@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use maruzzella::{
-    default_product_spec, plugin_tab, run, text_tab, BottomPanelLayout, CommandSpec,
-    MaruzzellaConfig, MenuRootSpec, TabGroupSpec, ThemeSpec, ToolbarItemSpec, WorkbenchNodeSpec,
+    default_product_spec, plugin_tab, run, BottomPanelLayout, CommandSpec, MaruzzellaConfig,
+    MenuRootSpec, TabGroupSpec, ThemeSpec, ToolbarItemSpec, WorkbenchNodeSpec,
 };
 
 fn main() {
@@ -125,14 +125,8 @@ fn main() {
     );
     product.layout.right_panel = TabGroupSpec::new(
         "panel-right",
-        Some("unused"),
-        vec![text_tab(
-            "unused",
-            "panel-right",
-            "Unused",
-            "",
-            false,
-        )],
+        None,
+        Vec::new(),
     );
     product.layout.bottom_panel = TabGroupSpec::new(
         "panel-bottom",

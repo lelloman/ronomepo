@@ -86,6 +86,7 @@ thread_local! {
     static REPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static WORKSPACE_SETTINGS_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_BUFFERS: RefCell<Vec<glib::WeakRef<TextBuffer>>> = const { RefCell::new(Vec::new()) };
+    static OPERATION_SUMMARIES: RefCell<Vec<glib::WeakRef<Label>>> = const { RefCell::new(Vec::new()) };
 }
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -589,6 +590,17 @@ fn refresh_views() {
         buffers.retain(|buffer_ref| match buffer_ref.upgrade() {
             Some(buffer) => {
                 buffer.set_text(&snapshot.logs.join("\n"));
+                true
+            }
+            None => false,
+        });
+    });
+
+    OPERATION_SUMMARIES.with(|labels| {
+        let mut labels = labels.borrow_mut();
+        labels.retain(|label_ref| match label_ref.upgrade() {
+            Some(label) => {
+                label.set_text(&operation_summary_text(&snapshot.logs));
                 true
             }
             None => false,
@@ -2664,7 +2676,13 @@ extern "C" fn create_operations_view(
     title.add_css_class("title-4");
     title.set_hexpand(true);
 
+    let summary = Label::new(Some(&operation_summary_text(&snapshot().logs)));
+    summary.set_xalign(0.0);
+    summary.add_css_class("muted");
+    summary.set_wrap(true);
+
     let refresh = Button::with_label("Refresh Logs");
+    let clear = Button::with_label("Clear");
     refresh.set_halign(Align::End);
 
     let buffer = TextBuffer::new(None);
@@ -2674,11 +2692,34 @@ extern "C" fn create_operations_view(
     OPERATION_BUFFERS.with(|buffers| {
         buffers.borrow_mut().push(buffer_ref);
     });
+    let summary_ref = glib::WeakRef::new();
+    summary_ref.set(Some(&summary));
+    OPERATION_SUMMARIES.with(|labels| {
+        labels.borrow_mut().push(summary_ref);
+    });
 
     refresh.connect_clicked({
         let buffer = buffer.clone();
+        let summary = summary.clone();
         move |_| {
-            buffer.set_text(&snapshot().logs.join("\n"));
+            let snapshot = snapshot();
+            buffer.set_text(&snapshot.logs.join("\n"));
+            summary.set_text(&operation_summary_text(&snapshot.logs));
+        }
+    });
+    clear.connect_clicked({
+        let buffer = buffer.clone();
+        let summary = summary.clone();
+        move |_| {
+            {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                app_state.logs.clear();
+                app_state.logs.push("Operations log cleared.".to_string());
+            }
+            let snapshot = snapshot();
+            buffer.set_text(&snapshot.logs.join("\n"));
+            summary.set_text(&operation_summary_text(&snapshot.logs));
+            refresh_views();
         }
     });
 
@@ -2697,14 +2738,32 @@ extern "C" fn create_operations_view(
         .build();
 
     header.append(&title);
+    header.append(&clear);
     header.append(&refresh);
     root.append(&header);
+    root.append(&summary);
     root.append(&scroller);
 
     unsafe {
         <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
             as *mut std::ffi::c_void
     }
+}
+
+fn operation_summary_text(logs: &[String]) -> String {
+    let total = logs.len();
+    let starts = logs.iter().filter(|line| line.starts_with("[START]")).count();
+    let ok = logs.iter().filter(|line| line.starts_with("[OK]")).count();
+    let skipped = logs.iter().filter(|line| line.starts_with("[SKIP]")).count();
+    let failed = logs.iter().filter(|line| line.starts_with("[FAIL]")).count();
+    let latest = logs
+        .last()
+        .map(String::as_str)
+        .unwrap_or("No operations recorded yet.");
+
+    format!(
+        "{total} log lines | {starts} started | {ok} ok | {skipped} skipped | {failed} failed | Latest: {latest}"
+    )
 }
 
 fn load_manifest_if_present(path: &Path) -> Option<WorkspaceManifest> {
