@@ -41,6 +41,7 @@ const CMD_SETTINGS: &str = "ronomepo.workspace.open_settings";
 const CMD_CLONE_MISSING: &str = "ronomepo.workspace.clone_missing";
 const CMD_PULL: &str = "ronomepo.workspace.pull";
 const CMD_PUSH: &str = "ronomepo.workspace.push";
+const CMD_PUSH_FORCE: &str = "ronomepo.workspace.push_force";
 const CMD_APPLY_HOOKS: &str = "ronomepo.workspace.apply_hooks";
 const CMD_OPEN_OVERVIEW: &str = "ronomepo.workspace.open_overview";
 
@@ -136,6 +137,10 @@ impl Plugin for RonomepoPlugin {
             CommandSpec::new(PLUGIN_ID, CMD_PUSH, "Push").with_handler(command_push),
         )?;
         host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_PUSH_FORCE, "Push Force")
+                .with_handler(command_push_force),
+        )?;
+        host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_APPLY_HOOKS, "Apply Hooks")
                 .with_handler(command_apply_hooks),
         )?;
@@ -185,6 +190,13 @@ impl Plugin for RonomepoPlugin {
             MzMenuSurface::FileItems,
             "Push",
             CMD_PUSH,
+        ))?;
+        host.register_menu_item(MenuItemSpec::new(
+            PLUGIN_ID,
+            "ronomepo-push-force",
+            MzMenuSurface::FileItems,
+            "Push Force",
+            CMD_PUSH_FORCE,
         ))?;
         host.register_menu_item(MenuItemSpec::new(
             PLUGIN_ID,
@@ -362,6 +374,13 @@ extern "C" fn command_push(
     maruzzella_sdk::ffi::MzStatus::OK
 }
 
+extern "C" fn command_push_force(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    launch_operation(OperationKind::PushForce);
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
 extern "C" fn command_apply_hooks(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
@@ -485,6 +504,7 @@ fn operation_kind_title(kind: OperationKind) -> &'static str {
         OperationKind::CloneMissing => "Clone Missing",
         OperationKind::Pull => "Pull",
         OperationKind::Push => "Push",
+        OperationKind::PushForce => "Push Force",
         OperationKind::ApplyHooks => "Apply Hooks",
     }
 }
@@ -1034,6 +1054,9 @@ fn build_repo_context_menu(
     });
     append_context_button(&menu, &popover, "Push", || {
         let _ = command_push(maruzzella_sdk::ffi::MzBytes::empty());
+    });
+    append_context_button(&menu, &popover, "Push Force", || {
+        let _ = command_push_force(maruzzella_sdk::ffi::MzBytes::empty());
     });
     append_context_button(&menu, &popover, "Clone Missing", || {
         let _ = command_clone_missing(maruzzella_sdk::ffi::MzBytes::empty());
@@ -1903,6 +1926,7 @@ fn overview_actions() -> GtkBox {
         ("Clone Missing", command_clone_missing as extern "C" fn(_) -> _),
         ("Pull", command_pull as extern "C" fn(_) -> _),
         ("Push", command_push as extern "C" fn(_) -> _),
+        ("Push Force", command_push_force as extern "C" fn(_) -> _),
         ("Apply Hooks", command_apply_hooks as extern "C" fn(_) -> _),
     ] {
         let button = Button::with_label(label);
@@ -1929,6 +1953,7 @@ fn repo_overview_actions(
         ("Clone Repo", Some(OperationKind::CloneMissing)),
         ("Pull Repo", Some(OperationKind::Pull)),
         ("Push Repo", Some(OperationKind::Push)),
+        ("Push Repo Force", Some(OperationKind::PushForce)),
         ("Apply Hooks", Some(OperationKind::ApplyHooks)),
     ] {
         let button = Button::with_label(label);

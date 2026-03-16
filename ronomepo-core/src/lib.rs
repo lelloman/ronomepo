@@ -73,6 +73,7 @@ pub enum OperationKind {
     CloneMissing,
     Pull,
     Push,
+    PushForce,
     ApplyHooks,
 }
 
@@ -290,11 +291,40 @@ pub fn run_workspace_operation<F>(
     let mut skipped = 0usize;
     let mut failed = 0usize;
 
+    if matches!(kind, OperationKind::Push) {
+        let flagged = generated_history_matches(manifest, selected_repo_ids, 25);
+        if !flagged.is_empty() {
+            emit(OperationEvent {
+                kind: OperationEventKind::Failed,
+                repository_id: None,
+                repository_name: None,
+                message: format!(
+                    "Push aborted because generated-commit markers were found in: {}. Use force push to override.",
+                    flagged.join(", ")
+                ),
+            });
+            emit(OperationEvent {
+                kind: OperationEventKind::Finished,
+                repository_id: None,
+                repository_name: None,
+                message: format!(
+                    "{} finished: {} completed, {} skipped, {} failed.",
+                    operation_kind_label(kind),
+                    completed,
+                    skipped,
+                    1
+                ),
+            });
+            return;
+        }
+    }
+
     for repo in entries {
         let event = match kind {
             OperationKind::CloneMissing => clone_missing_repo(manifest, repo),
             OperationKind::Pull => pull_repo(manifest, repo),
             OperationKind::Push => push_repo(manifest, repo),
+            OperationKind::PushForce => push_repo(manifest, repo),
             OperationKind::ApplyHooks => apply_hooks_repo(manifest, repo),
         };
 
@@ -527,8 +557,56 @@ fn operation_kind_label(kind: OperationKind) -> &'static str {
         OperationKind::CloneMissing => "Clone Missing",
         OperationKind::Pull => "Pull",
         OperationKind::Push => "Push",
+        OperationKind::PushForce => "Push Force",
         OperationKind::ApplyHooks => "Apply Hooks",
     }
+}
+
+fn generated_history_matches(
+    manifest: &WorkspaceManifest,
+    selected_repo_ids: &[String],
+    num_commits: usize,
+) -> Vec<String> {
+    let mut matches = Vec::new();
+
+    if repo_history_has_generated_markers(&manifest.root, num_commits) {
+        matches.push("(monorepo)".to_string());
+    }
+
+    for repo in manifest.repos.iter().filter(|repo| repo.enabled).filter(|repo| {
+        selected_repo_ids.is_empty() || selected_repo_ids.iter().any(|id| id == &repo.id)
+    }) {
+        let repo_path = manifest.root.join(&repo.dir_name);
+        if !repo_path.exists() {
+            continue;
+        }
+        if repo_history_has_generated_markers(&repo_path, num_commits) {
+            matches.push(repo.name.clone());
+        }
+    }
+
+    matches
+}
+
+fn repo_history_has_generated_markers(repo_path: &Path, num_commits: usize) -> bool {
+    let limit = num_commits.to_string();
+    let Some(output) = git_stdout(
+        repo_path,
+        [
+            "log",
+            "-n",
+            &limit,
+            "--format=%s%n%b%n---END---",
+        ],
+    ) else {
+        return false;
+    };
+
+    let lowered = output.to_ascii_lowercase();
+    lowered.contains("\ngenerated:")
+        || lowered.contains("\ngenerated-by:")
+        || lowered.contains("@anthropic")
+        || lowered.contains("co-author")
 }
 
 fn stderr_message(stderr: &[u8]) -> String {
@@ -707,6 +785,47 @@ mod tests {
         assert_eq!(
             format_sync_label(&RepositorySync::Diverged { ahead: 1, behind: 3 }),
             "+1/-3"
+        );
+    }
+
+    #[test]
+    fn generated_history_markers_are_detected() {
+        let repo_path = temp_dir_path("generated-history");
+        init_git_repo(&repo_path);
+        run_git(repo_path.as_path(), ["commit", "--allow-empty", "-m", "bot work", "-m", "Generated: Claude"]);
+
+        assert!(repo_history_has_generated_markers(&repo_path, 25));
+    }
+
+    #[test]
+    fn push_is_blocked_when_generated_history_is_present() {
+        let workspace = temp_dir_path("push-preflight");
+        fs::create_dir_all(&workspace).unwrap();
+        run_git(workspace.as_path(), ["init", "-b", "main"]);
+        run_git(workspace.as_path(), ["config", "user.name", "Ronomepo Tests"]);
+        run_git(workspace.as_path(), ["config", "user.email", "tests@example.com"]);
+        run_git(
+            workspace.as_path(),
+            ["commit", "--allow-empty", "-m", "workspace bot", "-m", "Generated-by: Agent"],
+        );
+
+        let manifest = WorkspaceManifest {
+            name: "Example".to_string(),
+            root: workspace,
+            repos: vec![],
+            shared_hooks_path: None,
+        };
+
+        let mut events = Vec::new();
+        run_workspace_operation(&manifest, &[], OperationKind::Push, |event| {
+            events.push(event);
+        });
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, OperationEventKind::Failed)
+                    && event.message.contains("Push aborted"))
         );
     }
 

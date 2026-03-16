@@ -53,6 +53,10 @@ fn main() {
             title: "Push".to_string(),
         },
         CommandSpec {
+            id: "ronomepo.workspace.push_force".to_string(),
+            title: "Push Force".to_string(),
+        },
+        CommandSpec {
             id: "ronomepo.workspace.apply_hooks".to_string(),
             title: "Apply Hooks".to_string(),
         },
