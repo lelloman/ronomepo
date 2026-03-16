@@ -145,14 +145,24 @@ fn main() {
     product.layout.workbench = WorkbenchNodeSpec::Group(TabGroupSpec::new(
         "workbench-main",
         Some("monorepo-overview"),
-        vec![plugin_tab(
-            "monorepo-overview",
-            "workbench-main",
-            "Monorepo Overview",
-            "com.lelloman.ronomepo.monorepo_overview",
-            "The Ronomepo monorepo overview could not be created.",
-            false,
-        )],
+        vec![
+            plugin_tab(
+                "monorepo-overview",
+                "workbench-main",
+                "Monorepo Overview",
+                "com.lelloman.ronomepo.monorepo_overview",
+                "The Ronomepo monorepo overview could not be created.",
+                false,
+            ),
+            plugin_tab(
+                "repo-overview",
+                "workbench-main",
+                "Repo Overview",
+                "com.lelloman.ronomepo.repo_overview",
+                "The Ronomepo repo overview could not be created.",
+                false,
+            ),
+        ],
     ));
 
     let config = MaruzzellaConfig::new("com.lelloman.ronomepo")

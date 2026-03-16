@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 const PLUGIN_ID: &str = "com.lelloman.ronomepo";
 const VIEW_REPO_MONITOR: &str = "com.lelloman.ronomepo.repo_monitor";
 const VIEW_MONOREPO_OVERVIEW: &str = "com.lelloman.ronomepo.monorepo_overview";
+const VIEW_REPO_OVERVIEW: &str = "com.lelloman.ronomepo.repo_overview";
 const VIEW_OPERATIONS: &str = "com.lelloman.ronomepo.operations";
 const CMD_REFRESH: &str = "ronomepo.workspace.refresh";
 const CMD_IMPORT: &str = "ronomepo.workspace.import_repos_txt";
@@ -59,8 +60,15 @@ struct RepositoryViewHandle {
     list: glib::WeakRef<ListBox>,
 }
 
+#[derive(Default)]
+struct ContainerViewHandle {
+    root: glib::WeakRef<GtkBox>,
+}
+
 thread_local! {
     static REPOSITORY_VIEWS: RefCell<Vec<RepositoryViewHandle>> = const { RefCell::new(Vec::new()) };
+    static MONOREPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
+    static REPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_BUFFERS: RefCell<Vec<glib::WeakRef<TextBuffer>>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -197,6 +205,13 @@ impl Plugin for RonomepoPlugin {
             "Monorepo Overview",
             MzViewPlacement::Workbench,
             create_monorepo_overview_view,
+        ))?;
+        host.register_view_factory(ViewFactorySpec::new(
+            PLUGIN_ID,
+            VIEW_REPO_OVERVIEW,
+            "Repo Overview",
+            MzViewPlacement::Workbench,
+            create_repo_overview_view,
         ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
@@ -436,6 +451,28 @@ fn refresh_views() {
             };
             render_repository_view_into(&summary, &list, &snapshot);
             true
+        });
+    });
+
+    MONOREPO_OVERVIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        views.retain(|handle| match handle.root.upgrade() {
+            Some(root) => {
+                render_monorepo_overview_into(&root, &snapshot);
+                true
+            }
+            None => false,
+        });
+    });
+
+    REPO_OVERVIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        views.retain(|handle| match handle.root.upgrade() {
+            Some(root) => {
+                render_repo_overview_into(&root, &snapshot);
+                true
+            }
+            None => false,
         });
     });
 
@@ -824,18 +861,78 @@ extern "C" fn create_monorepo_overview_view(
         return std::ptr::null_mut();
     }
 
-    let snapshot = snapshot();
-    let summary = workspace_summary(
-        snapshot.manifest.as_ref(),
-        snapshot.manifest_path.as_deref(),
-        &snapshot.workspace_root,
-    );
-
     let root = GtkBox::new(Orientation::Vertical, 18);
     root.set_margin_top(24);
     root.set_margin_bottom(24);
     root.set_margin_start(24);
     root.set_margin_end(24);
+
+    let snapshot = snapshot();
+    render_monorepo_overview_into(&root, &snapshot);
+
+    let root_ref = glib::WeakRef::new();
+    root_ref.set(Some(&root));
+    MONOREPO_OVERVIEWS.with(|views| {
+        views.borrow_mut().push(ContainerViewHandle { root: root_ref });
+    });
+
+    unsafe {
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+            as *mut std::ffi::c_void
+    }
+}
+
+fn render_monorepo_overview_into(root: &GtkBox, snapshot: &StateSnapshot) {
+    clear_box(root);
+
+    let summary = workspace_summary(
+        snapshot.manifest.as_ref(),
+        snapshot.manifest_path.as_deref(),
+        &snapshot.workspace_root,
+    );
+    let items = repository_items(snapshot);
+    let missing = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.status.state,
+                ronomepo_core::RepositoryState::Missing
+            )
+        })
+        .count();
+    let dirty = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.status.state,
+                ronomepo_core::RepositoryState::Dirty | ronomepo_core::RepositoryState::Untracked
+            )
+        })
+        .count();
+    let ahead = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.status.sync,
+                ronomepo_core::RepositorySync::Ahead(_)
+                    | ronomepo_core::RepositorySync::Diverged { .. }
+            )
+        })
+        .count();
+    let behind = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.status.sync,
+                ronomepo_core::RepositorySync::Behind(_)
+                    | ronomepo_core::RepositorySync::Diverged { .. }
+            )
+        })
+        .count();
+    let no_upstream = items
+        .iter()
+        .filter(|item| matches!(item.status.sync, ronomepo_core::RepositorySync::NoUpstream))
+        .count();
 
     let hero = GtkBox::new(Orientation::Vertical, 8);
     let title = Label::new(Some("Monorepo Overview"));
@@ -843,8 +940,7 @@ extern "C" fn create_monorepo_overview_view(
     title.add_css_class("title-2");
     let subtitle = Label::new(Some(&format!(
         "{} repositories tracked in {}",
-        summary.repo_count,
-        summary.workspace_name
+        summary.repo_count, summary.workspace_name
     )));
     subtitle.set_xalign(0.0);
     subtitle.add_css_class("muted");
@@ -852,10 +948,147 @@ extern "C" fn create_monorepo_overview_view(
     hero.append(&title);
     hero.append(&subtitle);
 
+    let stats = GtkBox::new(Orientation::Horizontal, 12);
+    for (label, value) in [
+        ("Selected", snapshot.selected_repo_ids.len()),
+        ("Dirty", dirty),
+        ("Missing", missing),
+        ("Ahead", ahead),
+        ("Behind", behind),
+        ("No Upstream", no_upstream),
+    ] {
+        stats.append(&stat_card(label, &value.to_string()));
+    }
+
+    let actions = overview_actions();
+
+    let sections = GtkBox::new(Orientation::Vertical, 12);
+    append_overview_section(
+        &sections,
+        "Workspace",
+        &format!("Current root: {}", snapshot.workspace_root.display()),
+    );
+    append_overview_section(
+        &sections,
+        "Manifest",
+        &snapshot
+            .manifest_path
+            .as_ref()
+            .map(|path| format!("Loaded from {}", path.display()))
+            .unwrap_or_else(|| format!("No {MANIFEST_FILE_NAME} loaded yet")),
+    );
+    append_overview_section(
+        &sections,
+        "Selection",
+        &snapshot
+            .active_repo_id
+            .as_ref()
+            .map(|repo_id| format!("Active repo overview target: {repo_id}"))
+            .unwrap_or_else(|| "No active repo overview target yet".to_string()),
+    );
+
+    root.append(&hero);
+    root.append(&stats);
+    root.append(&actions);
+    root.append(&sections);
+}
+
+extern "C" fn create_repo_overview_view(
+    _host: *const maruzzella_sdk::ffi::MzHostApi,
+    _request: *const maruzzella_sdk::ffi::MzViewRequest,
+) -> *mut std::ffi::c_void {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        return std::ptr::null_mut();
+    }
+
+    let root = GtkBox::new(Orientation::Vertical, 18);
+    root.set_margin_top(24);
+    root.set_margin_bottom(24);
+    root.set_margin_start(24);
+    root.set_margin_end(24);
+
+    let snapshot = snapshot();
+    render_repo_overview_into(&root, &snapshot);
+
+    let root_ref = glib::WeakRef::new();
+    root_ref.set(Some(&root));
+    REPO_OVERVIEWS.with(|views| {
+        views.borrow_mut().push(ContainerViewHandle { root: root_ref });
+    });
+
+    unsafe {
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+            as *mut std::ffi::c_void
+    }
+}
+
+fn render_repo_overview_into(root: &GtkBox, snapshot: &StateSnapshot) {
+    clear_box(root);
+
+    let title = Label::new(Some("Repo Overview"));
+    title.set_xalign(0.0);
+    title.add_css_class("title-2");
+    root.append(&title);
+
+    let Some(active_repo_id) = snapshot.active_repo_id.as_deref() else {
+        let body = Label::new(Some(
+            "No active repo selected yet. Double click a repository in the left monitor, then reuse this overview tab.",
+        ));
+        body.set_xalign(0.0);
+        body.set_wrap(true);
+        body.add_css_class("muted");
+        root.append(&body);
+        root.append(&overview_actions());
+        return;
+    };
+
+    let items = repository_items(snapshot);
+    let Some(item) = items.iter().find(|item| item.id == active_repo_id) else {
+        let body = Label::new(Some(
+            "The active repo overview target is no longer present in the current manifest.",
+        ));
+        body.set_xalign(0.0);
+        body.set_wrap(true);
+        body.add_css_class("muted");
+        root.append(&body);
+        root.append(&overview_actions());
+        return;
+    };
+
+    let subtitle = Label::new(Some(&format!(
+        "{} | {} | {}",
+        item.name,
+        branch_label(item),
+        format_sync_label(&item.status.sync)
+    )));
+    subtitle.set_xalign(0.0);
+    subtitle.add_css_class("muted");
+    subtitle.set_wrap(true);
+    root.append(&subtitle);
+    root.append(&overview_actions());
+
+    let sections = GtkBox::new(Orientation::Vertical, 12);
+    append_overview_section(
+        &sections,
+        "Path",
+        &item.status.repo_path.display().to_string(),
+    );
+    append_overview_section(&sections, "Remote", &item.remote_url);
+    append_overview_section(&sections, "Directory", &item.dir_name);
+    append_overview_section(&sections, "State", status_label(&item.status.state));
+    append_overview_section(
+        &sections,
+        "Sync",
+        &format_sync_label(&item.status.sync),
+    );
+
+    root.append(&sections);
+}
+
+fn overview_actions() -> GtkBox {
     let actions = GtkBox::new(Orientation::Horizontal, 8);
     for (label, handler) in [
         ("Refresh", command_refresh_workspace as extern "C" fn(_) -> _),
-        ("Import repos.txt", command_import_repos_txt as extern "C" fn(_) -> _),
         ("Clone Missing", command_clone_missing as extern "C" fn(_) -> _),
         ("Pull", command_pull as extern "C" fn(_) -> _),
         ("Push", command_push as extern "C" fn(_) -> _),
@@ -867,55 +1100,43 @@ extern "C" fn create_monorepo_overview_view(
         });
         actions.append(&button);
     }
+    actions
+}
 
-    let sections = GtkBox::new(Orientation::Vertical, 12);
-    for (heading, body) in [
-        (
-            "Workspace",
-            format!("Current root: {}", snapshot.workspace_root.display()),
-        ),
-        (
-            "Manifest",
-            snapshot
-                .manifest_path
-                .as_ref()
-                .map(|path| format!("Loaded from {}", path.display()))
-                .unwrap_or_else(|| format!("No {MANIFEST_FILE_NAME} loaded yet")),
-        ),
-        (
-            "Selection",
-            snapshot
-                .active_repo_id
-                .as_ref()
-                .map(|repo_id| format!("Active repo overview target: {repo_id}"))
-                .unwrap_or_else(|| "No active repo overview target yet".to_string()),
-        ),
-        (
-            "Next Milestones",
-            "Real repo status, selection-aware actions, and repo overview tabs will replace these placeholders.".to_string(),
-        ),
-    ] {
-        let block = GtkBox::new(Orientation::Vertical, 4);
-        let heading_label = Label::new(Some(heading));
-        heading_label.set_xalign(0.0);
-        heading_label.add_css_class("title-4");
-        let body_label = Label::new(Some(&body));
-        body_label.set_xalign(0.0);
-        body_label.set_wrap(true);
-        body_label.add_css_class("muted");
-        block.append(&heading_label);
-        block.append(&body_label);
-        sections.append(&block);
-        sections.append(&Separator::new(Orientation::Horizontal));
-    }
+fn stat_card(label: &str, value: &str) -> GtkBox {
+    let card = GtkBox::new(Orientation::Vertical, 4);
+    card.set_margin_bottom(8);
 
-    root.append(&hero);
-    root.append(&actions);
-    root.append(&sections);
+    let value_label = Label::new(Some(value));
+    value_label.set_xalign(0.0);
+    value_label.add_css_class("title-3");
+    let label_widget = Label::new(Some(label));
+    label_widget.set_xalign(0.0);
+    label_widget.add_css_class("muted");
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-            as *mut std::ffi::c_void
+    card.append(&value_label);
+    card.append(&label_widget);
+    card
+}
+
+fn append_overview_section(container: &GtkBox, heading: &str, body: &str) {
+    let block = GtkBox::new(Orientation::Vertical, 4);
+    let heading_label = Label::new(Some(heading));
+    heading_label.set_xalign(0.0);
+    heading_label.add_css_class("title-4");
+    let body_label = Label::new(Some(body));
+    body_label.set_xalign(0.0);
+    body_label.set_wrap(true);
+    body_label.add_css_class("muted");
+    block.append(&heading_label);
+    block.append(&body_label);
+    container.append(&block);
+    container.append(&Separator::new(Orientation::Horizontal));
+}
+
+fn clear_box(root: &GtkBox) {
+    while let Some(child) = root.first_child() {
+        root.remove(&child);
     }
 }
 
