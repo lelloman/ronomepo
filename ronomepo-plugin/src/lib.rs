@@ -1265,7 +1265,22 @@ fn render_repo_overview_into(
     subtitle.add_css_class("muted");
     subtitle.set_wrap(true);
     root.append(&subtitle);
+    root.append(&repo_overview_actions(item));
     root.append(&overview_actions());
+
+    let status_cards = GtkBox::new(Orientation::Horizontal, 12);
+    for (label, value) in [
+        ("Branch", branch_label(item).to_string()),
+        ("State", status_label(&item.status.state).to_string()),
+        ("Sync", format_sync_label(&item.status.sync)),
+        ("Selected", if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
+            "Yes".to_string()
+        } else {
+            "No".to_string()
+        }),
+    ] {
+        status_cards.append(&stat_card(label, &value));
+    }
 
     let sections = GtkBox::new(Orientation::Vertical, 12);
     append_overview_section(
@@ -1281,7 +1296,24 @@ fn render_repo_overview_into(
         "Sync",
         &format_sync_label(&item.status.sync),
     );
+    append_overview_section(
+        &sections,
+        "Current Selection Scope",
+        &repo_selection_scope_label(snapshot, item),
+    );
+    append_overview_section(
+        &sections,
+        "Action Eligibility",
+        &repo_action_eligibility(item),
+    );
+    append_log_section(
+        &sections,
+        "Recent Repo Activity",
+        &repo_recent_logs(snapshot, item),
+        6,
+    );
 
+    root.append(&status_cards);
     root.append(&sections);
 }
 
@@ -1297,6 +1329,30 @@ fn overview_actions() -> GtkBox {
         let button = Button::with_label(label);
         button.connect_clicked(move |_| {
             let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
+        });
+        actions.append(&button);
+    }
+    actions
+}
+
+fn repo_overview_actions(item: &RepositoryListItem) -> GtkBox {
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
+    for (label, kind) in [
+        ("Target This Repo", None),
+        ("Clone Repo", Some(OperationKind::CloneMissing)),
+        ("Pull Repo", Some(OperationKind::Pull)),
+        ("Push Repo", Some(OperationKind::Push)),
+        ("Apply Hooks", Some(OperationKind::ApplyHooks)),
+    ] {
+        let button = Button::with_label(label);
+        let repo_id = item.id.clone();
+        button.connect_clicked(move |_| {
+            set_selected_repo_ids(vec![repo_id.clone()]);
+            if let Some(kind) = kind {
+                launch_operation(kind);
+            } else {
+                append_log(format!("Targeted {repo_id} as the active selection."));
+            }
         });
         actions.append(&button);
     }
@@ -1443,6 +1499,80 @@ fn clear_box(root: &GtkBox) {
     while let Some(child) = root.first_child() {
         root.remove(&child);
     }
+}
+
+fn repo_selection_scope_label(snapshot: &StateSnapshot, item: &RepositoryListItem) -> String {
+    if snapshot.selected_repo_ids.is_empty() {
+        "No explicit selection in the left monitor. Workspace actions apply to all eligible repos."
+            .to_string()
+    } else if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
+        format!(
+            "This repo is part of the current selection ({} repos total). Toolbar and overview actions will include it.",
+            snapshot.selected_repo_ids.len()
+        )
+    } else {
+        format!(
+            "This repo is not in the current selection ({} repos selected elsewhere). Use 'Target This Repo' to scope actions to it.",
+            snapshot.selected_repo_ids.len()
+        )
+    }
+}
+
+fn repo_action_eligibility(item: &RepositoryListItem) -> String {
+    use ronomepo_core::{RepositoryState, RepositorySync};
+
+    let clone = if matches!(item.status.state, RepositoryState::Missing) {
+        "Clone is available."
+    } else {
+        "Clone will be skipped because the repo already exists locally."
+    };
+    let pull = match item.status.state {
+        RepositoryState::Missing => "Pull will be skipped until the repo is cloned.",
+        RepositoryState::Dirty => "Pull will be skipped because the working tree is dirty.",
+        RepositoryState::Untracked => "Pull is allowed, but untracked files are present.",
+        _ => "Pull is allowed if the repo has a valid remote.",
+    };
+    let push = match &item.status.sync {
+        RepositorySync::Ahead(count) => format!("Push is available with {count} local commit(s) ahead."),
+        RepositorySync::Diverged { ahead, behind } => format!(
+            "Push is risky: the branch diverged (+{ahead}/-{behind})."
+        ),
+        RepositorySync::NoUpstream => "Push will be skipped because no upstream is configured.".to_string(),
+        RepositorySync::Behind(count) => format!(
+            "Push is not useful yet because the branch is behind by {count} commit(s)."
+        ),
+        RepositorySync::UpToDate => "Push will be skipped because the repo is already up to date.".to_string(),
+        RepositorySync::Unknown => "Push eligibility is unknown because Git sync state could not be determined.".to_string(),
+    };
+
+    format!("{clone} {pull} {push}")
+}
+
+fn repo_recent_logs(snapshot: &StateSnapshot, item: &RepositoryListItem) -> Vec<String> {
+    let item_name = item.name.to_ascii_lowercase();
+    let item_id = item.id.to_ascii_lowercase();
+    let item_dir = item.dir_name.to_ascii_lowercase();
+
+    let mut logs = snapshot
+        .logs
+        .iter()
+        .filter(|entry| {
+            let lower = entry.to_ascii_lowercase();
+            lower.contains(&item_name) || lower.contains(&item_id) || lower.contains(&item_dir)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if logs.is_empty() {
+        logs.push("No repo-specific operations have been logged yet.".to_string());
+    }
+
+    logs
+}
+
+fn set_selected_repo_ids(ids: Vec<String>) {
+    update_selected_repo_ids(ids);
+    refresh_views();
 }
 
 extern "C" fn create_text_editor_view(
