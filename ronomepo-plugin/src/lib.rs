@@ -9,8 +9,9 @@ use gtk::{
     ScrolledWindow, Separator, TextBuffer, TextView, WrapMode,
 };
 use maruzzella_sdk::{
-    export_plugin, CommandSpec, HostApi, MenuItemSpec, MzLogLevel, MzStatusCode,
-    Plugin, PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
+    export_plugin, CommandSpec, HostApi, MenuItemSpec, MzLogLevel, MzMenuSurface, MzStatusCode,
+    MzViewPlacement, Plugin, PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version,
+    ViewFactorySpec,
 };
 use ronomepo_core::{
     build_repository_list, default_manifest_path, import_repos_txt, load_manifest, save_manifest,
@@ -19,11 +20,17 @@ use ronomepo_core::{
 use serde::{Deserialize, Serialize};
 
 const PLUGIN_ID: &str = "com.lelloman.ronomepo";
-const VIEW_REPOSITORIES: &str = "com.lelloman.ronomepo.repositories";
+const VIEW_REPO_MONITOR: &str = "com.lelloman.ronomepo.repo_monitor";
+const VIEW_MONOREPO_OVERVIEW: &str = "com.lelloman.ronomepo.monorepo_overview";
 const VIEW_OPERATIONS: &str = "com.lelloman.ronomepo.operations";
 const CMD_REFRESH: &str = "ronomepo.workspace.refresh";
 const CMD_IMPORT: &str = "ronomepo.workspace.import_repos_txt";
 const CMD_SETTINGS: &str = "ronomepo.workspace.open_settings";
+const CMD_CLONE_MISSING: &str = "ronomepo.workspace.clone_missing";
+const CMD_PULL: &str = "ronomepo.workspace.pull";
+const CMD_PUSH: &str = "ronomepo.workspace.push";
+const CMD_APPLY_HOOKS: &str = "ronomepo.workspace.apply_hooks";
+const CMD_OPEN_OVERVIEW: &str = "ronomepo.workspace.open_overview";
 
 struct RonomepoPlugin;
 
@@ -89,27 +96,80 @@ impl Plugin for RonomepoPlugin {
             CommandSpec::new(PLUGIN_ID, CMD_SETTINGS, "Workspace Settings")
                 .with_handler(command_open_settings),
         )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_CLONE_MISSING, "Clone Missing")
+                .with_handler(command_clone_missing),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_PULL, "Pull").with_handler(command_pull),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_PUSH, "Push").with_handler(command_push),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_APPLY_HOOKS, "Apply Hooks")
+                .with_handler(command_apply_hooks),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_OPEN_OVERVIEW, "Monorepo Overview")
+                .with_handler(command_open_overview),
+        )?;
 
         host.register_menu_item(MenuItemSpec::new(
             PLUGIN_ID,
             "ronomepo-refresh",
-            "maruzzella.menu.file.items",
+            MzMenuSurface::FileItems,
             "Refresh Workspace",
             CMD_REFRESH,
         ))?;
         host.register_menu_item(MenuItemSpec::new(
             PLUGIN_ID,
             "ronomepo-import",
-            "maruzzella.menu.file.items",
+            MzMenuSurface::FileItems,
             "Import repos.txt",
             CMD_IMPORT,
         ))?;
         host.register_menu_item(MenuItemSpec::new(
             PLUGIN_ID,
             "ronomepo-settings",
-            "maruzzella.menu.file.items",
+            MzMenuSurface::FileItems,
             "Workspace Settings",
             CMD_SETTINGS,
+        ))?;
+        host.register_menu_item(MenuItemSpec::new(
+            PLUGIN_ID,
+            "ronomepo-clone-missing",
+            MzMenuSurface::FileItems,
+            "Clone Missing",
+            CMD_CLONE_MISSING,
+        ))?;
+        host.register_menu_item(MenuItemSpec::new(
+            PLUGIN_ID,
+            "ronomepo-pull",
+            MzMenuSurface::FileItems,
+            "Pull",
+            CMD_PULL,
+        ))?;
+        host.register_menu_item(MenuItemSpec::new(
+            PLUGIN_ID,
+            "ronomepo-push",
+            MzMenuSurface::FileItems,
+            "Push",
+            CMD_PUSH,
+        ))?;
+        host.register_menu_item(MenuItemSpec::new(
+            PLUGIN_ID,
+            "ronomepo-hooks",
+            MzMenuSurface::FileItems,
+            "Apply Hooks",
+            CMD_APPLY_HOOKS,
+        ))?;
+        host.register_menu_item(MenuItemSpec::new(
+            PLUGIN_ID,
+            "ronomepo-overview",
+            MzMenuSurface::ViewItems,
+            "Monorepo Overview",
+            CMD_OPEN_OVERVIEW,
         ))?;
 
         host.register_surface_contribution(SurfaceContributionSpec::about_section(
@@ -121,12 +181,23 @@ impl Plugin for RonomepoPlugin {
 
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
-            VIEW_REPOSITORIES,
-            create_repositories_view,
+            VIEW_REPO_MONITOR,
+            "Repository Monitor",
+            MzViewPlacement::SidePanel,
+            create_repo_monitor_view,
+        ))?;
+        host.register_view_factory(ViewFactorySpec::new(
+            PLUGIN_ID,
+            VIEW_MONOREPO_OVERVIEW,
+            "Monorepo Overview",
+            MzViewPlacement::Workbench,
+            create_monorepo_overview_view,
         ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
             VIEW_OPERATIONS,
+            "Operations",
+            MzViewPlacement::BottomPanel,
             create_operations_view,
         ))?;
 
@@ -211,6 +282,46 @@ extern "C" fn command_open_settings(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
     append_log("Workspace settings are not implemented yet.".to_string());
+    refresh_views();
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
+extern "C" fn command_clone_missing(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    append_log("Clone Missing is wired into the shell layout; repo targeting comes next.".to_string());
+    refresh_views();
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
+extern "C" fn command_pull(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    append_log("Pull is wired into the shell layout; mono-style repo selection comes next.".to_string());
+    refresh_views();
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
+extern "C" fn command_push(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    append_log("Push is wired into the shell layout; mono-style ahead/upstream filtering comes next.".to_string());
+    refresh_views();
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
+extern "C" fn command_apply_hooks(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    append_log("Apply Hooks is wired into the shell layout; shared hooks behavior comes next.".to_string());
+    refresh_views();
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
+extern "C" fn command_open_overview(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    append_log("Monorepo Overview is the default startup tab.".to_string());
     refresh_views();
     maruzzella_sdk::ffi::MzStatus::OK
 }
@@ -401,7 +512,7 @@ fn status_label(state: &ronomepo_core::RepositoryState) -> &'static str {
     }
 }
 
-extern "C" fn create_repositories_view(
+extern "C" fn create_repo_monitor_view(
     _host: *const maruzzella_sdk::ffi::MzHostApi,
     _request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
@@ -415,31 +526,14 @@ extern "C" fn create_repositories_view(
     root.set_margin_start(18);
     root.set_margin_end(18);
 
-    let title = Label::new(Some("Repositories"));
+    let title = Label::new(Some("Repository Monitor"));
     title.set_xalign(0.0);
-    title.add_css_class("title-3");
+    title.add_css_class("title-4");
 
     let summary = Label::new(None);
     summary.set_xalign(0.0);
     summary.set_wrap(true);
     summary.add_css_class("muted");
-
-    let actions = GtkBox::new(Orientation::Horizontal, 8);
-    let refresh = Button::with_label("Refresh");
-    refresh.connect_clicked(|_| {
-        let _ = command_refresh_workspace(maruzzella_sdk::ffi::MzBytes::empty());
-    });
-    let import = Button::with_label("Import repos.txt");
-    import.connect_clicked(|_| {
-        let _ = command_import_repos_txt(maruzzella_sdk::ffi::MzBytes::empty());
-    });
-    let settings = Button::with_label("Settings");
-    settings.connect_clicked(|_| {
-        let _ = command_open_settings(maruzzella_sdk::ffi::MzBytes::empty());
-    });
-    actions.append(&refresh);
-    actions.append(&import);
-    actions.append(&settings);
 
     let list = ListBox::new();
     list.add_css_class("boxed-list");
@@ -454,7 +548,6 @@ extern "C" fn create_repositories_view(
 
     root.append(&title);
     root.append(&summary);
-    root.append(&actions);
     root.append(&Separator::new(Orientation::Horizontal));
     root.append(&scroller);
 
@@ -471,6 +564,101 @@ extern "C" fn create_repositories_view(
             list: list_ref,
         });
     });
+
+    unsafe {
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+            as *mut std::ffi::c_void
+    }
+}
+
+extern "C" fn create_monorepo_overview_view(
+    _host: *const maruzzella_sdk::ffi::MzHostApi,
+    _request: *const maruzzella_sdk::ffi::MzViewRequest,
+) -> *mut std::ffi::c_void {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        return std::ptr::null_mut();
+    }
+
+    let snapshot = snapshot();
+    let summary = workspace_summary(
+        snapshot.manifest.as_ref(),
+        snapshot.manifest_path.as_deref(),
+        &snapshot.workspace_root,
+    );
+
+    let root = GtkBox::new(Orientation::Vertical, 18);
+    root.set_margin_top(24);
+    root.set_margin_bottom(24);
+    root.set_margin_start(24);
+    root.set_margin_end(24);
+
+    let hero = GtkBox::new(Orientation::Vertical, 8);
+    let title = Label::new(Some("Monorepo Overview"));
+    title.set_xalign(0.0);
+    title.add_css_class("title-2");
+    let subtitle = Label::new(Some(&format!(
+        "{} repositories tracked in {}",
+        summary.repo_count,
+        summary.workspace_name
+    )));
+    subtitle.set_xalign(0.0);
+    subtitle.add_css_class("muted");
+    subtitle.set_wrap(true);
+    hero.append(&title);
+    hero.append(&subtitle);
+
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
+    for (label, handler) in [
+        ("Refresh", command_refresh_workspace as extern "C" fn(_) -> _),
+        ("Import repos.txt", command_import_repos_txt as extern "C" fn(_) -> _),
+        ("Clone Missing", command_clone_missing as extern "C" fn(_) -> _),
+        ("Pull", command_pull as extern "C" fn(_) -> _),
+        ("Push", command_push as extern "C" fn(_) -> _),
+        ("Apply Hooks", command_apply_hooks as extern "C" fn(_) -> _),
+    ] {
+        let button = Button::with_label(label);
+        button.connect_clicked(move |_| {
+            let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
+        });
+        actions.append(&button);
+    }
+
+    let sections = GtkBox::new(Orientation::Vertical, 12);
+    for (heading, body) in [
+        (
+            "Workspace",
+            format!("Current root: {}", snapshot.workspace_root.display()),
+        ),
+        (
+            "Manifest",
+            snapshot
+                .manifest_path
+                .as_ref()
+                .map(|path| format!("Loaded from {}", path.display()))
+                .unwrap_or_else(|| format!("No {MANIFEST_FILE_NAME} loaded yet")),
+        ),
+        (
+            "Next Milestones",
+            "Real repo status, selection-aware actions, and repo overview tabs will replace these placeholders.".to_string(),
+        ),
+    ] {
+        let block = GtkBox::new(Orientation::Vertical, 4);
+        let heading_label = Label::new(Some(heading));
+        heading_label.set_xalign(0.0);
+        heading_label.add_css_class("title-4");
+        let body_label = Label::new(Some(&body));
+        body_label.set_xalign(0.0);
+        body_label.set_wrap(true);
+        body_label.add_css_class("muted");
+        block.append(&heading_label);
+        block.append(&body_label);
+        sections.append(&block);
+        sections.append(&Separator::new(Orientation::Horizontal));
+    }
+
+    root.append(&hero);
+    root.append(&actions);
+    root.append(&sections);
 
     unsafe {
         <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
