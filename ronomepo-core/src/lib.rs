@@ -62,6 +62,32 @@ pub struct LastCommitInfo {
     pub subject: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryMatch {
+    pub repository_name: String,
+    pub head_offset: usize,
+    pub commit_hash: String,
+    pub subject: String,
+    pub matching_lines: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineStatsRow {
+    pub repository_name: String,
+    pub additions: usize,
+    pub deletions: usize,
+    pub net: isize,
+    pub missing: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceLineStats {
+    pub rows: Vec<LineStatsRow>,
+    pub total_additions: usize,
+    pub total_deletions: usize,
+    pub total_net: isize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepositoryState {
     Unknown,
@@ -345,6 +371,17 @@ pub fn run_workspace_operation<F>(
     let mut skipped = 0usize;
     let mut failed = 0usize;
 
+    if matches!(kind, OperationKind::ApplyHooks) {
+        let root_event = apply_hooks_to_workspace_root(manifest);
+        match root_event.kind {
+            OperationEventKind::Success => completed += 1,
+            OperationEventKind::Skipped => skipped += 1,
+            OperationEventKind::Failed => failed += 1,
+            _ => {}
+        }
+        emit(root_event);
+    }
+
     if matches!(kind, OperationKind::Push) {
         let flagged = generated_history_matches(manifest, selected_repo_ids, 25);
         if !flagged.is_empty() {
@@ -403,6 +440,58 @@ pub fn run_workspace_operation<F>(
             failed
         ),
     });
+}
+
+pub fn collect_generated_history_matches(
+    manifest: &WorkspaceManifest,
+    selected_repo_ids: &[String],
+    num_commits: usize,
+) -> Vec<HistoryMatch> {
+    let mut matches = collect_repo_history_matches(&manifest.root, "(monorepo)", num_commits);
+
+    for repo in manifest.repos.iter().filter(|repo| repo.enabled).filter(|repo| {
+        selected_repo_ids.is_empty() || selected_repo_ids.iter().any(|id| id == &repo.id)
+    }) {
+        let repo_path = manifest.root.join(&repo.dir_name);
+        if !repo_path.exists() {
+            continue;
+        }
+        matches.extend(collect_repo_history_matches(
+            &repo_path,
+            &repo.name,
+            num_commits,
+        ));
+    }
+
+    matches
+}
+
+pub fn collect_workspace_line_stats(
+    manifest: &WorkspaceManifest,
+    since_date: Option<&str>,
+) -> WorkspaceLineStats {
+    let mut rows = Vec::new();
+    let mut total_additions = 0usize;
+    let mut total_deletions = 0usize;
+
+    let monorepo = collect_repo_line_stats(&manifest.root, "(monorepo)", since_date);
+    total_additions += monorepo.additions;
+    total_deletions += monorepo.deletions;
+    rows.push(monorepo);
+
+    for repo in manifest.repos.iter().filter(|repo| repo.enabled) {
+        let row = collect_repo_line_stats(&manifest.root.join(&repo.dir_name), &repo.name, since_date);
+        total_additions += row.additions;
+        total_deletions += row.deletions;
+        rows.push(row);
+    }
+
+    WorkspaceLineStats {
+        rows,
+        total_additions,
+        total_deletions,
+        total_net: total_additions as isize - total_deletions as isize,
+    }
 }
 
 fn clone_missing_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> OperationEvent {
@@ -543,6 +632,35 @@ fn apply_hooks_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> Ope
     }
 }
 
+fn apply_hooks_to_workspace_root(manifest: &WorkspaceManifest) -> OperationEvent {
+    let Some(hooks_path) = resolved_shared_hooks_path(manifest) else {
+        return OperationEvent {
+            kind: OperationEventKind::Skipped,
+            repository_id: None,
+            repository_name: Some("(monorepo)".to_string()),
+            message: "No shared hooks path is configured for the workspace root.".to_string(),
+        };
+    };
+
+    match configure_hooks_path(&manifest.root, &hooks_path) {
+        Ok(()) => OperationEvent {
+            kind: OperationEventKind::Success,
+            repository_id: None,
+            repository_name: Some("(monorepo)".to_string()),
+            message: format!(
+                "Configured core.hooksPath for (monorepo) to {}.",
+                hooks_path.display()
+            ),
+        },
+        Err(error) => OperationEvent {
+            kind: OperationEventKind::Failed,
+            repository_id: None,
+            repository_name: Some("(monorepo)".to_string()),
+            message: format!("Failed to configure hooks for (monorepo): {error}"),
+        },
+    }
+}
+
 fn configure_hooks_path(repo_path: &Path, hooks_path: &Path) -> io::Result<()> {
     let status = Command::new("git")
         .arg("-C")
@@ -621,28 +739,22 @@ fn generated_history_matches(
     selected_repo_ids: &[String],
     num_commits: usize,
 ) -> Vec<String> {
-    let mut matches = Vec::new();
-
-    if repo_history_has_generated_markers(&manifest.root, num_commits) {
-        matches.push("(monorepo)".to_string());
-    }
-
-    for repo in manifest.repos.iter().filter(|repo| repo.enabled).filter(|repo| {
-        selected_repo_ids.is_empty() || selected_repo_ids.iter().any(|id| id == &repo.id)
-    }) {
-        let repo_path = manifest.root.join(&repo.dir_name);
-        if !repo_path.exists() {
-            continue;
-        }
-        if repo_history_has_generated_markers(&repo_path, num_commits) {
-            matches.push(repo.name.clone());
-        }
-    }
-
-    matches
+    collect_generated_history_matches(manifest, selected_repo_ids, num_commits)
+        .into_iter()
+        .map(|entry| entry.repository_name)
+        .collect()
 }
 
+#[cfg(test)]
 fn repo_history_has_generated_markers(repo_path: &Path, num_commits: usize) -> bool {
+    !collect_repo_history_matches(repo_path, "(repo)", num_commits).is_empty()
+}
+
+fn collect_repo_history_matches(
+    repo_path: &Path,
+    repository_name: &str,
+    num_commits: usize,
+) -> Vec<HistoryMatch> {
     let limit = num_commits.to_string();
     let Some(output) = git_stdout(
         repo_path,
@@ -650,17 +762,151 @@ fn repo_history_has_generated_markers(repo_path: &Path, num_commits: usize) -> b
             "log",
             "-n",
             &limit,
-            "--format=%s%n%b%n---END---",
+            "--format=HASH:%H%nSUBJ:%s%nBODY:%b%nEND---",
         ],
     ) else {
-        return false;
+        return Vec::new();
     };
 
-    let lowered = output.to_ascii_lowercase();
-    lowered.contains("\ngenerated:")
-        || lowered.contains("\ngenerated-by:")
+    const WHITELIST: &[&str] = &["e4e373f65715ad492dbe9db3ba89b2dd02c137f7"];
+
+    let mut matches = Vec::new();
+    let mut current_hash = String::new();
+    let mut current_subject = String::new();
+    let mut body_lines = Vec::new();
+    let mut head_offset = 0usize;
+
+    let push_match = |matches: &mut Vec<HistoryMatch>,
+                      current_hash: &str,
+                      current_subject: &str,
+                      body_lines: &[String],
+                      head_offset: usize| {
+        if current_hash.is_empty() || WHITELIST.contains(&current_hash) {
+            return;
+        }
+        let mut matching_lines = Vec::new();
+        let subject_lower = current_subject.to_ascii_lowercase();
+        if contains_generated_marker(&subject_lower) {
+            matching_lines.push(current_subject.to_string());
+        }
+        for line in body_lines {
+            if contains_generated_marker(&line.to_ascii_lowercase()) {
+                matching_lines.push(line.clone());
+            }
+        }
+        if !matching_lines.is_empty() {
+            matches.push(HistoryMatch {
+                repository_name: repository_name.to_string(),
+                head_offset,
+                commit_hash: current_hash.to_string(),
+                subject: current_subject.to_string(),
+                matching_lines,
+            });
+        }
+    };
+
+    for line in output.lines() {
+        if let Some(hash) = line.strip_prefix("HASH:") {
+            current_hash = hash.to_string();
+            current_subject.clear();
+            body_lines.clear();
+            continue;
+        }
+        if let Some(subject) = line.strip_prefix("SUBJ:") {
+            current_subject = subject.to_string();
+            continue;
+        }
+        if let Some(body) = line.strip_prefix("BODY:") {
+            body_lines.push(body.to_string());
+            continue;
+        }
+        if line == "END---" {
+            push_match(
+                &mut matches,
+                &current_hash,
+                &current_subject,
+                &body_lines,
+                head_offset,
+            );
+            if !current_hash.is_empty() {
+                head_offset += 1;
+            }
+            current_hash.clear();
+            current_subject.clear();
+            body_lines.clear();
+            continue;
+        }
+        if !current_hash.is_empty() {
+            body_lines.push(line.to_string());
+        }
+    }
+
+    matches
+}
+
+fn contains_generated_marker(lowered: &str) -> bool {
+    lowered.contains("generated:")
+        || lowered.contains("generated-by:")
         || lowered.contains("@anthropic")
         || lowered.contains("co-author")
+}
+
+fn collect_repo_line_stats(
+    repo_path: &Path,
+    repository_name: &str,
+    since_date: Option<&str>,
+) -> LineStatsRow {
+    if !repo_path.exists() {
+        return LineStatsRow {
+            repository_name: repository_name.to_string(),
+            additions: 0,
+            deletions: 0,
+            net: 0,
+            missing: true,
+        };
+    }
+
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo_path).arg("log");
+    if let Some(since_date) = since_date {
+        command.arg(format!("--since={since_date}"));
+    }
+    command.arg("--numstat").arg("--format=");
+    let Ok(output) = command.output() else {
+        return LineStatsRow {
+            repository_name: repository_name.to_string(),
+            additions: 0,
+            deletions: 0,
+            net: 0,
+            missing: false,
+        };
+    };
+
+    let stats = String::from_utf8_lossy(&output.stdout);
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    for line in stats.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(add) = parts.next() else {
+            continue;
+        };
+        let Some(del) = parts.next() else {
+            continue;
+        };
+        if add == "-" || del == "-" {
+            continue;
+        }
+        additions += add.parse::<usize>().unwrap_or(0);
+        deletions += del.parse::<usize>().unwrap_or(0);
+    }
+
+    LineStatsRow {
+        repository_name: repository_name.to_string(),
+        additions,
+        deletions,
+        net: additions as isize - deletions as isize,
+        missing: false,
+    }
 }
 
 fn stderr_message(stderr: &[u8]) -> String {
@@ -851,6 +1097,58 @@ mod tests {
     }
 
     #[test]
+    fn collect_generated_history_matches_reports_repo_and_subject() {
+        let workspace = temp_dir_path("history-report");
+        fs::create_dir_all(&workspace).unwrap();
+        run_git(workspace.as_path(), ["init", "-b", "main"]);
+        run_git(workspace.as_path(), ["config", "user.name", "Ronomepo Tests"]);
+        run_git(workspace.as_path(), ["config", "user.email", "tests@example.com"]);
+        run_git(
+            workspace.as_path(),
+            ["commit", "--allow-empty", "-m", "workspace bot", "-m", "Generated-by: Agent"],
+        );
+
+        let manifest = WorkspaceManifest {
+            name: "Example".to_string(),
+            root: workspace,
+            repos: vec![],
+            shared_hooks_path: None,
+        };
+
+        let matches = collect_generated_history_matches(&manifest, &[], 25);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].repository_name, "(monorepo)");
+        assert!(matches[0].subject.contains("workspace bot"));
+    }
+
+    #[test]
+    fn collect_workspace_line_stats_reports_totals() {
+        let workspace = temp_dir_path("line-stats");
+        let repo_path = workspace.join("alpha");
+        fs::create_dir_all(&workspace).unwrap();
+        init_git_repo(&workspace);
+        init_git_repo(&repo_path);
+
+        let manifest = WorkspaceManifest {
+            name: "Example".to_string(),
+            root: workspace,
+            repos: vec![RepositoryEntry {
+                id: "alpha".to_string(),
+                name: "alpha".to_string(),
+                dir_name: "alpha".to_string(),
+                remote_url: "git@example.com:alpha.git".to_string(),
+                enabled: true,
+            }],
+            shared_hooks_path: None,
+        };
+
+        let stats = collect_workspace_line_stats(&manifest, None);
+        assert_eq!(stats.rows.len(), 2);
+        assert!(stats.total_additions >= 2);
+        assert!(stats.total_net >= 2);
+    }
+
+    #[test]
     fn format_sync_label_matches_mono_style() {
         assert_eq!(format_sync_label(&RepositorySync::UpToDate), "up-to-date");
         assert_eq!(format_sync_label(&RepositorySync::NoUpstream), "-");
@@ -900,6 +1198,38 @@ mod tests {
                 .any(|event| matches!(event.kind, OperationEventKind::Failed)
                     && event.message.contains("Push aborted"))
         );
+    }
+
+    #[test]
+    fn apply_hooks_configures_workspace_root_too() {
+        let workspace = temp_dir_path("apply-hooks-root");
+        let repo_path = workspace.join("alpha");
+        let hooks_path = workspace.join("hooks");
+        fs::create_dir_all(&hooks_path).unwrap();
+        init_git_repo(&workspace);
+        init_git_repo(&repo_path);
+
+        let manifest = WorkspaceManifest {
+            name: "Example".to_string(),
+            root: workspace.clone(),
+            repos: vec![RepositoryEntry {
+                id: "alpha".to_string(),
+                name: "alpha".to_string(),
+                dir_name: "alpha".to_string(),
+                remote_url: "git@example.com:alpha.git".to_string(),
+                enabled: true,
+            }],
+            shared_hooks_path: Some(hooks_path.clone()),
+        };
+
+        let mut events = Vec::new();
+        run_workspace_operation(&manifest, &[], OperationKind::ApplyHooks, |event| {
+            events.push(event);
+        });
+
+        let root_hooks = git_stdout(&workspace, ["config", "--local", "core.hooksPath"]);
+        assert_eq!(root_hooks.as_deref(), Some(hooks_path.to_string_lossy().as_ref()));
+        assert!(events.iter().any(|event| event.repository_name.as_deref() == Some("(monorepo)")));
     }
 
     fn init_git_repo(path: &Path) {

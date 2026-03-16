@@ -64,6 +64,14 @@ fn main() {
             id: "ronomepo.workspace.open_overview".to_string(),
             title: "Monorepo Overview".to_string(),
         },
+        CommandSpec {
+            id: "ronomepo.workspace.check_history".to_string(),
+            title: "Check History".to_string(),
+        },
+        CommandSpec {
+            id: "ronomepo.workspace.line_stats".to_string(),
+            title: "Line Stats".to_string(),
+        },
     ];
     product.toolbar_items = vec![
         ToolbarItemSpec {

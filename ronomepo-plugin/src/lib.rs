@@ -23,8 +23,9 @@ use maruzzella_sdk::{
 use ronomepo_core::{
     build_repository_list, default_manifest_path, derive_dir_name, format_sync_label,
     import_repos_txt, load_manifest, run_workspace_operation, save_manifest, workspace_summary,
-    collect_repository_details, OperationEvent, OperationEventKind, OperationKind, RepositoryEntry,
-    RepositoryListItem, MANIFEST_FILE_NAME, WorkspaceManifest,
+    collect_generated_history_matches, collect_repository_details, collect_workspace_line_stats,
+    OperationEvent, OperationEventKind, OperationKind, RepositoryEntry, RepositoryListItem,
+    MANIFEST_FILE_NAME, WorkspaceManifest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +45,8 @@ const CMD_PUSH: &str = "ronomepo.workspace.push";
 const CMD_PUSH_FORCE: &str = "ronomepo.workspace.push_force";
 const CMD_APPLY_HOOKS: &str = "ronomepo.workspace.apply_hooks";
 const CMD_OPEN_OVERVIEW: &str = "ronomepo.workspace.open_overview";
+const CMD_CHECK_HISTORY: &str = "ronomepo.workspace.check_history";
+const CMD_LINE_STATS: &str = "ronomepo.workspace.line_stats";
 
 struct RonomepoPlugin;
 
@@ -64,6 +67,8 @@ struct AppState {
     active_repo_id: Option<String>,
     logs: Vec<String>,
     next_operation_batch: usize,
+    history_report: Vec<String>,
+    line_stats_report: Vec<String>,
 }
 
 #[derive(Default)]
@@ -150,6 +155,14 @@ impl Plugin for RonomepoPlugin {
             CommandSpec::new(PLUGIN_ID, CMD_OPEN_OVERVIEW, "Monorepo Overview")
                 .with_handler(command_open_overview),
         )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_CHECK_HISTORY, "Check History")
+                .with_handler(command_check_history),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_LINE_STATS, "Line Stats")
+                .with_handler(command_line_stats),
+        )?;
 
         host.register_menu_item(MenuItemSpec::new(
             PLUGIN_ID,
@@ -213,6 +226,20 @@ impl Plugin for RonomepoPlugin {
             MzMenuSurface::ViewItems,
             "Monorepo Overview",
             CMD_OPEN_OVERVIEW,
+        ))?;
+        host.register_menu_item(MenuItemSpec::new(
+            PLUGIN_ID,
+            "ronomepo-check-history",
+            MzMenuSurface::ViewItems,
+            "Check History",
+            CMD_CHECK_HISTORY,
+        ))?;
+        host.register_menu_item(MenuItemSpec::new(
+            PLUGIN_ID,
+            "ronomepo-line-stats",
+            MzMenuSurface::ViewItems,
+            "Line Stats",
+            CMD_LINE_STATS,
         ))?;
 
         host.register_surface_contribution(SurfaceContributionSpec::about_section(
@@ -429,6 +456,40 @@ extern "C" fn command_open_overview(
     }
 }
 
+extern "C" fn command_check_history(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    match refresh_history_report(25) {
+        Ok(message) => {
+            append_log(message);
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::OK
+        }
+        Err(message) => {
+            append_log(message);
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
+        }
+    }
+}
+
+extern "C" fn command_line_stats(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    match refresh_line_stats_report(None) {
+        Ok(message) => {
+            append_log(message);
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::OK
+        }
+        Err(message) => {
+            append_log(message);
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
+        }
+    }
+}
+
 fn refresh_workspace() -> Result<String, String> {
     let mut app_state = state().lock().expect("state mutex poisoned");
     let manifest_path = default_manifest_path(&app_state.workspace_root);
@@ -466,6 +527,88 @@ fn import_workspace_from_repos_txt() -> Result<String, String> {
         repos_path.display(),
         manifest_path.display()
     ))
+}
+
+fn refresh_history_report(num_commits: usize) -> Result<String, String> {
+    let (manifest, selected_repo_ids) = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        (
+            app_state.manifest.clone(),
+            app_state.selected_repo_ids.clone(),
+        )
+    };
+    let Some(manifest) = manifest else {
+        return Err(format!(
+            "Check History skipped because no {} is loaded.",
+            MANIFEST_FILE_NAME
+        ));
+    };
+
+    let matches = collect_generated_history_matches(&manifest, &selected_repo_ids, num_commits);
+    let lines = if matches.is_empty() {
+        vec![format!(
+            "No generated-commit markers found in the last {num_commits} commits."
+        )]
+    } else {
+        matches
+            .into_iter()
+            .map(|entry| {
+                let markers = entry.matching_lines.join(" | ");
+                format!(
+                    "{} | HEAD~{} | {} | {} | {}",
+                    entry.repository_name, entry.head_offset, entry.commit_hash, entry.subject, markers
+                )
+            })
+            .collect()
+    };
+
+    let count = lines.len();
+    let mut app_state = state().lock().expect("state mutex poisoned");
+    app_state.history_report = lines;
+    Ok(format!(
+        "History check completed over the last {num_commits} commits ({count} report line(s))."
+    ))
+}
+
+fn refresh_line_stats_report(since_date: Option<&str>) -> Result<String, String> {
+    let manifest = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        app_state.manifest.clone()
+    };
+    let Some(manifest) = manifest else {
+        return Err(format!(
+            "Line Stats skipped because no {} is loaded.",
+            MANIFEST_FILE_NAME
+        ));
+    };
+
+    let stats = collect_workspace_line_stats(&manifest, since_date);
+    let mut lines = stats
+        .rows
+        .into_iter()
+        .map(|row| {
+            if row.missing {
+                format!("{} | missing", row.repository_name)
+            } else {
+                format!(
+                    "{} | +{} | -{} | {:+}",
+                    row.repository_name, row.additions, row.deletions, row.net
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    lines.push(format!(
+        "TOTAL | +{} | -{} | {:+}",
+        stats.total_additions, stats.total_deletions, stats.total_net
+    ));
+
+    let rows = lines.len();
+    let mut app_state = state().lock().expect("state mutex poisoned");
+    app_state.line_stats_report = lines;
+    Ok(match since_date {
+        Some(since_date) => format!("Line stats refreshed since {since_date} ({rows} row(s))."),
+        None => format!("Line stats refreshed for all time ({rows} row(s))."),
+    })
 }
 
 fn append_log(message: String) {
@@ -660,6 +803,8 @@ struct StateSnapshot {
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
+    history_report: Vec<String>,
+    line_stats_report: Vec<String>,
 }
 
 fn snapshot() -> StateSnapshot {
@@ -673,6 +818,8 @@ fn snapshot() -> StateSnapshot {
         selected_repo_ids: app_state.selected_repo_ids.clone(),
         active_repo_id: app_state.active_repo_id.clone(),
         logs: app_state.logs.clone(),
+        history_report: app_state.history_report.clone(),
+        line_stats_report: app_state.line_stats_report.clone(),
     }
 }
 
@@ -1430,6 +1577,7 @@ fn render_monorepo_overview_into(
 
     let actions = overview_actions();
     let selection_actions = monorepo_selection_actions(snapshot, host_ptr, &items);
+    let report_actions = monorepo_report_actions();
     let file_actions = overview_file_actions(snapshot, host_ptr);
 
     let sections = GtkBox::new(Orientation::Vertical, 12);
@@ -1483,12 +1631,25 @@ fn render_monorepo_overview_into(
         &selected,
         Some(8),
     );
+    append_lines_section(
+        &sections,
+        "History Check",
+        &snapshot.history_report,
+        "Run Check History to scan recent commits for generated markers.",
+    );
+    append_lines_section(
+        &sections,
+        "Line Stats",
+        &snapshot.line_stats_report,
+        "Run Line Stats to inspect additions and deletions across the workspace.",
+    );
     append_log_section(&sections, "Recent Operations", &snapshot.logs, 8);
 
     root.append(&hero);
     root.append(&stats);
     root.append(&actions);
     root.append(&selection_actions);
+    root.append(&report_actions);
     root.append(&file_actions);
     root.append(&sections);
 }
@@ -2212,6 +2373,23 @@ fn monorepo_selection_actions(
         }
     });
     actions.append(&settings);
+
+    actions
+}
+
+fn monorepo_report_actions() -> GtkBox {
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
+
+    for (label, handler) in [
+        ("Check History", command_check_history as extern "C" fn(_) -> _),
+        ("Line Stats", command_line_stats as extern "C" fn(_) -> _),
+    ] {
+        let button = Button::with_label(label);
+        button.connect_clicked(move |_| {
+            let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
+        });
+        actions.append(&button);
+    }
 
     actions
 }
