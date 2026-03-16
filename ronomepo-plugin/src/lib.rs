@@ -69,6 +69,7 @@ struct AppState {
     next_operation_batch: usize,
     history_report: Vec<String>,
     line_stats_report: Vec<String>,
+    line_stats_since: String,
 }
 
 #[derive(Default)]
@@ -476,7 +477,7 @@ extern "C" fn command_check_history(
 extern "C" fn command_line_stats(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    match refresh_line_stats_report(None) {
+    match refresh_line_stats_report_from_state() {
         Ok(message) => {
             append_log(message);
             refresh_views();
@@ -609,6 +610,15 @@ fn refresh_line_stats_report(since_date: Option<&str>) -> Result<String, String>
         Some(since_date) => format!("Line stats refreshed since {since_date} ({rows} row(s))."),
         None => format!("Line stats refreshed for all time ({rows} row(s))."),
     })
+}
+
+fn refresh_line_stats_report_from_state() -> Result<String, String> {
+    let since = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        let trimmed = app_state.line_stats_since.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    };
+    refresh_line_stats_report(since.as_deref())
 }
 
 fn append_log(message: String) {
@@ -805,6 +815,7 @@ struct StateSnapshot {
     logs: Vec<String>,
     history_report: Vec<String>,
     line_stats_report: Vec<String>,
+    line_stats_since: String,
 }
 
 fn snapshot() -> StateSnapshot {
@@ -820,6 +831,7 @@ fn snapshot() -> StateSnapshot {
         logs: app_state.logs.clone(),
         history_report: app_state.history_report.clone(),
         line_stats_report: app_state.line_stats_report.clone(),
+        line_stats_since: app_state.line_stats_since.clone(),
     }
 }
 
@@ -1094,6 +1106,11 @@ fn update_monitor_filter(filter: String) {
 fn update_monitor_show_all(show_all: bool) {
     let mut app_state = state().lock().expect("state mutex poisoned");
     app_state.monitor_show_all = show_all;
+}
+
+fn update_line_stats_since(value: String) {
+    let mut app_state = state().lock().expect("state mutex poisoned");
+    app_state.line_stats_since = value;
 }
 
 fn open_repo_overviews(
@@ -1577,7 +1594,7 @@ fn render_monorepo_overview_into(
 
     let actions = overview_actions();
     let selection_actions = monorepo_selection_actions(snapshot, host_ptr, &items);
-    let report_actions = monorepo_report_actions();
+    let report_actions = monorepo_report_actions(snapshot);
     let file_actions = overview_file_actions(snapshot, host_ptr);
 
     let sections = GtkBox::new(Orientation::Vertical, 12);
@@ -2377,19 +2394,36 @@ fn monorepo_selection_actions(
     actions
 }
 
-fn monorepo_report_actions() -> GtkBox {
+fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
     let actions = GtkBox::new(Orientation::Horizontal, 8);
 
-    for (label, handler) in [
-        ("Check History", command_check_history as extern "C" fn(_) -> _),
-        ("Line Stats", command_line_stats as extern "C" fn(_) -> _),
-    ] {
-        let button = Button::with_label(label);
-        button.connect_clicked(move |_| {
-            let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
-        });
-        actions.append(&button);
-    }
+    let history = Button::with_label("Check History");
+    history.connect_clicked(|_| {
+        let _ = command_check_history(maruzzella_sdk::ffi::MzBytes::empty());
+    });
+    actions.append(&history);
+
+    let since_entry = Entry::new();
+    since_entry.set_placeholder_text(Some("Since date YYYY-MM-DD"));
+    since_entry.set_text(&snapshot.line_stats_since);
+    since_entry.set_hexpand(true);
+    since_entry.connect_changed(|entry| {
+        update_line_stats_since(entry.text().to_string());
+    });
+    actions.append(&since_entry);
+
+    let line_stats = Button::with_label("Line Stats");
+    line_stats.connect_clicked(|_| {
+        let _ = command_line_stats(maruzzella_sdk::ffi::MzBytes::empty());
+    });
+    actions.append(&line_stats);
+
+    let all_time = Button::with_label("All Time");
+    all_time.connect_clicked(|_| {
+        update_line_stats_since(String::new());
+        let _ = command_line_stats(maruzzella_sdk::ffi::MzBytes::empty());
+    });
+    actions.append(&all_time);
 
     actions
 }
