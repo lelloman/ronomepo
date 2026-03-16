@@ -1,6 +1,8 @@
 use std::cell::RefCell;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
@@ -865,6 +867,15 @@ fn build_repo_context_menu(
         };
         open_repo_overviews(host_ptr, &repo_ids);
     });
+    append_context_button(&menu, &popover, "Open Folder", || {
+        open_selected_repo_folders();
+    });
+    append_context_button(&menu, &popover, "Open Terminal", || {
+        open_selected_repo_terminal();
+    });
+    append_context_button(&menu, &popover, "Open In Editor", || {
+        open_selected_repo_in_editor();
+    });
     append_context_button(&menu, &popover, "Pull", || {
         let _ = command_pull(maruzzella_sdk::ffi::MzBytes::empty());
     });
@@ -1339,6 +1350,9 @@ fn repo_overview_actions(item: &RepositoryListItem) -> GtkBox {
     let actions = GtkBox::new(Orientation::Horizontal, 8);
     for (label, kind) in [
         ("Target This Repo", None),
+        ("Open Folder", None),
+        ("Open Terminal", None),
+        ("Open In Editor", None),
         ("Clone Repo", Some(OperationKind::CloneMissing)),
         ("Pull Repo", Some(OperationKind::Pull)),
         ("Push Repo", Some(OperationKind::Push)),
@@ -1346,12 +1360,29 @@ fn repo_overview_actions(item: &RepositoryListItem) -> GtkBox {
     ] {
         let button = Button::with_label(label);
         let repo_id = item.id.clone();
+        let repo_name = item.name.clone();
+        let repo_path = item.status.repo_path.clone();
         button.connect_clicked(move |_| {
-            set_selected_repo_ids(vec![repo_id.clone()]);
-            if let Some(kind) = kind {
-                launch_operation(kind);
-            } else {
-                append_log(format!("Targeted {repo_id} as the active selection."));
+            match label {
+                "Target This Repo" => {
+                    set_selected_repo_ids(vec![repo_id.clone()]);
+                    append_log(format!("Targeted {repo_id} as the active selection."));
+                }
+                "Open Folder" => {
+                    open_path_in_file_manager(&repo_path, &repo_name);
+                }
+                "Open Terminal" => {
+                    open_path_in_terminal(&repo_path, &repo_name);
+                }
+                "Open In Editor" => {
+                    open_path_in_editor(&repo_path, &repo_name);
+                }
+                _ => {
+                    set_selected_repo_ids(vec![repo_id.clone()]);
+                    if let Some(kind) = kind {
+                        launch_operation(kind);
+                    }
+                }
             }
         });
         actions.append(&button);
@@ -1573,6 +1604,134 @@ fn repo_recent_logs(snapshot: &StateSnapshot, item: &RepositoryListItem) -> Vec<
 fn set_selected_repo_ids(ids: Vec<String>) {
     update_selected_repo_ids(ids);
     refresh_views();
+}
+
+fn selected_repository_items_from_state() -> Vec<RepositoryListItem> {
+    let snapshot = snapshot();
+    let items = repository_items(&snapshot);
+    selected_repository_items(&snapshot, &items)
+}
+
+fn open_selected_repo_folders() {
+    let selected = selected_repository_items_from_state();
+    if selected.is_empty() {
+        append_log("Open Folder skipped because no repos are selected.".to_string());
+        return;
+    }
+
+    for item in selected {
+        open_path_in_file_manager(&item.status.repo_path, &item.name);
+    }
+}
+
+fn open_selected_repo_terminal() {
+    let selected = selected_repository_items_from_state();
+    let Some(item) = selected.first() else {
+        append_log("Open Terminal skipped because no repos are selected.".to_string());
+        return;
+    };
+    if selected.len() > 1 {
+        append_log(format!(
+            "Open Terminal will use the first selected repo only: {}.",
+            item.name
+        ));
+    }
+    open_path_in_terminal(&item.status.repo_path, &item.name);
+}
+
+fn open_selected_repo_in_editor() {
+    let selected = selected_repository_items_from_state();
+    let Some(item) = selected.first() else {
+        append_log("Open In Editor skipped because no repos are selected.".to_string());
+        return;
+    };
+    if selected.len() > 1 {
+        append_log(format!(
+            "Open In Editor will use the first selected repo only: {}.",
+            item.name
+        ));
+    }
+    open_path_in_editor(&item.status.repo_path, &item.name);
+}
+
+fn open_path_in_file_manager(path: &Path, label: &str) {
+    if !path.exists() {
+        append_log(format!(
+            "Open Folder skipped for {label} because {} does not exist.",
+            path.display()
+        ));
+        return;
+    }
+
+    match Command::new("xdg-open").arg(path).spawn() {
+        Ok(_) => append_log(format!("Opened folder for {label}: {}", path.display())),
+        Err(error) => append_log(format!(
+            "Failed to open folder for {label} at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn open_path_in_terminal(path: &Path, label: &str) {
+    if !path.exists() {
+        append_log(format!(
+            "Open Terminal skipped for {label} because {} does not exist.",
+            path.display()
+        ));
+        return;
+    }
+
+    let path_text = path.display().to_string();
+    for (program, flag) in [
+        ("x-terminal-emulator", "--working-directory"),
+        ("kgx", "--working-directory"),
+        ("gnome-terminal", "--working-directory"),
+        ("konsole", "--workdir"),
+        ("alacritty", "--working-directory"),
+        ("kitty", "--directory"),
+    ] {
+        if Command::new(program).args([flag, path_text.as_str()]).spawn().is_ok() {
+            append_log(format!("Opened terminal for {label}: {}", path.display()));
+            return;
+        }
+    }
+
+    append_log(format!(
+        "Failed to open terminal for {label}: no supported terminal launcher was found."
+    ));
+}
+
+fn open_path_in_editor(path: &Path, label: &str) {
+    if !path.exists() {
+        append_log(format!(
+            "Open In Editor skipped for {label} because {} does not exist.",
+            path.display()
+        ));
+        return;
+    }
+
+    for variable in ["RONOMEPO_EDITOR", "VISUAL", "EDITOR"] {
+        if let Some(command) = env::var_os(variable) {
+            if Command::new(&command).arg(path).spawn().is_ok() {
+                append_log(format!(
+                    "Opened {label} in editor from {variable}: {}",
+                    path.display()
+                ));
+                return;
+            }
+        }
+    }
+
+    match Command::new("xdg-open").arg(path).spawn() {
+        Ok(_) => append_log(format!(
+            "Opened {label} in the desktop editor fallback: {}",
+            path.display()
+        )),
+        Err(error) => append_log(format!(
+            "Failed to open {label} in an editor at {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 extern "C" fn create_text_editor_view(
