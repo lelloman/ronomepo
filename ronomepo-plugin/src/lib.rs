@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -6,7 +7,7 @@ use std::thread;
 use gtk::glib::{self, translate::IntoGlibPtr};
 use gtk::prelude::*;
 use gtk::{
-    Align, Box as GtkBox, Button, GestureClick, Label, ListBox, ListBoxRow, Orientation,
+    Align, Box as GtkBox, Button, Entry, GestureClick, Label, ListBox, ListBoxRow, Orientation,
     PolicyType, Popover, PositionType, ScrolledWindow, SelectionMode, Separator, TextBuffer,
     TextView, WrapMode,
 };
@@ -26,6 +27,7 @@ const PLUGIN_ID: &str = "com.lelloman.ronomepo";
 const VIEW_REPO_MONITOR: &str = "com.lelloman.ronomepo.repo_monitor";
 const VIEW_MONOREPO_OVERVIEW: &str = "com.lelloman.ronomepo.monorepo_overview";
 const VIEW_REPO_OVERVIEW: &str = "com.lelloman.ronomepo.repo_overview";
+const VIEW_TEXT_EDITOR: &str = "com.lelloman.ronomepo.text_editor";
 const VIEW_OPERATIONS: &str = "com.lelloman.ronomepo.operations";
 const CMD_REFRESH: &str = "ronomepo.workspace.refresh";
 const CMD_IMPORT: &str = "ronomepo.workspace.import_repos_txt";
@@ -212,6 +214,13 @@ impl Plugin for RonomepoPlugin {
             "Repo Overview",
             MzViewPlacement::Workbench,
             create_repo_overview_view,
+        ))?;
+        host.register_view_factory(ViewFactorySpec::new(
+            PLUGIN_ID,
+            VIEW_TEXT_EDITOR,
+            "Text Editor",
+            MzViewPlacement::Workbench,
+            create_text_editor_view,
         ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
@@ -1137,6 +1146,123 @@ fn append_overview_section(container: &GtkBox, heading: &str, body: &str) {
 fn clear_box(root: &GtkBox) {
     while let Some(child) = root.first_child() {
         root.remove(&child);
+    }
+}
+
+extern "C" fn create_text_editor_view(
+    _host: *const maruzzella_sdk::ffi::MzHostApi,
+    _request: *const maruzzella_sdk::ffi::MzViewRequest,
+) -> *mut std::ffi::c_void {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        return std::ptr::null_mut();
+    }
+
+    let root = GtkBox::new(Orientation::Vertical, 12);
+    root.set_margin_top(18);
+    root.set_margin_bottom(18);
+    root.set_margin_start(18);
+    root.set_margin_end(18);
+
+    let title = Label::new(Some("Text Editor"));
+    title.set_xalign(0.0);
+    title.add_css_class("title-3");
+
+    let toolbar = GtkBox::new(Orientation::Horizontal, 8);
+    let path_entry = Entry::new();
+    path_entry.set_hexpand(true);
+    path_entry.set_placeholder_text(Some("Relative or absolute file path"));
+
+    let open_button = Button::with_label("Open");
+    let save_button = Button::with_label("Save");
+    let format_button = Button::with_label("Format");
+
+    toolbar.append(&path_entry);
+    toolbar.append(&open_button);
+    toolbar.append(&save_button);
+    toolbar.append(&format_button);
+
+    let status = Label::new(Some("Open a text file from the workspace."));
+    status.set_xalign(0.0);
+    status.add_css_class("muted");
+    status.set_wrap(true);
+
+    let buffer = TextBuffer::new(None);
+    let text = TextView::with_buffer(&buffer);
+    text.set_monospace(true);
+    text.set_wrap_mode(WrapMode::WordChar);
+    text.set_vexpand(true);
+
+    let scroller = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(PolicyType::Automatic)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .child(&text)
+        .build();
+
+    open_button.connect_clicked({
+        let path_entry = path_entry.clone();
+        let buffer = buffer.clone();
+        let status = status.clone();
+        move |_| {
+            let path = resolve_editor_path(path_entry.text().as_str());
+            match fs::read_to_string(&path) {
+                Ok(content) => {
+                    buffer.set_text(&content);
+                    status.set_text(&format!("Loaded {}", path.display()));
+                }
+                Err(error) => {
+                    status.set_text(&format!("Failed to open {}: {error}", path.display()));
+                }
+            }
+        }
+    });
+
+    save_button.connect_clicked({
+        let path_entry = path_entry.clone();
+        let buffer = buffer.clone();
+        let status = status.clone();
+        move |_| {
+            let path = resolve_editor_path(path_entry.text().as_str());
+            let content = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+            match fs::write(&path, content.as_str()) {
+                Ok(()) => {
+                    status.set_text(&format!("Saved {}", path.display()));
+                }
+                Err(error) => {
+                    status.set_text(&format!("Failed to save {}: {error}", path.display()));
+                }
+            }
+        }
+    });
+
+    format_button.connect_clicked({
+        let status = status.clone();
+        move |_| {
+            status.set_text(
+                "Formatting is intentionally deferred. This editor is the Ronomepo-local stopgap until Maruzzella owns it.",
+            );
+        }
+    });
+
+    root.append(&title);
+    root.append(&toolbar);
+    root.append(&status);
+    root.append(&scroller);
+
+    unsafe {
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+            as *mut std::ffi::c_void
+    }
+}
+
+fn resolve_editor_path(input: &str) -> PathBuf {
+    let trimmed = input.trim();
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        path
+    } else {
+        snapshot().workspace_root.join(path)
     }
 }
 

@@ -162,6 +162,14 @@ fn main() {
                 "The Ronomepo repo overview could not be created.",
                 false,
             ),
+            plugin_tab(
+                "text-editor",
+                "workbench-main",
+                "Text Editor",
+                "com.lelloman.ronomepo.text_editor",
+                "The Ronomepo text editor could not be created.",
+                false,
+            ),
         ],
     ));
 
