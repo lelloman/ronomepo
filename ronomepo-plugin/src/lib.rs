@@ -3,6 +3,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
@@ -11,7 +13,7 @@ use gtk::prelude::*;
 use gtk::{
     Align, Box as GtkBox, Button, Entry, GestureClick, Label, ListBox, ListBoxRow, Orientation,
     PolicyType, Popover, PositionType, ScrolledWindow, SelectionMode, Separator, TextBuffer,
-    TextView, WrapMode,
+    TextView, WrapMode, CheckButton,
 };
 use maruzzella_sdk::{
     export_plugin, CommandSpec, HostApi, MenuItemSpec, MzLogLevel, MzMenuSurface,
@@ -19,9 +21,10 @@ use maruzzella_sdk::{
     PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use ronomepo_core::{
-    build_repository_list, default_manifest_path, format_sync_label, import_repos_txt,
-    load_manifest, run_workspace_operation, save_manifest, workspace_summary, OperationEvent,
-    OperationEventKind, OperationKind, RepositoryListItem, MANIFEST_FILE_NAME, WorkspaceManifest,
+    build_repository_list, default_manifest_path, derive_dir_name, format_sync_label,
+    import_repos_txt, load_manifest, run_workspace_operation, save_manifest, workspace_summary,
+    OperationEvent, OperationEventKind, OperationKind, RepositoryEntry, RepositoryListItem,
+    MANIFEST_FILE_NAME, WorkspaceManifest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +32,7 @@ const PLUGIN_ID: &str = "com.lelloman.ronomepo";
 const VIEW_REPO_MONITOR: &str = "com.lelloman.ronomepo.repo_monitor";
 const VIEW_MONOREPO_OVERVIEW: &str = "com.lelloman.ronomepo.monorepo_overview";
 const VIEW_REPO_OVERVIEW: &str = "com.lelloman.ronomepo.repo_overview";
+const VIEW_WORKSPACE_SETTINGS: &str = "com.lelloman.ronomepo.workspace_settings";
 const VIEW_TEXT_EDITOR: &str = "com.lelloman.ronomepo.text_editor";
 const VIEW_OPERATIONS: &str = "com.lelloman.ronomepo.operations";
 const CMD_REFRESH: &str = "ronomepo.workspace.refresh";
@@ -78,10 +82,12 @@ thread_local! {
     static REPOSITORY_VIEWS: RefCell<Vec<RepositoryViewHandle>> = const { RefCell::new(Vec::new()) };
     static MONOREPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static REPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
+    static WORKSPACE_SETTINGS_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_BUFFERS: RefCell<Vec<glib::WeakRef<TextBuffer>>> = const { RefCell::new(Vec::new()) };
 }
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
+static LAST_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
 
 fn state() -> &'static Mutex<AppState> {
     STATE.get_or_init(|| Mutex::new(AppState::default()))
@@ -224,6 +230,13 @@ impl Plugin for RonomepoPlugin {
         ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
+            VIEW_WORKSPACE_SETTINGS,
+            "Workspace Settings",
+            MzViewPlacement::Workbench,
+            create_workspace_settings_view,
+        ))?;
+        host.register_view_factory(ViewFactorySpec::new(
+            PLUGIN_ID,
             VIEW_TEXT_EDITOR,
             "Text Editor",
             MzViewPlacement::Workbench,
@@ -317,9 +330,14 @@ extern "C" fn command_import_repos_txt(
 extern "C" fn command_open_settings(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    append_log("Workspace settings are not implemented yet.".to_string());
-    refresh_views();
-    maruzzella_sdk::ffi::MzStatus::OK
+    match open_workspace_settings_tab() {
+        Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
+        Err(message) => {
+            append_log(message);
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
+        }
+    }
 }
 
 extern "C" fn command_clone_missing(
@@ -503,6 +521,17 @@ fn refresh_views() {
         });
     });
 
+    WORKSPACE_SETTINGS_VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        views.retain(|handle| match handle.root.upgrade() {
+            Some(root) => {
+                render_workspace_settings_into(&root, &snapshot, handle.host_ptr as *const _);
+                true
+            }
+            None => false,
+        });
+    });
+
     OPERATION_BUFFERS.with(|buffers| {
         let mut buffers = buffers.borrow_mut();
         buffers.retain(|buffer_ref| match buffer_ref.upgrade() {
@@ -513,6 +542,44 @@ fn refresh_views() {
             None => false,
         });
     });
+}
+
+fn remember_host_ptr(host: *const maruzzella_sdk::ffi::MzHostApi) {
+    if !host.is_null() {
+        LAST_HOST_PTR.store(host as usize, Ordering::Relaxed);
+    }
+}
+
+fn current_host_ptr() -> *const maruzzella_sdk::ffi::MzHostApi {
+    LAST_HOST_PTR.load(Ordering::Relaxed) as *const _
+}
+
+fn open_workspace_settings_tab() -> Result<(), String> {
+    let host_ptr = current_host_ptr();
+    if host_ptr.is_null() {
+        return Err(
+            "Cannot open Workspace Settings because the Maruzzella host handle is unavailable."
+                .to_string(),
+        );
+    }
+
+    let host = unsafe { HostApi::from_raw(&*host_ptr) };
+    let request = OpenViewRequest::new(
+        PLUGIN_ID,
+        VIEW_WORKSPACE_SETTINGS,
+        MzViewPlacement::Workbench,
+    );
+    match host.open_view(&request) {
+        Ok(MzViewOpenDisposition::Opened) => {
+            append_log("Opened Workspace Settings.".to_string());
+            Ok(())
+        }
+        Ok(MzViewOpenDisposition::FocusedExisting) => {
+            append_log("Focused existing Workspace Settings tab.".to_string());
+            Ok(())
+        }
+        Err(status) => Err(format!("Failed to open Workspace Settings: {status:?}")),
+    }
 }
 
 #[derive(Clone)]
@@ -922,6 +989,8 @@ extern "C" fn create_repo_monitor_view(
         return std::ptr::null_mut();
     }
 
+    remember_host_ptr(host);
+
     let root = GtkBox::new(Orientation::Vertical, 12);
     root.set_margin_top(18);
     root.set_margin_bottom(18);
@@ -1030,6 +1099,8 @@ extern "C" fn create_monorepo_overview_view(
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         return std::ptr::null_mut();
     }
+
+    remember_host_ptr(host);
 
     let root = GtkBox::new(Orientation::Vertical, 18);
     root.set_margin_top(24);
@@ -1215,6 +1286,8 @@ extern "C" fn create_repo_overview_view(
         return std::ptr::null_mut();
     }
 
+    remember_host_ptr(host);
+
     let root = GtkBox::new(Orientation::Vertical, 18);
     root.set_margin_top(24);
     root.set_margin_bottom(24);
@@ -1239,6 +1312,392 @@ extern "C" fn create_repo_overview_view(
     unsafe {
         <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
             as *mut std::ffi::c_void
+    }
+}
+
+#[derive(Clone)]
+struct RepoEditorRowHandle {
+    enabled: CheckButton,
+    name: Entry,
+    dir_name: Entry,
+    remote_url: Entry,
+}
+
+extern "C" fn create_workspace_settings_view(
+    host: *const maruzzella_sdk::ffi::MzHostApi,
+    _request: *const maruzzella_sdk::ffi::MzViewRequest,
+) -> *mut std::ffi::c_void {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        return std::ptr::null_mut();
+    }
+
+    remember_host_ptr(host);
+
+    let root = GtkBox::new(Orientation::Vertical, 18);
+    root.set_margin_top(24);
+    root.set_margin_bottom(24);
+    root.set_margin_start(24);
+    root.set_margin_end(24);
+
+    let snapshot = snapshot();
+    render_workspace_settings_into(&root, &snapshot, host);
+
+    let root_ref = glib::WeakRef::new();
+    root_ref.set(Some(&root));
+    WORKSPACE_SETTINGS_VIEWS.with(|views| {
+        views.borrow_mut().push(ContainerViewHandle {
+            root: root_ref,
+            instance_key: None,
+            host_ptr: host as usize,
+        });
+    });
+
+    unsafe {
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+            as *mut std::ffi::c_void
+    }
+}
+
+fn render_workspace_settings_into(
+    root: &GtkBox,
+    snapshot: &StateSnapshot,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) {
+    clear_box(root);
+
+    let manifest = snapshot.manifest.clone().unwrap_or_else(|| WorkspaceManifest {
+        name: workspace_name_from_root(&snapshot.workspace_root),
+        root: snapshot.workspace_root.clone(),
+        repos: Vec::new(),
+        shared_hooks_path: Some(snapshot.workspace_root.join("hooks")),
+    });
+
+    let title = Label::new(Some("Workspace Settings"));
+    title.set_xalign(0.0);
+    title.add_css_class("title-2");
+
+    let subtitle = Label::new(Some(
+        "Edit the workspace manifest directly. Changes here become the source of truth for Ronomepo.",
+    ));
+    subtitle.set_xalign(0.0);
+    subtitle.set_wrap(true);
+    subtitle.add_css_class("muted");
+
+    let name_entry = Entry::new();
+    name_entry.set_text(&manifest.name);
+    let root_entry = Entry::new();
+    root_entry.set_text(&manifest.root.display().to_string());
+    let hooks_entry = Entry::new();
+    hooks_entry.set_text(
+        &manifest
+            .shared_hooks_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    );
+
+    let form = GtkBox::new(Orientation::Vertical, 8);
+    form.append(&labeled_field("Workspace Name", &name_entry));
+    form.append(&labeled_field("Workspace Root", &root_entry));
+    form.append(&labeled_field("Shared Hooks Path", &hooks_entry));
+
+    let repo_header = Label::new(Some("Repositories"));
+    repo_header.set_xalign(0.0);
+    repo_header.add_css_class("title-4");
+
+    let repo_help = Label::new(Some(
+        "Each repository row controls one manifest entry. Empty rows are ignored on save.",
+    ));
+    repo_help.set_xalign(0.0);
+    repo_help.set_wrap(true);
+    repo_help.add_css_class("muted");
+
+    let repo_rows_box = GtkBox::new(Orientation::Vertical, 8);
+    let repo_rows = Rc::new(RefCell::new(Vec::<RepoEditorRowHandle>::new()));
+    for repo in &manifest.repos {
+        append_repo_editor_row(&repo_rows_box, &repo_rows, Some(repo));
+    }
+    if manifest.repos.is_empty() {
+        append_repo_editor_row(&repo_rows_box, &repo_rows, None);
+    }
+
+    let repo_scroller = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .min_content_height(280)
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .child(&repo_rows_box)
+        .build();
+
+    let status = Label::new(Some(
+        "Use Save Manifest to persist changes, or Import repos.txt to regenerate entries from the legacy file.",
+    ));
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.add_css_class("muted");
+
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
+    let add_repo = Button::with_label("Add Repo");
+    let save = Button::with_label("Save Manifest");
+    let reload = Button::with_label("Reload Manifest");
+    let import = Button::with_label("Import repos.txt");
+    let edit_manifest = Button::with_label("Edit Manifest File");
+
+    add_repo.connect_clicked({
+        let repo_rows_box = repo_rows_box.clone();
+        let repo_rows = repo_rows.clone();
+        move |_| {
+            append_repo_editor_row(&repo_rows_box, &repo_rows, None);
+        }
+    });
+
+    save.connect_clicked({
+        let name_entry = name_entry.clone();
+        let root_entry = root_entry.clone();
+        let hooks_entry = hooks_entry.clone();
+        let status = status.clone();
+        let repo_rows = repo_rows.clone();
+        move |_| match save_workspace_manifest_from_editor(
+            host_ptr,
+            name_entry.text().as_str(),
+            root_entry.text().as_str(),
+            hooks_entry.text().as_str(),
+            &repo_rows.borrow(),
+        ) {
+            Ok(message) => {
+                status.set_text(&message);
+                append_log(message);
+                refresh_views();
+            }
+            Err(message) => {
+                status.set_text(&message);
+                append_log(message);
+            }
+        }
+    });
+
+    reload.connect_clicked({
+        let status = status.clone();
+        move |_| match refresh_workspace() {
+            Ok(message) => {
+                status.set_text(&message);
+                append_log(message);
+                refresh_views();
+            }
+            Err(message) => {
+                status.set_text(&message);
+                append_log(message);
+            }
+        }
+    });
+
+    import.connect_clicked({
+        let status = status.clone();
+        move |_| match import_workspace_from_repos_txt() {
+            Ok(message) => {
+                status.set_text(&message);
+                append_log(message);
+                refresh_views();
+            }
+            Err(message) => {
+                status.set_text(&message);
+                append_log(message);
+            }
+        }
+    });
+
+    let manifest_edit_path = snapshot
+        .manifest_path
+        .clone()
+        .unwrap_or_else(|| default_manifest_path(&snapshot.workspace_root));
+    edit_manifest.connect_clicked(move |_| {
+        let path = manifest_edit_path.clone();
+        open_text_editor_for_path(host_ptr, &path);
+    });
+
+    for button in [add_repo, save, reload, import, edit_manifest] {
+        actions.append(&button);
+    }
+
+    root.append(&title);
+    root.append(&subtitle);
+    root.append(&actions);
+    root.append(&form);
+    root.append(&repo_header);
+    root.append(&repo_help);
+    root.append(&repo_scroller);
+    root.append(&status);
+}
+
+fn labeled_field(label: &str, widget: &impl IsA<gtk::Widget>) -> GtkBox {
+    let row = GtkBox::new(Orientation::Vertical, 4);
+    let title = Label::new(Some(label));
+    title.set_xalign(0.0);
+    title.add_css_class("title-5");
+    row.append(&title);
+    row.append(widget);
+    row
+}
+
+fn append_repo_editor_row(
+    repo_rows_box: &GtkBox,
+    repo_rows: &Rc<RefCell<Vec<RepoEditorRowHandle>>>,
+    repo: Option<&RepositoryEntry>,
+) {
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    row.add_css_class("boxed-list");
+
+    let enabled = CheckButton::with_label("Enabled");
+    enabled.set_active(repo.map(|repo| repo.enabled).unwrap_or(true));
+
+    let name = Entry::new();
+    name.set_placeholder_text(Some("Name"));
+    name.set_hexpand(true);
+    name.set_text(repo.map(|repo| repo.name.as_str()).unwrap_or(""));
+
+    let dir_name = Entry::new();
+    dir_name.set_placeholder_text(Some("dir_name"));
+    dir_name.set_text(repo.map(|repo| repo.dir_name.as_str()).unwrap_or(""));
+
+    let remote_url = Entry::new();
+    remote_url.set_placeholder_text(Some("Remote URL"));
+    remote_url.set_hexpand(true);
+    remote_url.set_text(repo.map(|repo| repo.remote_url.as_str()).unwrap_or(""));
+
+    let remove = Button::with_label("Remove");
+    remove.connect_clicked({
+        let repo_rows_box = repo_rows_box.clone();
+        let repo_rows = repo_rows.clone();
+        let row = row.clone();
+        let enabled = enabled.clone();
+        let name = name.clone();
+        let dir_name = dir_name.clone();
+        let remote_url = remote_url.clone();
+        move |_| {
+            repo_rows_box.remove(&row);
+            repo_rows.borrow_mut().retain(|handle| {
+                !handle.enabled.eq(&enabled)
+                    && !handle.name.eq(&name)
+                    && !handle.dir_name.eq(&dir_name)
+                    && !handle.remote_url.eq(&remote_url)
+            });
+        }
+    });
+
+    row.append(&enabled);
+    row.append(&name);
+    row.append(&dir_name);
+    row.append(&remote_url);
+    row.append(&remove);
+    repo_rows_box.append(&row);
+
+    repo_rows.borrow_mut().push(RepoEditorRowHandle {
+        enabled,
+        name,
+        dir_name,
+        remote_url,
+    });
+}
+
+fn save_workspace_manifest_from_editor(
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    workspace_name: &str,
+    workspace_root: &str,
+    shared_hooks_path: &str,
+    repo_rows: &[RepoEditorRowHandle],
+) -> Result<String, String> {
+    let workspace_root = PathBuf::from(workspace_root.trim());
+    if workspace_root.as_os_str().is_empty() {
+        return Err("Workspace root cannot be empty.".to_string());
+    }
+
+    let mut repos = Vec::new();
+    for handle in repo_rows {
+        let remote_url = handle.remote_url.text().trim().to_string();
+        let mut dir_name = handle.dir_name.text().trim().to_string();
+        let mut name = handle.name.text().trim().to_string();
+
+        if remote_url.is_empty() && dir_name.is_empty() && name.is_empty() {
+            continue;
+        }
+
+        if remote_url.is_empty() {
+            return Err("Each non-empty repository row needs a remote URL.".to_string());
+        }
+        if dir_name.is_empty() {
+            dir_name = derive_dir_name(&remote_url).map_err(|error| error.to_string())?;
+        }
+        if name.is_empty() {
+            name = dir_name.clone();
+        }
+
+        repos.push(RepositoryEntry {
+            id: dir_name.clone(),
+            name,
+            dir_name,
+            remote_url,
+            enabled: handle.enabled.is_active(),
+        });
+    }
+
+    let manifest = WorkspaceManifest {
+        name: if workspace_name.trim().is_empty() {
+            workspace_name_from_root(&workspace_root)
+        } else {
+            workspace_name.trim().to_string()
+        },
+        root: workspace_root.clone(),
+        repos,
+        shared_hooks_path: if shared_hooks_path.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(shared_hooks_path.trim()))
+        },
+    };
+
+    let manifest_path = default_manifest_path(&workspace_root);
+    save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
+
+    {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        app_state.workspace_root = workspace_root.clone();
+        app_state.manifest_path = Some(manifest_path.clone());
+        app_state.manifest = Some(manifest.clone());
+        app_state.selected_repo_ids
+            .retain(|id| manifest.repos.iter().any(|repo| &repo.id == id));
+        if app_state
+            .active_repo_id
+            .as_ref()
+            .is_some_and(|id| !manifest.repos.iter().any(|repo| &repo.id == id))
+        {
+            app_state.active_repo_id = None;
+        }
+    }
+
+    persist_last_workspace_path(host_ptr, &workspace_root);
+
+    Ok(format!(
+        "Saved {} with {} repositories.",
+        manifest_path.display(),
+        manifest.repos.len()
+    ))
+}
+
+fn persist_last_workspace_path(
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    workspace_root: &Path,
+) {
+    if host_ptr.is_null() {
+        return;
+    }
+    let host = unsafe { HostApi::from_raw(&*host_ptr) };
+    let Ok(mut config) = ensure_config(&host) else {
+        return;
+    };
+    config.last_workspace_path = Some(workspace_root.display().to_string());
+    if let Ok(payload) = serde_json::to_vec(&config) {
+        let _ = host.write_config(&payload);
     }
 }
 
@@ -1839,6 +2298,8 @@ extern "C" fn create_text_editor_view(
         return std::ptr::null_mut();
     }
 
+    remember_host_ptr(host);
+
     let root = GtkBox::new(Orientation::Vertical, 12);
     root.set_margin_top(18);
     root.set_margin_bottom(18);
@@ -2013,12 +2474,14 @@ fn decode_mzstr(value: maruzzella_sdk::ffi::MzStr) -> Option<String> {
 }
 
 extern "C" fn create_operations_view(
-    _host: *const maruzzella_sdk::ffi::MzHostApi,
+    host: *const maruzzella_sdk::ffi::MzHostApi,
     _request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         return std::ptr::null_mut();
     }
+
+    remember_host_ptr(host);
 
     let root = GtkBox::new(Orientation::Vertical, 12);
     root.set_margin_top(18);
