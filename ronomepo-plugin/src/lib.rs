@@ -1089,6 +1089,11 @@ fn render_monorepo_overview_into(root: &GtkBox, snapshot: &StateSnapshot) {
         .iter()
         .filter(|item| matches!(item.status.sync, ronomepo_core::RepositorySync::NoUpstream))
         .count();
+    let attention = items
+        .iter()
+        .filter(|item| repo_attention_rank(item) < 7)
+        .count();
+    let selected = selected_repository_items(snapshot, &items);
 
     let hero = GtkBox::new(Orientation::Vertical, 8);
     let title = Label::new(Some("Monorepo Overview"));
@@ -1106,6 +1111,7 @@ fn render_monorepo_overview_into(root: &GtkBox, snapshot: &StateSnapshot) {
 
     let stats = GtkBox::new(Orientation::Horizontal, 12);
     for (label, value) in [
+        ("Attention", attention),
         ("Selected", snapshot.selected_repo_ids.len()),
         ("Dirty", dirty),
         ("Missing", missing),
@@ -1135,13 +1141,41 @@ fn render_monorepo_overview_into(root: &GtkBox, snapshot: &StateSnapshot) {
     );
     append_overview_section(
         &sections,
-        "Selection",
+        "Selection Scope",
+        &if selected.is_empty() {
+            "No repos selected. Toolbar and overview actions apply to the whole workspace."
+                .to_string()
+        } else {
+            format!(
+                "{} repos selected. Toolbar and overview actions target the current selection first.",
+                selected.len()
+            )
+        },
+    );
+    append_overview_section(
+        &sections,
+        "Repo Overview Focus",
         &snapshot
             .active_repo_id
             .as_ref()
             .map(|repo_id| format!("Active repo overview target: {repo_id}"))
             .unwrap_or_else(|| "No active repo overview target yet".to_string()),
     );
+    append_repo_group_section(
+        &sections,
+        "Needs Attention",
+        "Repos that are missing, dirty, behind, diverged, ahead, or missing an upstream.",
+        &attention_items(&items),
+        Some(8),
+    );
+    append_repo_group_section(
+        &sections,
+        "Current Selection",
+        "The repos currently selected in the left monitor.",
+        &selected,
+        Some(8),
+    );
+    append_log_section(&sections, "Recent Operations", &snapshot.logs, 8);
 
     root.append(&hero);
     root.append(&stats);
@@ -1298,6 +1332,111 @@ fn append_overview_section(container: &GtkBox, heading: &str, body: &str) {
     block.append(&body_label);
     container.append(&block);
     container.append(&Separator::new(Orientation::Horizontal));
+}
+
+fn append_repo_group_section(
+    container: &GtkBox,
+    heading: &str,
+    body: &str,
+    items: &[RepositoryListItem],
+    limit: Option<usize>,
+) {
+    let block = GtkBox::new(Orientation::Vertical, 6);
+
+    let heading_label = Label::new(Some(heading));
+    heading_label.set_xalign(0.0);
+    heading_label.add_css_class("title-4");
+
+    let body_label = Label::new(Some(body));
+    body_label.set_xalign(0.0);
+    body_label.set_wrap(true);
+    body_label.add_css_class("muted");
+
+    block.append(&heading_label);
+    block.append(&body_label);
+
+    if items.is_empty() {
+        let empty_label = Label::new(Some("Nothing to show."));
+        empty_label.set_xalign(0.0);
+        empty_label.add_css_class("muted");
+        block.append(&empty_label);
+    } else {
+        let take = limit.unwrap_or(items.len());
+        for item in items.iter().take(take) {
+            let row = Label::new(Some(&format!(
+                "{}  |  {}  |  {}  |  {}",
+                item.name,
+                branch_label(item),
+                status_label(&item.status.state),
+                format_sync_label(&item.status.sync)
+            )));
+            row.set_xalign(0.0);
+            row.add_css_class("mono");
+            block.append(&row);
+        }
+        if items.len() > take {
+            let more_label = Label::new(Some(&format!(
+                "{} more repos hidden in this section.",
+                items.len() - take
+            )));
+            more_label.set_xalign(0.0);
+            more_label.add_css_class("muted");
+            block.append(&more_label);
+        }
+    }
+
+    container.append(&block);
+    container.append(&Separator::new(Orientation::Horizontal));
+}
+
+fn append_log_section(container: &GtkBox, heading: &str, logs: &[String], limit: usize) {
+    let block = GtkBox::new(Orientation::Vertical, 6);
+
+    let heading_label = Label::new(Some(heading));
+    heading_label.set_xalign(0.0);
+    heading_label.add_css_class("title-4");
+    block.append(&heading_label);
+
+    if logs.is_empty() {
+        let empty_label = Label::new(Some("No operations recorded yet."));
+        empty_label.set_xalign(0.0);
+        empty_label.add_css_class("muted");
+        block.append(&empty_label);
+    } else {
+        for entry in logs.iter().rev().take(limit).rev() {
+            let row = Label::new(Some(entry));
+            row.set_xalign(0.0);
+            row.set_wrap(true);
+            row.add_css_class("mono");
+            block.append(&row);
+        }
+    }
+
+    container.append(&block);
+    container.append(&Separator::new(Orientation::Horizontal));
+}
+
+fn attention_items(items: &[RepositoryListItem]) -> Vec<RepositoryListItem> {
+    let mut attention = items
+        .iter()
+        .filter(|item| repo_attention_rank(item) < 7)
+        .cloned()
+        .collect::<Vec<_>>();
+    attention.sort_by_key(repo_monitor_sort_key);
+    attention
+}
+
+fn selected_repository_items(
+    snapshot: &StateSnapshot,
+    items: &[RepositoryListItem],
+) -> Vec<RepositoryListItem> {
+    let mut selected = items
+        .iter()
+        .filter(|item| snapshot.selected_repo_ids.iter().any(|id| id == &item.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    selected.sort_by_key(repo_monitor_sort_key);
+    selected
 }
 
 fn clear_box(root: &GtkBox) {
