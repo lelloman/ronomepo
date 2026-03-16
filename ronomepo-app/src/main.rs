@@ -1,9 +1,11 @@
 use std::env;
 use std::path::PathBuf;
 
+use gtk::gio::prelude::ApplicationExtManual;
 use maruzzella::{
-    default_product_spec, load_static_plugin, plugin_tab, run, BottomPanelLayout, CommandSpec,
-    MaruzzellaConfig, MenuRootSpec, TabGroupSpec, ThemeSpec, ToolbarItemSpec, WorkbenchNodeSpec,
+    build_application, default_product_spec, load_static_plugin, plugin_tab, BottomPanelLayout,
+    CommandSpec, MaruzzellaConfig, MenuRootSpec, TabGroupSpec, ThemeSpec, ToolbarItemSpec,
+    WorkbenchNodeSpec,
 };
 
 fn main() {
@@ -164,7 +166,11 @@ fn main() {
         .with_product(product)
         .with_builtin_plugin(embedded_ronomepo_plugin);
 
-    run(config);
+    let application = build_application(config);
+    let argv0 = env::args()
+        .next()
+        .unwrap_or_else(|| "ronomepo-app".to_string());
+    application.run_with_args(&[argv0]);
 }
 
 fn parse_workspace_root_arg() -> Option<PathBuf> {

@@ -533,6 +533,7 @@ dependencies = [
 name = "ronomepo-app"
 version = "0.1.0"
 dependencies = [
+ "gtk4",
  "maruzzella",
  "ronomepo-plugin",
 ]
