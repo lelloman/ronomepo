@@ -51,6 +51,7 @@ struct AppState {
     workspace_root: PathBuf,
     manifest_path: Option<PathBuf>,
     manifest: Option<WorkspaceManifest>,
+    monitor_filter: String,
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
@@ -59,6 +60,7 @@ struct AppState {
 #[derive(Default)]
 struct RepositoryViewHandle {
     summary: glib::WeakRef<Label>,
+    filter_entry: glib::WeakRef<Entry>,
     list: glib::WeakRef<ListBox>,
     host_ptr: usize,
 }
@@ -457,9 +459,15 @@ fn refresh_views() {
             let Some(summary) = handle.summary.upgrade() else {
                 return false;
             };
+            let Some(filter_entry) = handle.filter_entry.upgrade() else {
+                return false;
+            };
             let Some(list) = handle.list.upgrade() else {
                 return false;
             };
+            if filter_entry.text().as_str() != snapshot.monitor_filter {
+                filter_entry.set_text(&snapshot.monitor_filter);
+            }
             render_repository_view_into(&summary, &list, &snapshot, handle.host_ptr as *const _);
             true
         });
@@ -504,6 +512,7 @@ struct StateSnapshot {
     workspace_root: PathBuf,
     manifest_path: Option<PathBuf>,
     manifest: Option<WorkspaceManifest>,
+    monitor_filter: String,
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
@@ -515,6 +524,7 @@ fn snapshot() -> StateSnapshot {
         workspace_root: app_state.workspace_root.clone(),
         manifest_path: app_state.manifest_path.clone(),
         manifest: app_state.manifest.clone(),
+        monitor_filter: app_state.monitor_filter.clone(),
         selected_repo_ids: app_state.selected_repo_ids.clone(),
         active_repo_id: app_state.active_repo_id.clone(),
         logs: app_state.logs.clone(),
@@ -532,6 +542,7 @@ fn render_repository_view_into(
         .as_ref()
         .map(build_repository_list)
         .unwrap_or_default();
+    let filtered_items = filtered_repository_items(snapshot, repository_items);
     let summary = workspace_summary(
         snapshot.manifest.as_ref(),
         snapshot.manifest_path.as_deref(),
@@ -545,10 +556,26 @@ fn render_repository_view_into(
             MANIFEST_FILE_NAME
         ),
     };
+    let selection_scope = if snapshot.selected_repo_ids.is_empty() {
+        "No selection".to_string()
+    } else {
+        format!("{} selected", snapshot.selected_repo_ids.len())
+    };
+    let filter_scope = if snapshot.monitor_filter.trim().is_empty() {
+        format!("{} shown", filtered_items.len())
+    } else {
+        format!(
+            "{} shown for \"{}\"",
+            filtered_items.len(),
+            snapshot.monitor_filter.trim()
+        )
+    };
     summary_label.set_text(&format!(
-        "{} | {} repos | {} | Workspace: {}",
+        "{} | {} repos | {} | {} | {} | Workspace: {}",
         summary.workspace_name,
         summary.repo_count,
+        filter_scope,
+        selection_scope,
         manifest_status,
         snapshot.workspace_root.display()
     ));
@@ -557,8 +584,8 @@ fn render_repository_view_into(
         list.remove(&child);
     }
 
-    if !repository_items.is_empty() {
-        for item in &repository_items {
+    if !filtered_items.is_empty() {
+        for item in &filtered_items {
             let row = ListBoxRow::new();
             let content = GtkBox::new(Orientation::Horizontal, 10);
             content.set_margin_top(8);
@@ -602,7 +629,7 @@ fn render_repository_view_into(
             list.append(&row);
         }
 
-        for (index, item) in repository_items.iter().enumerate() {
+        for (index, item) in filtered_items.iter().enumerate() {
             if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
                 if let Some(row) = list.row_at_index(index as i32) {
                     list.select_row(Some(&row));
@@ -617,13 +644,19 @@ fn render_repository_view_into(
         empty.set_margin_start(12);
         empty.set_margin_end(12);
 
-        let title = Label::new(Some("No workspace manifest loaded"));
+        let title = Label::new(Some(if snapshot.manifest.is_some() {
+            "No repositories match the current filter"
+        } else {
+            "No workspace manifest loaded"
+        }));
         title.set_xalign(0.0);
         title.add_css_class("title-4");
 
-        let body = Label::new(Some(
-            "Ronomepo is running, but no ronomepo.json was found. Import repos.txt from the current workspace root to bootstrap the manifest.",
-        ));
+        let body = Label::new(Some(if snapshot.manifest.is_some() {
+            "Try a broader search term or clear the filter to see the full workspace."
+        } else {
+            "Ronomepo is running, but no ronomepo.json was found. Import repos.txt from the current workspace root to bootstrap the manifest."
+        }));
         body.set_xalign(0.0);
         body.set_wrap(true);
 
@@ -656,6 +689,52 @@ fn repository_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
         .unwrap_or_default()
 }
 
+fn filtered_repository_items(
+    snapshot: &StateSnapshot,
+    mut items: Vec<RepositoryListItem>,
+) -> Vec<RepositoryListItem> {
+    items.sort_by_key(repo_monitor_sort_key);
+
+    let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
+    if filter.is_empty() {
+        return items;
+    }
+
+    items
+        .into_iter()
+        .filter(|item| {
+            let branch = branch_label(item).to_ascii_lowercase();
+            let sync = format_sync_label(&item.status.sync).to_ascii_lowercase();
+            let state = status_label(&item.status.state).to_ascii_lowercase();
+            item.name.to_ascii_lowercase().contains(&filter)
+                || item.dir_name.to_ascii_lowercase().contains(&filter)
+                || item.remote_url.to_ascii_lowercase().contains(&filter)
+                || branch.contains(&filter)
+                || sync.contains(&filter)
+                || state.contains(&filter)
+        })
+        .collect()
+}
+
+fn repo_monitor_sort_key(item: &RepositoryListItem) -> (u8, String) {
+    (repo_attention_rank(item), item.name.to_ascii_lowercase())
+}
+
+fn repo_attention_rank(item: &RepositoryListItem) -> u8 {
+    use ronomepo_core::{RepositoryState, RepositorySync};
+
+    match (&item.status.state, &item.status.sync) {
+        (RepositoryState::Missing, _) => 0,
+        (RepositoryState::Dirty, _) | (RepositoryState::Untracked, _) => 1,
+        (_, RepositorySync::Diverged { .. }) => 2,
+        (_, RepositorySync::Behind(_)) => 3,
+        (_, RepositorySync::Ahead(_)) => 4,
+        (RepositoryState::Unknown, _) | (_, RepositorySync::Unknown) => 5,
+        (_, RepositorySync::NoUpstream) => 6,
+        _ => 7,
+    }
+}
+
 fn selection_ids_from_list(list: &ListBox) -> Vec<String> {
     let snapshot = snapshot();
     let items = repository_items(&snapshot);
@@ -672,6 +751,11 @@ fn selection_ids_from_list(list: &ListBox) -> Vec<String> {
 fn update_selected_repo_ids(ids: Vec<String>) {
     let mut app_state = state().lock().expect("state mutex poisoned");
     app_state.selected_repo_ids = ids;
+}
+
+fn update_monitor_filter(filter: String) {
+    let mut app_state = state().lock().expect("state mutex poisoned");
+    app_state.monitor_filter = filter;
 }
 
 fn open_repo_overviews(
@@ -836,6 +920,13 @@ extern "C" fn create_repo_monitor_view(
     summary.set_wrap(true);
     summary.add_css_class("muted");
 
+    let filter_entry = Entry::new();
+    filter_entry.set_placeholder_text(Some("Filter repositories"));
+    filter_entry.connect_changed(|entry| {
+        update_monitor_filter(entry.text().to_string());
+        refresh_views();
+    });
+
     let list = ListBox::new();
     list.add_css_class("boxed-list");
     list.set_selection_mode(SelectionMode::Multiple);
@@ -862,6 +953,7 @@ extern "C" fn create_repo_monitor_view(
 
     root.append(&title);
     root.append(&summary);
+    root.append(&filter_entry);
     root.append(&Separator::new(Orientation::Horizontal));
     root.append(&repo_monitor_header());
     root.append(&scroller);
@@ -871,11 +963,14 @@ extern "C" fn create_repo_monitor_view(
 
     let summary_ref = glib::WeakRef::new();
     summary_ref.set(Some(&summary));
+    let filter_ref = glib::WeakRef::new();
+    filter_ref.set(Some(&filter_entry));
     let list_ref = glib::WeakRef::new();
     list_ref.set(Some(&list));
     REPOSITORY_VIEWS.with(|views| {
         views.borrow_mut().push(RepositoryViewHandle {
             summary: summary_ref,
+            filter_entry: filter_ref,
             list: list_ref,
             host_ptr: host as usize,
         });
@@ -890,6 +985,7 @@ extern "C" fn create_repo_monitor_view(
 fn repo_monitor_header() -> GtkBox {
     let header = GtkBox::new(Orientation::Horizontal, 10);
     header.add_css_class("mono");
+    header.set_margin_bottom(4);
 
     for (title, width, expand) in [
         ("Name", 16, false),
