@@ -1342,6 +1342,7 @@ fn render_monorepo_overview_into(
     }
 
     let actions = overview_actions();
+    let selection_actions = monorepo_selection_actions(snapshot, host_ptr, &items);
     let file_actions = overview_file_actions(snapshot, host_ptr);
 
     let sections = GtkBox::new(Orientation::Vertical, 12);
@@ -1400,6 +1401,7 @@ fn render_monorepo_overview_into(
     root.append(&hero);
     root.append(&stats);
     root.append(&actions);
+    root.append(&selection_actions);
     root.append(&file_actions);
     root.append(&sections);
 }
@@ -2052,6 +2054,89 @@ fn overview_file_actions(
     }
 
     actions
+}
+
+fn monorepo_selection_actions(
+    snapshot: &StateSnapshot,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    items: &[RepositoryListItem],
+) -> GtkBox {
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
+
+    for (label, ids) in [
+        (
+            "Select Attention",
+            collect_repo_ids(items, |item| repo_attention_rank(item) < 7),
+        ),
+        (
+            "Select Dirty",
+            collect_repo_ids(items, |item| {
+                matches!(
+                    item.status.state,
+                    ronomepo_core::RepositoryState::Dirty
+                        | ronomepo_core::RepositoryState::Untracked
+                )
+            }),
+        ),
+        (
+            "Select Missing",
+            collect_repo_ids(items, |item| {
+                matches!(item.status.state, ronomepo_core::RepositoryState::Missing)
+            }),
+        ),
+        (
+            "Select Ahead",
+            collect_repo_ids(items, |item| {
+                matches!(
+                    item.status.sync,
+                    ronomepo_core::RepositorySync::Ahead(_)
+                        | ronomepo_core::RepositorySync::Diverged { .. }
+                )
+            }),
+        ),
+    ] {
+        let button = Button::with_label(label);
+        button.connect_clicked(move |_| {
+            if ids.is_empty() {
+                append_log(format!("{label} skipped because no repos match that bucket."));
+            } else {
+                set_selected_repo_ids(ids.clone());
+                append_log(format!("{label} matched {} repos.", ids.len()));
+            }
+        });
+        actions.append(&button);
+    }
+
+    let open_selection = Button::with_label("Open Selected Overviews");
+    open_selection.connect_clicked(move |_| {
+        let repo_ids = {
+            let app_state = state().lock().expect("state mutex poisoned");
+            app_state.selected_repo_ids.clone()
+        };
+        open_repo_overviews(host_ptr, &repo_ids);
+    });
+    actions.append(&open_selection);
+
+    let settings = Button::with_label("Workspace Settings");
+    settings.connect_clicked(move |_| {
+        if let Err(message) = open_workspace_settings_tab() {
+            append_log(message);
+            refresh_views();
+        }
+    });
+    actions.append(&settings);
+
+    actions
+}
+
+fn collect_repo_ids<F>(items: &[RepositoryListItem], predicate: F) -> Vec<String>
+where
+    F: Fn(&RepositoryListItem) -> bool,
+{
+    items.iter()
+        .filter(|item| predicate(item))
+        .map(|item| item.id.clone())
+        .collect()
 }
 
 fn stat_card(label: &str, value: &str) -> GtkBox {
