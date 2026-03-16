@@ -58,6 +58,7 @@ struct AppState {
     manifest_path: Option<PathBuf>,
     manifest: Option<WorkspaceManifest>,
     monitor_filter: String,
+    monitor_show_all: bool,
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
@@ -371,9 +372,40 @@ extern "C" fn command_apply_hooks(
 extern "C" fn command_open_overview(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    append_log("Monorepo Overview is the default startup tab.".to_string());
-    refresh_views();
-    maruzzella_sdk::ffi::MzStatus::OK
+    let host_ptr = current_host_ptr();
+    if host_ptr.is_null() {
+        append_log(
+            "Cannot focus Monorepo Overview because the Maruzzella host handle is unavailable."
+                .to_string(),
+        );
+        refresh_views();
+        return maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError);
+    }
+
+    let host = unsafe { HostApi::from_raw(&*host_ptr) };
+    let request = OpenViewRequest::new(
+        PLUGIN_ID,
+        VIEW_MONOREPO_OVERVIEW,
+        MzViewPlacement::Workbench,
+    );
+
+    match host.open_view(&request) {
+        Ok(MzViewOpenDisposition::Opened) => {
+            append_log("Opened Monorepo Overview.".to_string());
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::OK
+        }
+        Ok(MzViewOpenDisposition::FocusedExisting) => {
+            append_log("Focused existing Monorepo Overview.".to_string());
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::OK
+        }
+        Err(status) => {
+            append_log(format!("Failed to open Monorepo Overview: {status:?}"));
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
+        }
+    }
 }
 
 fn refresh_workspace() -> Result<String, String> {
@@ -588,6 +620,7 @@ struct StateSnapshot {
     manifest_path: Option<PathBuf>,
     manifest: Option<WorkspaceManifest>,
     monitor_filter: String,
+    monitor_show_all: bool,
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
@@ -600,6 +633,7 @@ fn snapshot() -> StateSnapshot {
         manifest_path: app_state.manifest_path.clone(),
         manifest: app_state.manifest.clone(),
         monitor_filter: app_state.monitor_filter.clone(),
+        monitor_show_all: app_state.monitor_show_all,
         selected_repo_ids: app_state.selected_repo_ids.clone(),
         active_repo_id: app_state.active_repo_id.clone(),
         logs: app_state.logs.clone(),
@@ -612,12 +646,7 @@ fn render_repository_view_into(
     snapshot: &StateSnapshot,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    let repository_items = snapshot
-        .manifest
-        .as_ref()
-        .map(build_repository_list)
-        .unwrap_or_default();
-    let filtered_items = filtered_repository_items(snapshot, repository_items);
+    let filtered_items = visible_monitor_items(snapshot);
     let summary = workspace_summary(
         snapshot.manifest.as_ref(),
         snapshot.manifest_path.as_deref(),
@@ -637,12 +666,25 @@ fn render_repository_view_into(
         format!("{} selected", snapshot.selected_repo_ids.len())
     };
     let filter_scope = if snapshot.monitor_filter.trim().is_empty() {
-        format!("{} shown", filtered_items.len())
+        format!(
+            "{} shown ({})",
+            filtered_items.len(),
+            if snapshot.monitor_show_all {
+                "all repos"
+            } else {
+                "attention only"
+            }
+        )
     } else {
         format!(
-            "{} shown for \"{}\"",
+            "{} shown for \"{}\" ({})",
             filtered_items.len(),
-            snapshot.monitor_filter.trim()
+            snapshot.monitor_filter.trim(),
+            if snapshot.monitor_show_all {
+                "all repos"
+            } else {
+                "attention only"
+            }
         )
     };
     summary_label.set_text(&format!(
@@ -764,11 +806,33 @@ fn repository_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
         .unwrap_or_default()
 }
 
+const MONOREPO_ROW_ID: &str = "__ronomepo_monorepo__";
+
+fn monorepo_monitor_item(snapshot: &StateSnapshot) -> RepositoryListItem {
+    RepositoryListItem {
+        id: MONOREPO_ROW_ID.to_string(),
+        name: "(monorepo)".to_string(),
+        dir_name: ".".to_string(),
+        remote_url: snapshot.workspace_root.display().to_string(),
+        status: ronomepo_core::collect_repository_status(&snapshot.workspace_root),
+    }
+}
+
+fn visible_monitor_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
+    let mut items = vec![monorepo_monitor_item(snapshot)];
+    items.extend(repository_items(snapshot));
+    filtered_repository_items(snapshot, items)
+}
+
 fn filtered_repository_items(
     snapshot: &StateSnapshot,
     mut items: Vec<RepositoryListItem>,
 ) -> Vec<RepositoryListItem> {
     items.sort_by_key(repo_monitor_sort_key);
+
+    if !snapshot.monitor_show_all {
+        items.retain(repo_requires_attention);
+    }
 
     let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
     if filter.is_empty() {
@@ -795,6 +859,16 @@ fn repo_monitor_sort_key(item: &RepositoryListItem) -> (u8, String) {
     (repo_attention_rank(item), item.name.to_ascii_lowercase())
 }
 
+fn repo_requires_attention(item: &RepositoryListItem) -> bool {
+    use ronomepo_core::{RepositoryState, RepositorySync};
+
+    !matches!(item.status.state, RepositoryState::Clean)
+        || !matches!(
+            item.status.sync,
+            RepositorySync::UpToDate | RepositorySync::NoUpstream
+        )
+}
+
 fn repo_attention_rank(item: &RepositoryListItem) -> u8 {
     use ronomepo_core::{RepositoryState, RepositorySync};
 
@@ -812,11 +886,12 @@ fn repo_attention_rank(item: &RepositoryListItem) -> u8 {
 
 fn selection_ids_from_list(list: &ListBox) -> Vec<String> {
     let snapshot = snapshot();
-    let items = repository_items(&snapshot);
+    let items = visible_monitor_items(&snapshot);
     let mut selected = list
         .selected_rows()
         .into_iter()
         .filter_map(|row| items.get(row.index() as usize).map(|item| item.id.clone()))
+        .filter(|id| id != MONOREPO_ROW_ID)
         .collect::<Vec<_>>();
     selected.sort();
     selected.dedup();
@@ -831,6 +906,11 @@ fn update_selected_repo_ids(ids: Vec<String>) {
 fn update_monitor_filter(filter: String) {
     let mut app_state = state().lock().expect("state mutex poisoned");
     app_state.monitor_filter = filter;
+}
+
+fn update_monitor_show_all(show_all: bool) {
+    let mut app_state = state().lock().expect("state mutex poisoned");
+    app_state.monitor_show_all = show_all;
 }
 
 fn open_repo_overviews(
@@ -1013,6 +1093,13 @@ extern "C" fn create_repo_monitor_view(
         refresh_views();
     });
 
+    let show_all = CheckButton::with_label("Show all");
+    show_all.set_active(snapshot().monitor_show_all);
+    show_all.connect_toggled(|button| {
+        update_monitor_show_all(button.is_active());
+        refresh_views();
+    });
+
     let list = ListBox::new();
     list.add_css_class("boxed-list");
     list.set_selection_mode(SelectionMode::Multiple);
@@ -1020,13 +1107,16 @@ extern "C" fn create_repo_monitor_view(
         update_selected_repo_ids(selection_ids_from_list(list));
     });
     list.connect_row_activated(move |_, row| {
-        let repo_ids = snapshot()
-            .manifest
-            .as_ref()
-            .map(build_repository_list)
-            .and_then(|items| items.get(row.index() as usize).map(|item| vec![item.id.clone()]))
-            .unwrap_or_default();
-        open_repo_overviews(host, &repo_ids);
+        let snapshot = snapshot();
+        let items = visible_monitor_items(&snapshot);
+        let Some(item) = items.get(row.index() as usize) else {
+            return;
+        };
+        if item.id == MONOREPO_ROW_ID {
+            let _ = command_open_overview(maruzzella_sdk::ffi::MzBytes::empty());
+            return;
+        }
+        open_repo_overviews(host, std::slice::from_ref(&item.id));
     });
 
     let scroller = ScrolledWindow::builder()
@@ -1040,6 +1130,7 @@ extern "C" fn create_repo_monitor_view(
     root.append(&title);
     root.append(&summary);
     root.append(&filter_entry);
+    root.append(&show_all);
     root.append(&Separator::new(Orientation::Horizontal));
     root.append(&repo_monitor_header());
     root.append(&scroller);
