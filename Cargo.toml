@@ -1,0 +1,4 @@
+[workspace]
+members = ["ronomepo-app", "ronomepo-core", "ronomepo-plugin"]
+resolver = "2"
+

@@ -1,0 +1,21 @@
+{
+  "name": "Sample Workspace",
+  "root": "/tmp/sample-workspace",
+  "repos": [
+    {
+      "id": "maruzzella",
+      "name": "maruzzella",
+      "dir_name": "maruzzella",
+      "remote_url": "git@github.com:lelloman/maruzzella.git",
+      "enabled": true
+    },
+    {
+      "id": "ronomepo",
+      "name": "ronomepo",
+      "dir_name": "ronomepo",
+      "remote_url": "git@github.com:lelloman/ronomepo.git",
+      "enabled": true
+    }
+  ],
+  "shared_hooks_path": "/tmp/sample-workspace/hooks"
+}
