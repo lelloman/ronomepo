@@ -1139,6 +1139,8 @@ extern "C" fn create_repo_monitor_view(
         refresh_views();
     });
 
+    let monitor_actions = repo_monitor_actions(host);
+
     let list = ListBox::new();
     list.add_css_class("boxed-list");
     list.set_selection_mode(SelectionMode::Multiple);
@@ -1170,6 +1172,7 @@ extern "C" fn create_repo_monitor_view(
     root.append(&summary);
     root.append(&filter_entry);
     root.append(&show_all);
+    root.append(&monitor_actions);
     root.append(&Separator::new(Orientation::Horizontal));
     root.append(&repo_monitor_header());
     root.append(&scroller);
@@ -1220,6 +1223,86 @@ fn repo_monitor_header() -> GtkBox {
     }
 
     header
+}
+
+fn repo_monitor_actions(host_ptr: *const maruzzella_sdk::ffi::MzHostApi) -> GtkBox {
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
+
+    let select_visible = Button::with_label("Select Visible");
+    select_visible.connect_clicked(move |_| {
+        let snapshot = snapshot();
+        let ids = visible_monitor_items(&snapshot)
+            .into_iter()
+            .filter(|item| item.id != MONOREPO_ROW_ID)
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            append_log("Select Visible skipped because there are no visible repos.".to_string());
+            return;
+        }
+        set_selected_repo_ids(ids.clone());
+        append_log(format!("Selected {} visible repos from the monitor.", ids.len()));
+    });
+    actions.append(&select_visible);
+
+    let select_dirty = Button::with_label("Select Dirty");
+    select_dirty.connect_clicked(move |_| {
+        let snapshot = snapshot();
+        let ids = visible_monitor_items(&snapshot)
+            .into_iter()
+            .filter(|item| {
+                matches!(
+                    item.status.state,
+                    ronomepo_core::RepositoryState::Dirty
+                        | ronomepo_core::RepositoryState::Untracked
+                )
+            })
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            append_log("Select Dirty skipped because no visible repos are dirty.".to_string());
+            return;
+        }
+        set_selected_repo_ids(ids.clone());
+        append_log(format!("Selected {} dirty repos from the monitor.", ids.len()));
+    });
+    actions.append(&select_dirty);
+
+    let select_missing = Button::with_label("Select Missing");
+    select_missing.connect_clicked(move |_| {
+        let snapshot = snapshot();
+        let ids = visible_monitor_items(&snapshot)
+            .into_iter()
+            .filter(|item| matches!(item.status.state, ronomepo_core::RepositoryState::Missing))
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            append_log("Select Missing skipped because no visible repos are missing.".to_string());
+            return;
+        }
+        set_selected_repo_ids(ids.clone());
+        append_log(format!("Selected {} missing repos from the monitor.", ids.len()));
+    });
+    actions.append(&select_missing);
+
+    let clear_selection = Button::with_label("Clear");
+    clear_selection.connect_clicked(move |_| {
+        set_selected_repo_ids(Vec::new());
+        append_log("Cleared repo selection.".to_string());
+    });
+    actions.append(&clear_selection);
+
+    let open_selected = Button::with_label("Open Selected");
+    open_selected.connect_clicked(move |_| {
+        let repo_ids = {
+            let app_state = state().lock().expect("state mutex poisoned");
+            app_state.selected_repo_ids.clone()
+        };
+        open_repo_overviews(host_ptr, &repo_ids);
+    });
+    actions.append(&open_selected);
+
+    actions
 }
 
 extern "C" fn create_monorepo_overview_view(
