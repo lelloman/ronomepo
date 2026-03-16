@@ -68,6 +68,31 @@ pub enum RepositorySync {
     Diverged { ahead: usize, behind: usize },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationKind {
+    CloneMissing,
+    Pull,
+    Push,
+    ApplyHooks,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationEventKind {
+    Started,
+    Success,
+    Skipped,
+    Failed,
+    Finished,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperationEvent {
+    pub kind: OperationEventKind,
+    pub repository_id: Option<String>,
+    pub repository_name: Option<String>,
+    pub message: String,
+}
+
 #[derive(Debug)]
 pub enum WorkspaceError {
     Io(io::Error),
@@ -226,6 +251,292 @@ pub fn format_sync_label(sync: &RepositorySync) -> String {
         RepositorySync::Ahead(ahead) => format!("+{ahead}"),
         RepositorySync::Behind(behind) => format!("-{behind}"),
         RepositorySync::Diverged { ahead, behind } => format!("+{ahead}/-{behind}"),
+    }
+}
+
+pub fn run_workspace_operation<F>(
+    manifest: &WorkspaceManifest,
+    selected_repo_ids: &[String],
+    kind: OperationKind,
+    mut emit: F,
+) where
+    F: FnMut(OperationEvent),
+{
+    let entries = manifest
+        .repos
+        .iter()
+        .filter(|repo| repo.enabled)
+        .filter(|repo| {
+            selected_repo_ids.is_empty() || selected_repo_ids.iter().any(|id| id == &repo.id)
+        })
+        .collect::<Vec<_>>();
+
+    emit(OperationEvent {
+        kind: OperationEventKind::Started,
+        repository_id: None,
+        repository_name: None,
+        message: format!(
+            "{} started for {}.",
+            operation_kind_label(kind),
+            if selected_repo_ids.is_empty() {
+                "all eligible repositories".to_string()
+            } else {
+                format!("{} selected repos", entries.len())
+            }
+        ),
+    });
+
+    let mut completed = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for repo in entries {
+        let event = match kind {
+            OperationKind::CloneMissing => clone_missing_repo(manifest, repo),
+            OperationKind::Pull => pull_repo(manifest, repo),
+            OperationKind::Push => push_repo(manifest, repo),
+            OperationKind::ApplyHooks => apply_hooks_repo(manifest, repo),
+        };
+
+        match event.kind {
+            OperationEventKind::Success => completed += 1,
+            OperationEventKind::Skipped => skipped += 1,
+            OperationEventKind::Failed => failed += 1,
+            _ => {}
+        }
+        emit(event);
+    }
+
+    emit(OperationEvent {
+        kind: OperationEventKind::Finished,
+        repository_id: None,
+        repository_name: None,
+        message: format!(
+            "{} finished: {} completed, {} skipped, {} failed.",
+            operation_kind_label(kind),
+            completed,
+            skipped,
+            failed
+        ),
+    });
+}
+
+fn clone_missing_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> OperationEvent {
+    let repo_path = manifest.root.join(&repo.dir_name);
+    if repo_path.exists() {
+        return skipped_event(repo, format!("{} already exists locally.", repo.dir_name));
+    }
+
+    match Command::new("git")
+        .arg("clone")
+        .arg(&repo.remote_url)
+        .arg(&repo_path)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            if let Some(hooks_path) = resolved_shared_hooks_path(manifest) {
+                let _ = configure_hooks_path(&repo_path, &hooks_path);
+            }
+            success_event(repo, format!("Cloned {}.", repo.dir_name))
+        }
+        Ok(output) => failed_event(
+            repo,
+            format!(
+                "Clone failed for {}: {}",
+                repo.dir_name,
+                stderr_message(&output.stderr)
+            ),
+        ),
+        Err(error) => failed_event(repo, format!("Clone failed for {}: {error}", repo.dir_name)),
+    }
+}
+
+fn pull_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> OperationEvent {
+    let repo_path = manifest.root.join(&repo.dir_name);
+    if !repo_path.exists() {
+        return failed_event(repo, format!("{} is missing locally.", repo.dir_name));
+    }
+
+    if matches!(repository_state(&repo_path), RepositoryState::Dirty) {
+        return skipped_event(
+            repo,
+            format!("Skipped {} because it has uncommitted changes.", repo.dir_name),
+        );
+    }
+
+    let has_untracked = matches!(repository_state(&repo_path), RepositoryState::Untracked);
+    match Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .arg("pull")
+        .arg("--quiet")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let suffix = if has_untracked {
+                " Untracked files were present."
+            } else {
+                ""
+            };
+            success_event(repo, format!("Pulled {}.{suffix}", repo.dir_name))
+        }
+        Ok(output) => failed_event(
+            repo,
+            format!(
+                "Pull failed for {}: {}",
+                repo.dir_name,
+                stderr_message(&output.stderr)
+            ),
+        ),
+        Err(error) => failed_event(repo, format!("Pull failed for {}: {error}", repo.dir_name)),
+    }
+}
+
+fn push_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> OperationEvent {
+    let repo_path = manifest.root.join(&repo.dir_name);
+    if !repo_path.exists() {
+        return failed_event(repo, format!("{} is missing locally.", repo.dir_name));
+    }
+
+    let Some(upstream) = git_stdout(&repo_path, ["rev-parse", "--abbrev-ref", "@{upstream}"]) else {
+        return skipped_event(repo, format!("Skipped {} because it has no upstream.", repo.dir_name));
+    };
+    if upstream.is_empty() {
+        return skipped_event(repo, format!("Skipped {} because it has no upstream.", repo.dir_name));
+    }
+
+    let ahead = git_stdout(&repo_path, ["rev-list", "--count", "@{upstream}..HEAD"])
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if ahead == 0 {
+        return skipped_event(repo, format!("Skipped {} because it has nothing to push.", repo.dir_name));
+    }
+
+    match Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .arg("push")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            success_event(repo, format!("Pushed {} ({} commits).", repo.dir_name, ahead))
+        }
+        Ok(output) => failed_event(
+            repo,
+            format!(
+                "Push failed for {}: {}",
+                repo.dir_name,
+                stderr_message(&output.stderr)
+            ),
+        ),
+        Err(error) => failed_event(repo, format!("Push failed for {}: {error}", repo.dir_name)),
+    }
+}
+
+fn apply_hooks_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> OperationEvent {
+    let repo_path = manifest.root.join(&repo.dir_name);
+    if !repo_path.exists() {
+        return failed_event(repo, format!("{} is missing locally.", repo.dir_name));
+    }
+
+    let Some(hooks_path) = resolved_shared_hooks_path(manifest) else {
+        return skipped_event(repo, "No shared hooks path is configured.".to_string());
+    };
+
+    match configure_hooks_path(&repo_path, &hooks_path) {
+        Ok(()) => success_event(
+            repo,
+            format!(
+                "Configured core.hooksPath for {} to {}.",
+                repo.dir_name,
+                hooks_path.display()
+            ),
+        ),
+        Err(error) => failed_event(
+            repo,
+            format!("Failed to configure hooks for {}: {error}", repo.dir_name),
+        ),
+    }
+}
+
+fn configure_hooks_path(repo_path: &Path, hooks_path: &Path) -> io::Result<()> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("config")
+        .arg("--local")
+        .arg("core.hooksPath")
+        .arg(hooks_path)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "git config --local core.hooksPath failed",
+        ))
+    }
+}
+
+fn resolved_shared_hooks_path(manifest: &WorkspaceManifest) -> Option<PathBuf> {
+    manifest
+        .shared_hooks_path
+        .clone()
+        .or_else(|| {
+            let fallback = manifest.root.join("hooks");
+            fallback.exists().then_some(fallback)
+        })
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                manifest.root.join(path)
+            }
+        })
+}
+
+fn success_event(repo: &RepositoryEntry, message: String) -> OperationEvent {
+    OperationEvent {
+        kind: OperationEventKind::Success,
+        repository_id: Some(repo.id.clone()),
+        repository_name: Some(repo.name.clone()),
+        message,
+    }
+}
+
+fn skipped_event(repo: &RepositoryEntry, message: String) -> OperationEvent {
+    OperationEvent {
+        kind: OperationEventKind::Skipped,
+        repository_id: Some(repo.id.clone()),
+        repository_name: Some(repo.name.clone()),
+        message,
+    }
+}
+
+fn failed_event(repo: &RepositoryEntry, message: String) -> OperationEvent {
+    OperationEvent {
+        kind: OperationEventKind::Failed,
+        repository_id: Some(repo.id.clone()),
+        repository_name: Some(repo.name.clone()),
+        message,
+    }
+}
+
+fn operation_kind_label(kind: OperationKind) -> &'static str {
+    match kind {
+        OperationKind::CloneMissing => "Clone Missing",
+        OperationKind::Pull => "Pull",
+        OperationKind::Push => "Push",
+        OperationKind::ApplyHooks => "Apply Hooks",
+    }
+}
+
+fn stderr_message(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr).trim().to_string();
+    if text.is_empty() {
+        "command exited with an error".to_string()
+    } else {
+        text
     }
 }
 

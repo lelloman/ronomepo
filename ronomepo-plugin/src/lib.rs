@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 
 use gtk::glib::{self, translate::IntoGlibPtr};
 use gtk::prelude::*;
@@ -16,8 +17,8 @@ use maruzzella_sdk::{
 };
 use ronomepo_core::{
     build_repository_list, default_manifest_path, format_sync_label, import_repos_txt,
-    load_manifest, save_manifest, workspace_summary, RepositoryListItem, MANIFEST_FILE_NAME,
-    WorkspaceManifest,
+    load_manifest, run_workspace_operation, save_manifest, workspace_summary, OperationEvent,
+    OperationEventKind, OperationKind, RepositoryListItem, MANIFEST_FILE_NAME, WorkspaceManifest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -293,44 +294,28 @@ extern "C" fn command_open_settings(
 extern "C" fn command_clone_missing(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    append_log(format!(
-        "Clone Missing is wired into the shell layout; execution for {} comes next.",
-        action_scope_label()
-    ));
-    refresh_views();
+    launch_operation(OperationKind::CloneMissing);
     maruzzella_sdk::ffi::MzStatus::OK
 }
 
 extern "C" fn command_pull(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    append_log(format!(
-        "Pull is wired into the shell layout; mono-style execution for {} comes next.",
-        action_scope_label()
-    ));
-    refresh_views();
+    launch_operation(OperationKind::Pull);
     maruzzella_sdk::ffi::MzStatus::OK
 }
 
 extern "C" fn command_push(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    append_log(format!(
-        "Push is wired into the shell layout; mono-style ahead/upstream filtering for {} comes next.",
-        action_scope_label()
-    ));
-    refresh_views();
+    launch_operation(OperationKind::Push);
     maruzzella_sdk::ffi::MzStatus::OK
 }
 
 extern "C" fn command_apply_hooks(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    append_log(format!(
-        "Apply Hooks is wired into the shell layout; shared hooks behavior for {} comes next.",
-        action_scope_label()
-    ));
-    refresh_views();
+    launch_operation(OperationKind::ApplyHooks);
     maruzzella_sdk::ffi::MzStatus::OK
 }
 
@@ -386,15 +371,55 @@ fn append_log(message: String) {
     app_state.logs.push(message);
 }
 
-fn action_scope_label() -> String {
-    let app_state = state().lock().expect("state mutex poisoned");
-    if app_state.selected_repo_ids.is_empty() {
-        "all eligible repositories".to_string()
-    } else {
-        format!(
-            "the current selection ({} repos)",
-            app_state.selected_repo_ids.len()
+fn launch_operation(kind: OperationKind) {
+    let (manifest, selected_repo_ids) = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        (
+            app_state.manifest.clone(),
+            app_state.selected_repo_ids.clone(),
         )
+    };
+
+    let Some(manifest) = manifest else {
+        append_log(format!(
+            "{} skipped because no {} is loaded.",
+            operation_kind_title(kind),
+            MANIFEST_FILE_NAME
+        ));
+        refresh_views();
+        return;
+    };
+
+    let main_context = glib::MainContext::default();
+    thread::spawn(move || {
+        run_workspace_operation(&manifest, &selected_repo_ids, kind, |event| {
+            append_log(format_operation_event(&event));
+            main_context.invoke(refresh_views);
+        });
+    });
+}
+
+fn operation_kind_title(kind: OperationKind) -> &'static str {
+    match kind {
+        OperationKind::CloneMissing => "Clone Missing",
+        OperationKind::Pull => "Pull",
+        OperationKind::Push => "Push",
+        OperationKind::ApplyHooks => "Apply Hooks",
+    }
+}
+
+fn format_operation_event(event: &OperationEvent) -> String {
+    let prefix = match event.kind {
+        OperationEventKind::Started => "START",
+        OperationEventKind::Success => "OK",
+        OperationEventKind::Skipped => "SKIP",
+        OperationEventKind::Failed => "FAIL",
+        OperationEventKind::Finished => "DONE",
+    };
+
+    match event.repository_name.as_deref() {
+        Some(repo_name) => format!("[{prefix}] {repo_name}: {}", event.message),
+        None => format!("[{prefix}] {}", event.message),
     }
 }
 
