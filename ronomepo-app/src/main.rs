@@ -1,19 +1,16 @@
+use std::env;
 use std::path::PathBuf;
 
 use maruzzella::{
-    default_product_spec, plugin_tab, run, BottomPanelLayout, CommandSpec, MaruzzellaConfig,
-    MenuRootSpec, TabGroupSpec, ThemeSpec, ToolbarItemSpec, WorkbenchNodeSpec,
+    default_product_spec, load_static_plugin, plugin_tab, run, BottomPanelLayout, CommandSpec,
+    MaruzzellaConfig, MenuRootSpec, TabGroupSpec, ThemeSpec, ToolbarItemSpec, WorkbenchNodeSpec,
 };
 
 fn main() {
-    let plugin_path = plugin_path();
-    if !plugin_path.exists() {
-        eprintln!(
-            "Ronomepo plugin not found at {}\nBuild it first with: cargo build -p ronomepo-plugin",
-            plugin_path.display()
-        );
-        return;
-    }
+    let workspace_root = parse_workspace_root_arg().unwrap_or_else(|| {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    });
+    env::set_var("RONOMEPO_WORKSPACE_ROOT", &workspace_root);
 
     let mut product = default_product_spec();
     product.branding.title = "Ronomepo".to_string();
@@ -165,22 +162,32 @@ fn main() {
         .with_persistence_id("ronomepo")
         .with_theme(app_theme())
         .with_product(product)
-        .with_plugin_path(plugin_path);
+        .with_builtin_plugin(embedded_ronomepo_plugin);
 
     run(config);
 }
 
-fn plugin_path() -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.push("target");
-    path.push("debug");
-    path.push(format!(
-        "{}ronomepo_plugin{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    ));
-    path
+fn parse_workspace_root_arg() -> Option<PathBuf> {
+    let mut args = env::args_os().skip(1);
+    let mut positional = None;
+
+    while let Some(arg) = args.next() {
+        if arg == "--workspace" {
+            return args.next().map(PathBuf::from);
+        }
+        if let Some(value) = arg.to_str().and_then(|text| text.strip_prefix("--workspace=")) {
+            return Some(PathBuf::from(value));
+        }
+        if positional.is_none() {
+            positional = Some(PathBuf::from(arg));
+        }
+    }
+
+    positional
+}
+
+fn embedded_ronomepo_plugin() -> Result<maruzzella::LoadedPlugin, maruzzella::PluginLoadError> {
+    load_static_plugin("builtin:ronomepo-plugin", ronomepo_plugin::maruzzella_plugin_entry)
 }
 
 fn app_theme() -> ThemeSpec {

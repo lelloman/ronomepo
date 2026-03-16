@@ -5,4 +5,4 @@ edition = "2021"
 
 [dependencies]
 maruzzella = { path = "../../maruzzella" }
-
+ronomepo-plugin = { path = "../ronomepo-plugin" }

@@ -48,7 +48,7 @@ const CMD_OPEN_OVERVIEW: &str = "ronomepo.workspace.open_overview";
 const CMD_CHECK_HISTORY: &str = "ronomepo.workspace.check_history";
 const CMD_LINE_STATS: &str = "ronomepo.workspace.line_stats";
 
-struct RonomepoPlugin;
+pub struct RonomepoPlugin;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct RonomepoPluginConfig {
@@ -316,11 +316,11 @@ fn ensure_config(host: &HostApi<'_>) -> Result<RonomepoPluginConfig, MzStatusCod
 }
 
 fn initialize_state(config: &RonomepoPluginConfig) {
-    let workspace_root = config
-        .last_workspace_path
-        .as_deref()
+    let workspace_root = env::var_os("RONOMEPO_WORKSPACE_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        .or_else(|| std::env::current_dir().ok())
+        .or_else(|| config.last_workspace_path.as_deref().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
     let manifest_path = default_manifest_path(&workspace_root);
     let manifest = load_manifest_if_present(&manifest_path);
 
@@ -1593,7 +1593,7 @@ fn render_monorepo_overview_into(
     }
 
     let actions = overview_actions();
-    let selection_actions = monorepo_selection_actions(snapshot, host_ptr, &items);
+    let selection_actions = monorepo_selection_actions(host_ptr, &items);
     let report_actions = monorepo_report_actions(snapshot);
     let file_actions = overview_file_actions(snapshot, host_ptr);
 
@@ -2322,7 +2322,6 @@ fn overview_file_actions(
 }
 
 fn monorepo_selection_actions(
-    snapshot: &StateSnapshot,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
     items: &[RepositoryListItem],
 ) -> GtkBox {

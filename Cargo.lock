@@ -534,6 +534,7 @@ name = "ronomepo-app"
 version = "0.1.0"
 dependencies = [
  "maruzzella",
+ "ronomepo-plugin",
 ]
 
 [[package]]
