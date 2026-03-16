@@ -63,6 +63,7 @@ struct AppState {
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
+    next_operation_batch: usize,
 }
 
 #[derive(Default)]
@@ -473,17 +474,20 @@ fn append_log(message: String) {
 }
 
 fn launch_operation(kind: OperationKind) {
-    let (manifest, selected_repo_ids) = {
-        let app_state = state().lock().expect("state mutex poisoned");
+    let (manifest, selected_repo_ids, batch_id) = {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        let batch_id = app_state.next_operation_batch.max(1);
+        app_state.next_operation_batch = batch_id + 1;
         (
             app_state.manifest.clone(),
             app_state.selected_repo_ids.clone(),
+            batch_id,
         )
     };
 
     let Some(manifest) = manifest else {
         append_log(format!(
-            "{} skipped because no {} is loaded.",
+            "[run {batch_id}] {} skipped because no {} is loaded.",
             operation_kind_title(kind),
             MANIFEST_FILE_NAME
         ));
@@ -494,7 +498,7 @@ fn launch_operation(kind: OperationKind) {
     let main_context = glib::MainContext::default();
     thread::spawn(move || {
         run_workspace_operation(&manifest, &selected_repo_ids, kind, |event| {
-            append_log(format_operation_event(&event));
+            append_log(format!("[run {batch_id}] {}", format_operation_event(&event)));
             main_context.invoke(refresh_views);
         });
     });
