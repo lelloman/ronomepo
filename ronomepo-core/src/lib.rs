@@ -49,6 +49,19 @@ pub struct RepositoryStatus {
     pub repo_path: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryDetails {
+    pub remotes: Vec<String>,
+    pub last_commit: Option<LastCommitInfo>,
+    pub changed_files: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastCommitInfo {
+    pub short_sha: String,
+    pub subject: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepositoryState {
     Unknown,
@@ -252,6 +265,47 @@ pub fn format_sync_label(sync: &RepositorySync) -> String {
         RepositorySync::Ahead(ahead) => format!("+{ahead}"),
         RepositorySync::Behind(behind) => format!("-{behind}"),
         RepositorySync::Diverged { ahead, behind } => format!("+{ahead}/-{behind}"),
+    }
+}
+
+pub fn collect_repository_details(repo_path: &Path) -> RepositoryDetails {
+    if !repo_path.exists() {
+        return RepositoryDetails {
+            remotes: Vec::new(),
+            last_commit: None,
+            changed_files: Vec::new(),
+        };
+    }
+
+    RepositoryDetails {
+        remotes: git_stdout(repo_path, ["remote", "-v"])
+            .map(|output| {
+                output
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        last_commit: git_stdout(repo_path, ["log", "-1", "--format=%h|%s"]).and_then(|output| {
+            let (short_sha, subject) = output.split_once('|')?;
+            Some(LastCommitInfo {
+                short_sha: short_sha.to_string(),
+                subject: subject.to_string(),
+            })
+        }),
+        changed_files: git_stdout(repo_path, ["status", "--short"])
+            .map(|output| {
+                output
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .take(8)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -775,6 +829,25 @@ mod tests {
 
         let status = collect_repository_status(&repo_path);
         assert_eq!(status.state, RepositoryState::Untracked);
+    }
+
+    #[test]
+    fn collect_repository_details_reports_commit_and_changes() {
+        let repo_path = temp_dir_path("details");
+        init_git_repo(&repo_path);
+        run_git(repo_path.as_path(), ["remote", "add", "origin", "git@example.com:alpha.git"]);
+        fs::write(repo_path.join("scratch.txt"), "hello").unwrap();
+
+        let details = collect_repository_details(&repo_path);
+        assert!(details.last_commit.is_some());
+        assert!(details
+            .remotes
+            .iter()
+            .any(|line| line.contains("origin") && line.contains("git@example.com:alpha.git")));
+        assert!(details
+            .changed_files
+            .iter()
+            .any(|line| line.contains("scratch.txt")));
     }
 
     #[test]

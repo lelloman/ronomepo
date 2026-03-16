@@ -23,8 +23,8 @@ use maruzzella_sdk::{
 use ronomepo_core::{
     build_repository_list, default_manifest_path, derive_dir_name, format_sync_label,
     import_repos_txt, load_manifest, run_workspace_operation, save_manifest, workspace_summary,
-    OperationEvent, OperationEventKind, OperationKind, RepositoryEntry, RepositoryListItem,
-    MANIFEST_FILE_NAME, WorkspaceManifest,
+    collect_repository_details, OperationEvent, OperationEventKind, OperationKind, RepositoryEntry,
+    RepositoryListItem, MANIFEST_FILE_NAME, WorkspaceManifest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1885,6 +1885,7 @@ fn render_repo_overview_into(
     }
 
     let sections = GtkBox::new(Orientation::Vertical, 12);
+    let details = collect_repository_details(&item.status.repo_path);
     append_overview_section(
         &sections,
         "Path",
@@ -1907,6 +1908,27 @@ fn render_repo_overview_into(
         &sections,
         "Action Eligibility",
         &repo_action_eligibility(item),
+    );
+    append_overview_section(
+        &sections,
+        "Last Commit",
+        &details
+            .last_commit
+            .as_ref()
+            .map(|commit| format!("{} {}", commit.short_sha, commit.subject))
+            .unwrap_or_else(|| "No commit information available.".to_string()),
+    );
+    append_lines_section(
+        &sections,
+        "Remotes",
+        &details.remotes,
+        "No remotes reported for this repository.",
+    );
+    append_lines_section(
+        &sections,
+        "Changed Files",
+        &details.changed_files,
+        "Working tree is clean.",
     );
     append_log_section(
         &sections,
@@ -2047,6 +2069,37 @@ fn append_overview_section(container: &GtkBox, heading: &str, body: &str) {
     body_label.add_css_class("muted");
     block.append(&heading_label);
     block.append(&body_label);
+    container.append(&block);
+    container.append(&Separator::new(Orientation::Horizontal));
+}
+
+fn append_lines_section(
+    container: &GtkBox,
+    heading: &str,
+    lines: &[String],
+    empty_message: &str,
+) {
+    let block = GtkBox::new(Orientation::Vertical, 6);
+    let heading_label = Label::new(Some(heading));
+    heading_label.set_xalign(0.0);
+    heading_label.add_css_class("title-4");
+    block.append(&heading_label);
+
+    if lines.is_empty() {
+        let empty = Label::new(Some(empty_message));
+        empty.set_xalign(0.0);
+        empty.add_css_class("muted");
+        block.append(&empty);
+    } else {
+        for line in lines {
+            let row = Label::new(Some(line));
+            row.set_xalign(0.0);
+            row.set_wrap(true);
+            row.add_css_class("mono");
+            block.append(&row);
+        }
+    }
+
     container.append(&block);
     container.append(&Separator::new(Orientation::Horizontal));
 }
