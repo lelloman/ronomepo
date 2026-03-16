@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -37,13 +38,15 @@ pub struct RepositoryListItem {
     pub name: String,
     pub dir_name: String,
     pub remote_url: String,
-    pub status: RepositoryStatusStub,
+    pub status: RepositoryStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RepositoryStatusStub {
+pub struct RepositoryStatus {
     pub state: RepositoryState,
     pub branch: Option<String>,
+    pub sync: RepositorySync,
+    pub repo_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +55,17 @@ pub enum RepositoryState {
     Missing,
     Clean,
     Dirty,
+    Untracked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepositorySync {
+    Unknown,
+    NoUpstream,
+    UpToDate,
+    Ahead(usize),
+    Behind(usize),
+    Diverged { ahead: usize, behind: usize },
 }
 
 #[derive(Debug)]
@@ -141,10 +155,7 @@ pub fn build_repository_list(manifest: &WorkspaceManifest) -> Vec<RepositoryList
             name: repo.name.clone(),
             dir_name: repo.dir_name.clone(),
             remote_url: repo.remote_url.clone(),
-            status: RepositoryStatusStub {
-                state: RepositoryState::Unknown,
-                branch: None,
-            },
+            status: collect_repository_status(&manifest.root.join(&repo.dir_name)),
         })
         .collect()
 }
@@ -183,6 +194,106 @@ pub fn derive_dir_name(url: &str) -> Result<String, WorkspaceError> {
         return Err(WorkspaceError::InvalidRepoUrl(url.to_string()));
     }
     Ok(candidate.to_string())
+}
+
+pub fn collect_repository_status(repo_path: &Path) -> RepositoryStatus {
+    if !repo_path.exists() {
+        return RepositoryStatus {
+            state: RepositoryState::Missing,
+            branch: None,
+            sync: RepositorySync::NoUpstream,
+            repo_path: repo_path.to_path_buf(),
+        };
+    }
+
+    let branch = current_branch(repo_path);
+    let state = repository_state(repo_path);
+    let sync = repository_sync(repo_path);
+
+    RepositoryStatus {
+        state,
+        branch,
+        sync,
+        repo_path: repo_path.to_path_buf(),
+    }
+}
+
+pub fn format_sync_label(sync: &RepositorySync) -> String {
+    match sync {
+        RepositorySync::Unknown => "?".to_string(),
+        RepositorySync::NoUpstream => "-".to_string(),
+        RepositorySync::UpToDate => "up-to-date".to_string(),
+        RepositorySync::Ahead(ahead) => format!("+{ahead}"),
+        RepositorySync::Behind(behind) => format!("-{behind}"),
+        RepositorySync::Diverged { ahead, behind } => format!("+{ahead}/-{behind}"),
+    }
+}
+
+fn current_branch(repo_path: &Path) -> Option<String> {
+    match git_stdout(repo_path, ["branch", "--show-current"]) {
+        Some(output) if !output.is_empty() => Some(output),
+        Some(_) => Some("detached".to_string()),
+        None => None,
+    }
+}
+
+fn repository_state(repo_path: &Path) -> RepositoryState {
+    let has_diff = git_success(repo_path, ["diff", "--quiet"]).map(|ok| !ok);
+    let has_cached_diff = git_success(repo_path, ["diff", "--cached", "--quiet"]).map(|ok| !ok);
+    if matches!(has_diff, Some(true)) || matches!(has_cached_diff, Some(true)) {
+        return RepositoryState::Dirty;
+    }
+
+    match git_stdout(repo_path, ["ls-files", "--others", "--exclude-standard"]) {
+        Some(output) if !output.is_empty() => RepositoryState::Untracked,
+        Some(_) => RepositoryState::Clean,
+        None => RepositoryState::Unknown,
+    }
+}
+
+fn repository_sync(repo_path: &Path) -> RepositorySync {
+    let Some(upstream) = git_stdout(repo_path, ["rev-parse", "--abbrev-ref", "@{upstream}"]) else {
+        return RepositorySync::NoUpstream;
+    };
+    if upstream.is_empty() {
+        return RepositorySync::NoUpstream;
+    }
+
+    let ahead = git_stdout(repo_path, ["rev-list", "--count", "@{upstream}..HEAD"])
+        .and_then(|value| value.parse::<usize>().ok());
+    let behind = git_stdout(repo_path, ["rev-list", "--count", "HEAD..@{upstream}"])
+        .and_then(|value| value.parse::<usize>().ok());
+
+    match (ahead, behind) {
+        (Some(0), Some(0)) => RepositorySync::UpToDate,
+        (Some(ahead), Some(0)) => RepositorySync::Ahead(ahead),
+        (Some(0), Some(behind)) => RepositorySync::Behind(behind),
+        (Some(ahead), Some(behind)) => RepositorySync::Diverged { ahead, behind },
+        _ => RepositorySync::Unknown,
+    }
+}
+
+fn git_stdout<const N: usize>(repo_path: &Path, args: [&str; N]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_success<const N: usize>(repo_path: &Path, args: [&str; N]) -> Option<bool> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .status()
+        .ok()
+        .map(|status| status.success())
 }
 
 #[cfg(test)]
@@ -234,10 +345,15 @@ mod tests {
     }
 
     #[test]
-    fn build_repository_list_defaults_to_unknown_status() {
+    fn build_repository_list_collects_real_status() {
+        let workspace = temp_dir_path("workspace");
+        let repo_path = workspace.join("alpha");
+        fs::create_dir_all(&workspace).unwrap();
+        init_git_repo(&repo_path);
+
         let manifest = WorkspaceManifest {
             name: "Example".to_string(),
-            root: PathBuf::from("/tmp/example"),
+            root: workspace,
             repos: vec![RepositoryEntry {
                 id: "alpha".to_string(),
                 name: "Alpha".to_string(),
@@ -250,8 +366,57 @@ mod tests {
 
         let items = build_repository_list(&manifest);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].status.state, RepositoryState::Unknown);
-        assert_eq!(items[0].status.branch, None);
+        assert_eq!(items[0].status.state, RepositoryState::Clean);
+        assert_eq!(items[0].status.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn collect_repository_status_marks_missing_repo() {
+        let path = temp_dir_path("missing").join("ghost");
+        let status = collect_repository_status(&path);
+        assert_eq!(status.state, RepositoryState::Missing);
+        assert_eq!(status.branch, None);
+    }
+
+    #[test]
+    fn collect_repository_status_detects_untracked_files() {
+        let repo_path = temp_dir_path("untracked");
+        init_git_repo(&repo_path);
+        fs::write(repo_path.join("scratch.txt"), "hello").unwrap();
+
+        let status = collect_repository_status(&repo_path);
+        assert_eq!(status.state, RepositoryState::Untracked);
+    }
+
+    #[test]
+    fn format_sync_label_matches_mono_style() {
+        assert_eq!(format_sync_label(&RepositorySync::UpToDate), "up-to-date");
+        assert_eq!(format_sync_label(&RepositorySync::NoUpstream), "-");
+        assert_eq!(format_sync_label(&RepositorySync::Ahead(2)), "+2");
+        assert_eq!(
+            format_sync_label(&RepositorySync::Diverged { ahead: 1, behind: 3 }),
+            "+1/-3"
+        );
+    }
+
+    fn init_git_repo(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        run_git(path, ["init", "-b", "main"]);
+        run_git(path, ["config", "user.name", "Ronomepo Tests"]);
+        run_git(path, ["config", "user.email", "tests@example.com"]);
+        fs::write(path.join("README.md"), "hello\n").unwrap();
+        run_git(path, ["add", "README.md"]);
+        run_git(path, ["commit", "-m", "init"]);
+    }
+
+    fn run_git<const N: usize>(path: &Path, args: [&str; N]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     fn temp_file_path(prefix: &str) -> PathBuf {
@@ -261,5 +426,12 @@ mod tests {
             .as_nanos();
         std::env::temp_dir().join(format!("ronomepo-{prefix}-{stamp}.json"))
     }
-}
 
+    fn temp_dir_path(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ronomepo-{prefix}-{stamp}"))
+    }
+}

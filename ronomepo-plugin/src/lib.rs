@@ -509,6 +509,7 @@ fn status_label(state: &ronomepo_core::RepositoryState) -> &'static str {
         ronomepo_core::RepositoryState::Missing => "Missing",
         ronomepo_core::RepositoryState::Clean => "Clean",
         ronomepo_core::RepositoryState::Dirty => "Dirty",
+        ronomepo_core::RepositoryState::Untracked => "Untracked",
     }
 }
 
