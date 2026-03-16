@@ -71,6 +71,7 @@ struct RepositoryViewHandle {
 struct ContainerViewHandle {
     root: glib::WeakRef<GtkBox>,
     instance_key: Option<String>,
+    host_ptr: usize,
 }
 
 thread_local! {
@@ -479,7 +480,7 @@ fn refresh_views() {
         let mut views = views.borrow_mut();
         views.retain(|handle| match handle.root.upgrade() {
             Some(root) => {
-                render_monorepo_overview_into(&root, &snapshot);
+                render_monorepo_overview_into(&root, &snapshot, handle.host_ptr as *const _);
                 true
             }
             None => false,
@@ -490,7 +491,12 @@ fn refresh_views() {
         let mut views = views.borrow_mut();
         views.retain(|handle| match handle.root.upgrade() {
             Some(root) => {
-                render_repo_overview_into(&root, &snapshot, handle.instance_key.as_deref());
+                render_repo_overview_into(
+                    &root,
+                    &snapshot,
+                    handle.instance_key.as_deref(),
+                    handle.host_ptr as *const _,
+                );
                 true
             }
             None => false,
@@ -1018,7 +1024,7 @@ fn repo_monitor_header() -> GtkBox {
 }
 
 extern "C" fn create_monorepo_overview_view(
-    _host: *const maruzzella_sdk::ffi::MzHostApi,
+    host: *const maruzzella_sdk::ffi::MzHostApi,
     _request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
@@ -1032,7 +1038,7 @@ extern "C" fn create_monorepo_overview_view(
     root.set_margin_end(24);
 
     let snapshot = snapshot();
-    render_monorepo_overview_into(&root, &snapshot);
+    render_monorepo_overview_into(&root, &snapshot, host);
 
     let root_ref = glib::WeakRef::new();
     root_ref.set(Some(&root));
@@ -1040,6 +1046,7 @@ extern "C" fn create_monorepo_overview_view(
         views.borrow_mut().push(ContainerViewHandle {
             root: root_ref,
             instance_key: None,
+            host_ptr: host as usize,
         });
     });
 
@@ -1049,7 +1056,11 @@ extern "C" fn create_monorepo_overview_view(
     }
 }
 
-fn render_monorepo_overview_into(root: &GtkBox, snapshot: &StateSnapshot) {
+fn render_monorepo_overview_into(
+    root: &GtkBox,
+    snapshot: &StateSnapshot,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) {
     clear_box(root);
 
     let summary = workspace_summary(
@@ -1134,6 +1145,7 @@ fn render_monorepo_overview_into(root: &GtkBox, snapshot: &StateSnapshot) {
     }
 
     let actions = overview_actions();
+    let file_actions = overview_file_actions(snapshot, host_ptr);
 
     let sections = GtkBox::new(Orientation::Vertical, 12);
     append_overview_section(
@@ -1191,11 +1203,12 @@ fn render_monorepo_overview_into(root: &GtkBox, snapshot: &StateSnapshot) {
     root.append(&hero);
     root.append(&stats);
     root.append(&actions);
+    root.append(&file_actions);
     root.append(&sections);
 }
 
 extern "C" fn create_repo_overview_view(
-    _host: *const maruzzella_sdk::ffi::MzHostApi,
+    host: *const maruzzella_sdk::ffi::MzHostApi,
     request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
@@ -1211,7 +1224,7 @@ extern "C" fn create_repo_overview_view(
     let instance_key = unsafe { request.as_ref() }
         .and_then(|request| decode_mzstr(request.instance_key));
     let snapshot = snapshot();
-    render_repo_overview_into(&root, &snapshot, instance_key.as_deref());
+    render_repo_overview_into(&root, &snapshot, instance_key.as_deref(), host);
 
     let root_ref = glib::WeakRef::new();
     root_ref.set(Some(&root));
@@ -1219,6 +1232,7 @@ extern "C" fn create_repo_overview_view(
         views.borrow_mut().push(ContainerViewHandle {
             root: root_ref,
             instance_key,
+            host_ptr: host as usize,
         });
     });
 
@@ -1232,6 +1246,7 @@ fn render_repo_overview_into(
     root: &GtkBox,
     snapshot: &StateSnapshot,
     instance_key: Option<&str>,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
     clear_box(root);
 
@@ -1250,6 +1265,7 @@ fn render_repo_overview_into(
         body.add_css_class("muted");
         root.append(&body);
         root.append(&overview_actions());
+        root.append(&overview_file_actions(snapshot, host_ptr));
         return;
     };
 
@@ -1263,6 +1279,7 @@ fn render_repo_overview_into(
         body.add_css_class("muted");
         root.append(&body);
         root.append(&overview_actions());
+        root.append(&overview_file_actions(snapshot, host_ptr));
         return;
     };
 
@@ -1276,8 +1293,9 @@ fn render_repo_overview_into(
     subtitle.add_css_class("muted");
     subtitle.set_wrap(true);
     root.append(&subtitle);
-    root.append(&repo_overview_actions(item));
+    root.append(&repo_overview_actions(item, host_ptr));
     root.append(&overview_actions());
+    root.append(&overview_file_actions(snapshot, host_ptr));
 
     let status_cards = GtkBox::new(Orientation::Horizontal, 12);
     for (label, value) in [
@@ -1346,13 +1364,18 @@ fn overview_actions() -> GtkBox {
     actions
 }
 
-fn repo_overview_actions(item: &RepositoryListItem) -> GtkBox {
+fn repo_overview_actions(
+    item: &RepositoryListItem,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) -> GtkBox {
     let actions = GtkBox::new(Orientation::Horizontal, 8);
     for (label, kind) in [
         ("Target This Repo", None),
         ("Open Folder", None),
         ("Open Terminal", None),
         ("Open In Editor", None),
+        ("Edit README", None),
+        ("Edit .git/config", None),
         ("Clone Repo", Some(OperationKind::CloneMissing)),
         ("Pull Repo", Some(OperationKind::Pull)),
         ("Push Repo", Some(OperationKind::Push)),
@@ -1377,6 +1400,12 @@ fn repo_overview_actions(item: &RepositoryListItem) -> GtkBox {
                 "Open In Editor" => {
                     open_path_in_editor(&repo_path, &repo_name);
                 }
+                "Edit README" => {
+                    open_text_editor_for_path(host_ptr, &repo_path.join("README.md"));
+                }
+                "Edit .git/config" => {
+                    open_text_editor_for_path(host_ptr, &repo_path.join(".git/config"));
+                }
                 _ => {
                     set_selected_repo_ids(vec![repo_id.clone()]);
                     if let Some(kind) = kind {
@@ -1387,6 +1416,32 @@ fn repo_overview_actions(item: &RepositoryListItem) -> GtkBox {
         });
         actions.append(&button);
     }
+    actions
+}
+
+fn overview_file_actions(
+    snapshot: &StateSnapshot,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) -> GtkBox {
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
+
+    for (label, path) in [
+        (
+            "Edit Manifest",
+            snapshot
+                .manifest_path
+                .clone()
+                .unwrap_or_else(|| default_manifest_path(&snapshot.workspace_root)),
+        ),
+        ("Edit repos.txt", snapshot.workspace_root.join("repos.txt")),
+    ] {
+        let button = Button::with_label(label);
+        button.connect_clicked(move |_| {
+            open_text_editor_for_path(host_ptr, &path);
+        });
+        actions.append(&button);
+    }
+
     actions
 }
 
@@ -1654,6 +1709,48 @@ fn open_selected_repo_in_editor() {
     open_path_in_editor(&item.status.repo_path, &item.name);
 }
 
+fn open_text_editor_for_path(
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    path: &Path,
+) {
+    let resolved = resolve_editor_path(&path.display().to_string());
+    let instance_key = resolved.to_string_lossy().to_string();
+    let requested_title = editor_title_for_path(&resolved);
+
+    if host_ptr.is_null() {
+        append_log(format!(
+            "Cannot open {} in the Ronomepo editor because the Maruzzella host handle is unavailable.",
+            resolved.display()
+        ));
+        return;
+    }
+
+    let host = unsafe { HostApi::from_raw(&*host_ptr) };
+    let mut request = OpenViewRequest::new(PLUGIN_ID, VIEW_TEXT_EDITOR, MzViewPlacement::Workbench);
+    request.instance_key = Some(&instance_key);
+    request.requested_title = Some(&requested_title);
+    request.payload = instance_key.as_bytes();
+
+    match host.open_view(&request) {
+        Ok(MzViewOpenDisposition::Opened) => {
+            append_log(format!(
+                "Opened {} in a Ronomepo editor tab.",
+                resolved.display()
+            ));
+        }
+        Ok(MzViewOpenDisposition::FocusedExisting) => {
+            append_log(format!(
+                "Focused existing Ronomepo editor tab for {}.",
+                resolved.display()
+            ));
+        }
+        Err(status) => append_log(format!(
+            "Failed to open {} in a Ronomepo editor tab: {status:?}",
+            resolved.display()
+        )),
+    }
+}
+
 fn open_path_in_file_manager(path: &Path, label: &str) {
     if !path.exists() {
         append_log(format!(
@@ -1735,8 +1832,8 @@ fn open_path_in_editor(path: &Path, label: &str) {
 }
 
 extern "C" fn create_text_editor_view(
-    _host: *const maruzzella_sdk::ffi::MzHostApi,
-    _request: *const maruzzella_sdk::ffi::MzViewRequest,
+    host: *const maruzzella_sdk::ffi::MzHostApi,
+    request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         return std::ptr::null_mut();
@@ -1747,6 +1844,21 @@ extern "C" fn create_text_editor_view(
     root.set_margin_bottom(18);
     root.set_margin_start(18);
     root.set_margin_end(18);
+
+    let initial_path = unsafe { request.as_ref() }
+        .and_then(|request| decode_mzstr(request.instance_key))
+        .or_else(|| {
+            unsafe { request.as_ref() }.and_then(|request| {
+                if request.payload.ptr.is_null() || request.payload.len == 0 {
+                    None
+                } else {
+                    let bytes =
+                        unsafe { std::slice::from_raw_parts(request.payload.ptr, request.payload.len) };
+                    let text = String::from_utf8_lossy(bytes).trim().to_string();
+                    (!text.is_empty()).then_some(text)
+                }
+            })
+        });
 
     let title = Label::new(Some("Text Editor"));
     title.set_xalign(0.0);
@@ -1785,20 +1897,29 @@ extern "C" fn create_text_editor_view(
         .child(&text)
         .build();
 
+    if let Some(path) = initial_path.as_deref() {
+        path_entry.set_text(path);
+        load_editor_buffer(&buffer, &status, &resolve_editor_path(path));
+        title.set_text(&editor_title_for_path(&resolve_editor_path(path)));
+    }
+
     open_button.connect_clicked({
         let path_entry = path_entry.clone();
         let buffer = buffer.clone();
         let status = status.clone();
+        let title = title.clone();
+        let initial_path = initial_path.clone();
         move |_| {
             let path = resolve_editor_path(path_entry.text().as_str());
-            match fs::read_to_string(&path) {
-                Ok(content) => {
-                    buffer.set_text(&content);
-                    status.set_text(&format!("Loaded {}", path.display()));
-                }
-                Err(error) => {
-                    status.set_text(&format!("Failed to open {}: {error}", path.display()));
-                }
+            let current_instance = initial_path
+                .as_deref()
+                .map(resolve_editor_path)
+                .unwrap_or_default();
+            if !current_instance.as_os_str().is_empty() && current_instance != path {
+                open_text_editor_for_path(host, &path);
+            } else {
+                load_editor_buffer(&buffer, &status, &path);
+                title.set_text(&editor_title_for_path(&path));
             }
         }
     });
@@ -1807,12 +1928,22 @@ extern "C" fn create_text_editor_view(
         let path_entry = path_entry.clone();
         let buffer = buffer.clone();
         let status = status.clone();
+        let title = title.clone();
         move |_| {
             let path = resolve_editor_path(path_entry.text().as_str());
             let content = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
             match fs::write(&path, content.as_str()) {
                 Ok(()) => {
                     status.set_text(&format!("Saved {}", path.display()));
+                    let title_text = editor_title_for_path(&path);
+                    title.set_text(&title_text);
+                    if !host.is_null() {
+                        let host = unsafe { HostApi::from_raw(&*host) };
+                        let mut query = maruzzella_sdk::ViewQuery::new(PLUGIN_ID, VIEW_TEXT_EDITOR);
+                        let path_key = path.to_string_lossy().to_string();
+                        query.instance_key = Some(&path_key);
+                        let _ = host.update_view_title(&query, &title_text);
+                    }
                 }
                 Err(error) => {
                     status.set_text(&format!("Failed to save {}: {error}", path.display()));
@@ -1849,6 +1980,27 @@ fn resolve_editor_path(input: &str) -> PathBuf {
     } else {
         snapshot().workspace_root.join(path)
     }
+}
+
+fn load_editor_buffer(buffer: &TextBuffer, status: &Label, path: &Path) {
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            buffer.set_text(&content);
+            status.set_text(&format!("Loaded {}", path.display()));
+        }
+        Err(error) => {
+            buffer.set_text("");
+            status.set_text(&format!("Failed to open {}: {error}", path.display()));
+        }
+    }
+}
+
+fn editor_title_for_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Text Editor")
+        .to_string()
 }
 
 fn decode_mzstr(value: maruzzella_sdk::ffi::MzStr) -> Option<String> {
