@@ -155,14 +155,6 @@ fn main() {
                 false,
             ),
             plugin_tab(
-                "repo-overview",
-                "workbench-main",
-                "Repo Overview",
-                "com.lelloman.ronomepo.repo_overview",
-                "The Ronomepo repo overview could not be created.",
-                false,
-            ),
-            plugin_tab(
                 "text-editor",
                 "workbench-main",
                 "Text Editor",

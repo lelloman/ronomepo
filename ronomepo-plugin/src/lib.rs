@@ -12,9 +12,9 @@ use gtk::{
     TextView, WrapMode,
 };
 use maruzzella_sdk::{
-    export_plugin, CommandSpec, HostApi, MenuItemSpec, MzLogLevel, MzMenuSurface, MzStatusCode,
-    MzViewPlacement, Plugin, PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version,
-    ViewFactorySpec,
+    export_plugin, CommandSpec, HostApi, MenuItemSpec, MzLogLevel, MzMenuSurface,
+    MzStatusCode, MzViewOpenDisposition, MzViewPlacement, OpenViewRequest, Plugin,
+    PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use ronomepo_core::{
     build_repository_list, default_manifest_path, format_sync_label, import_repos_txt,
@@ -60,11 +60,13 @@ struct AppState {
 struct RepositoryViewHandle {
     summary: glib::WeakRef<Label>,
     list: glib::WeakRef<ListBox>,
+    host_ptr: usize,
 }
 
 #[derive(Default)]
 struct ContainerViewHandle {
     root: glib::WeakRef<GtkBox>,
+    instance_key: Option<String>,
 }
 
 thread_local! {
@@ -458,7 +460,7 @@ fn refresh_views() {
             let Some(list) = handle.list.upgrade() else {
                 return false;
             };
-            render_repository_view_into(&summary, &list, &snapshot);
+            render_repository_view_into(&summary, &list, &snapshot, handle.host_ptr as *const _);
             true
         });
     });
@@ -478,7 +480,7 @@ fn refresh_views() {
         let mut views = views.borrow_mut();
         views.retain(|handle| match handle.root.upgrade() {
             Some(root) => {
-                render_repo_overview_into(&root, &snapshot);
+                render_repo_overview_into(&root, &snapshot, handle.instance_key.as_deref());
                 true
             }
             None => false,
@@ -519,7 +521,12 @@ fn snapshot() -> StateSnapshot {
     }
 }
 
-fn render_repository_view_into(summary_label: &Label, list: &ListBox, snapshot: &StateSnapshot) {
+fn render_repository_view_into(
+    summary_label: &Label,
+    list: &ListBox,
+    snapshot: &StateSnapshot,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) {
     let repository_items = snapshot
         .manifest
         .as_ref()
@@ -591,7 +598,7 @@ fn render_repository_view_into(summary_label: &Label, list: &ListBox, snapshot: 
                 item.remote_url,
                 item.dir_name
             )));
-            attach_row_context_menu(&row);
+            attach_row_context_menu(&row, host_ptr);
             list.append(&row);
         }
 
@@ -667,12 +674,15 @@ fn update_selected_repo_ids(ids: Vec<String>) {
     app_state.selected_repo_ids = ids;
 }
 
-fn open_selected_repo_overview() {
+fn open_repo_overviews(
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    repo_ids: &[String],
+) {
     let snapshot = snapshot();
     let items = repository_items(&snapshot);
     let selected = items
         .iter()
-        .filter(|item| snapshot.selected_repo_ids.iter().any(|id| id == &item.id))
+        .filter(|item| repo_ids.iter().any(|id| id == &item.id))
         .collect::<Vec<_>>();
 
     if selected.is_empty() {
@@ -681,30 +691,54 @@ fn open_selected_repo_overview() {
         return;
     }
 
-    let first = selected[0];
-    {
-        let mut app_state = state().lock().expect("state mutex poisoned");
-        app_state.active_repo_id = Some(first.id.clone());
+    if host_ptr.is_null() {
+        append_log(
+            "Cannot open repo overview because the Maruzzella host handle is unavailable."
+                .to_string(),
+        );
+        refresh_views();
+        return;
     }
 
-    let message = if selected.len() == 1 {
-        format!(
-            "Selected {} for repo overview. Dynamic repo tabs land in the next task.",
-            first.name
-        )
-    } else {
-        format!(
-            "Selected {} repositories; {} is now the active repo overview target. Multi-tab opening lands in the next task.",
-            selected.len(),
-            first.name
-        )
-    };
-    append_log(message);
+    for item in selected {
+        if let Err(message) = open_repo_overview_for_item(host_ptr, item) {
+            append_log(message);
+            continue;
+        }
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        app_state.active_repo_id = Some(item.id.clone());
+    }
     refresh_views();
 }
 
-fn attach_row_context_menu(row: &ListBoxRow) {
-    let popover = build_repo_context_menu(row);
+fn open_repo_overview_for_item(
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    item: &RepositoryListItem,
+) -> Result<(), String> {
+    let host = unsafe { HostApi::from_raw(&*host_ptr) };
+    let mut request = OpenViewRequest::new(PLUGIN_ID, VIEW_REPO_OVERVIEW, MzViewPlacement::Workbench);
+    request.instance_key = Some(&item.id);
+    request.requested_title = Some(&item.name);
+    request.payload = item.id.as_bytes();
+
+    match host.open_view(&request) {
+        Ok(MzViewOpenDisposition::Opened) => {
+            append_log(format!("Opened repo overview for {}.", item.name));
+            Ok(())
+        }
+        Ok(MzViewOpenDisposition::FocusedExisting) => {
+            append_log(format!("Focused existing repo overview for {}.", item.name));
+            Ok(())
+        }
+        Err(status) => Err(format!(
+            "Failed to open repo overview for {}: {status:?}",
+            item.name
+        )),
+    }
+}
+
+fn attach_row_context_menu(row: &ListBoxRow, host_ptr: *const maruzzella_sdk::ffi::MzHostApi) {
+    let popover = build_repo_context_menu(row, host_ptr);
     let gesture = GestureClick::new();
     gesture.set_button(3);
     gesture.connect_pressed({
@@ -724,7 +758,10 @@ fn attach_row_context_menu(row: &ListBoxRow) {
     row.add_controller(gesture);
 }
 
-fn build_repo_context_menu(relative_to: &impl IsA<gtk::Widget>) -> Popover {
+fn build_repo_context_menu(
+    relative_to: &impl IsA<gtk::Widget>,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) -> Popover {
     let popover = Popover::new();
     popover.set_autohide(true);
     popover.set_has_arrow(true);
@@ -737,8 +774,12 @@ fn build_repo_context_menu(relative_to: &impl IsA<gtk::Widget>) -> Popover {
     menu.set_margin_start(8);
     menu.set_margin_end(8);
 
-    append_context_button(&menu, &popover, "Open Overview", || {
-        open_selected_repo_overview();
+    append_context_button(&menu, &popover, "Open Overview", move || {
+        let repo_ids = {
+            let app_state = state().lock().expect("state mutex poisoned");
+            app_state.selected_repo_ids.clone()
+        };
+        open_repo_overviews(host_ptr, &repo_ids);
     });
     append_context_button(&menu, &popover, "Pull", || {
         let _ = command_pull(maruzzella_sdk::ffi::MzBytes::empty());
@@ -773,7 +814,7 @@ where
 }
 
 extern "C" fn create_repo_monitor_view(
-    _host: *const maruzzella_sdk::ffi::MzHostApi,
+    host: *const maruzzella_sdk::ffi::MzHostApi,
     _request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
@@ -801,8 +842,14 @@ extern "C" fn create_repo_monitor_view(
     list.connect_selected_rows_changed(|list| {
         update_selected_repo_ids(selection_ids_from_list(list));
     });
-    list.connect_row_activated(|_, _| {
-        open_selected_repo_overview();
+    list.connect_row_activated(move |_, row| {
+        let repo_ids = snapshot()
+            .manifest
+            .as_ref()
+            .map(build_repository_list)
+            .and_then(|items| items.get(row.index() as usize).map(|item| vec![item.id.clone()]))
+            .unwrap_or_default();
+        open_repo_overviews(host, &repo_ids);
     });
 
     let scroller = ScrolledWindow::builder()
@@ -820,7 +867,7 @@ extern "C" fn create_repo_monitor_view(
     root.append(&scroller);
 
     let snapshot = snapshot();
-    render_repository_view_into(&summary, &list, &snapshot);
+    render_repository_view_into(&summary, &list, &snapshot, host);
 
     let summary_ref = glib::WeakRef::new();
     summary_ref.set(Some(&summary));
@@ -830,6 +877,7 @@ extern "C" fn create_repo_monitor_view(
         views.borrow_mut().push(RepositoryViewHandle {
             summary: summary_ref,
             list: list_ref,
+            host_ptr: host as usize,
         });
     });
 
@@ -882,7 +930,10 @@ extern "C" fn create_monorepo_overview_view(
     let root_ref = glib::WeakRef::new();
     root_ref.set(Some(&root));
     MONOREPO_OVERVIEWS.with(|views| {
-        views.borrow_mut().push(ContainerViewHandle { root: root_ref });
+        views.borrow_mut().push(ContainerViewHandle {
+            root: root_ref,
+            instance_key: None,
+        });
     });
 
     unsafe {
@@ -1004,7 +1055,7 @@ fn render_monorepo_overview_into(root: &GtkBox, snapshot: &StateSnapshot) {
 
 extern "C" fn create_repo_overview_view(
     _host: *const maruzzella_sdk::ffi::MzHostApi,
-    _request: *const maruzzella_sdk::ffi::MzViewRequest,
+    request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
     if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
         return std::ptr::null_mut();
@@ -1016,13 +1067,18 @@ extern "C" fn create_repo_overview_view(
     root.set_margin_start(24);
     root.set_margin_end(24);
 
+    let instance_key = unsafe { request.as_ref() }
+        .and_then(|request| decode_mzstr(request.instance_key));
     let snapshot = snapshot();
-    render_repo_overview_into(&root, &snapshot);
+    render_repo_overview_into(&root, &snapshot, instance_key.as_deref());
 
     let root_ref = glib::WeakRef::new();
     root_ref.set(Some(&root));
     REPO_OVERVIEWS.with(|views| {
-        views.borrow_mut().push(ContainerViewHandle { root: root_ref });
+        views.borrow_mut().push(ContainerViewHandle {
+            root: root_ref,
+            instance_key,
+        });
     });
 
     unsafe {
@@ -1031,7 +1087,11 @@ extern "C" fn create_repo_overview_view(
     }
 }
 
-fn render_repo_overview_into(root: &GtkBox, snapshot: &StateSnapshot) {
+fn render_repo_overview_into(
+    root: &GtkBox,
+    snapshot: &StateSnapshot,
+    instance_key: Option<&str>,
+) {
     clear_box(root);
 
     let title = Label::new(Some("Repo Overview"));
@@ -1039,9 +1099,10 @@ fn render_repo_overview_into(root: &GtkBox, snapshot: &StateSnapshot) {
     title.add_css_class("title-2");
     root.append(&title);
 
-    let Some(active_repo_id) = snapshot.active_repo_id.as_deref() else {
+    let target_repo_id = instance_key.or(snapshot.active_repo_id.as_deref());
+    let Some(active_repo_id) = target_repo_id else {
         let body = Label::new(Some(
-            "No active repo selected yet. Double click a repository in the left monitor, then reuse this overview tab.",
+            "No repo target was provided. Open repo overviews from the left monitor.",
         ));
         body.set_xalign(0.0);
         body.set_wrap(true);
@@ -1264,6 +1325,15 @@ fn resolve_editor_path(input: &str) -> PathBuf {
     } else {
         snapshot().workspace_root.join(path)
     }
+}
+
+fn decode_mzstr(value: maruzzella_sdk::ffi::MzStr) -> Option<String> {
+    if value.ptr.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(value.ptr, value.len) };
+    let text = String::from_utf8_lossy(bytes).trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 extern "C" fn create_operations_view(
