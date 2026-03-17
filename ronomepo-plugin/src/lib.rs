@@ -57,7 +57,7 @@ struct RonomepoPluginConfig {
     import_banner_dismissed: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct AppState {
     workspace_root: PathBuf,
     manifest_path: Option<PathBuf>,
@@ -71,6 +71,25 @@ struct AppState {
     history_report: Vec<String>,
     line_stats_report: Vec<String>,
     line_stats_since: String,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            workspace_root: PathBuf::new(),
+            manifest_path: None,
+            manifest: None,
+            monitor_filter: String::new(),
+            monitor_show_all: true,
+            selected_repo_ids: Vec::new(),
+            active_repo_id: None,
+            logs: Vec::new(),
+            next_operation_batch: 0,
+            history_report: Vec::new(),
+            line_stats_report: Vec::new(),
+            line_stats_since: String::new(),
+        }
+    }
 }
 
 #[derive(Default)]
