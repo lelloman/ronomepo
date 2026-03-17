@@ -22,7 +22,8 @@ use maruzzella_sdk::{
 };
 use ronomepo_core::{
     build_repository_list, default_manifest_path, derive_dir_name, format_sync_label,
-    import_repos_txt, load_manifest, run_workspace_operation, save_manifest, workspace_summary,
+    import_repos_txt, load_manifest, normalize_workspace_root, run_workspace_operation,
+    save_manifest, workspace_summary,
     collect_generated_history_matches, collect_repository_details, collect_workspace_line_stats,
     OperationEvent, OperationEventKind, OperationKind, RepositoryEntry, RepositoryListItem,
     MANIFEST_FILE_NAME, WorkspaceManifest,
@@ -320,6 +321,7 @@ fn initialize_state(config: &RonomepoPluginConfig) {
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .or_else(|| config.last_workspace_path.as_deref().map(PathBuf::from))
+        .map(normalize_workspace_root)
         .unwrap_or_else(|| PathBuf::from("."));
     let manifest_path = default_manifest_path(&workspace_root);
     let manifest = load_manifest_if_present(&manifest_path);
@@ -2000,7 +2002,7 @@ fn save_workspace_manifest_from_editor(
     shared_hooks_path: &str,
     repo_rows: &[RepoEditorRowHandle],
 ) -> Result<String, String> {
-    let workspace_root = PathBuf::from(workspace_root.trim());
+    let workspace_root = normalize_workspace_root(workspace_root.trim());
     if workspace_root.as_os_str().is_empty() {
         return Err("Workspace root cannot be empty.".to_string());
     }

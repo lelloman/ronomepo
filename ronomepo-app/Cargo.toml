@@ -6,4 +6,5 @@ edition = "2021"
 [dependencies]
 gtk = { package = "gtk4", version = "0.9" }
 maruzzella = { path = "../../maruzzella" }
+ronomepo-core = { path = "../ronomepo-core" }
 ronomepo-plugin = { path = "../ronomepo-plugin" }

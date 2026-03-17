@@ -168,6 +168,23 @@ pub fn default_manifest_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(MANIFEST_FILE_NAME)
 }
 
+pub fn normalize_workspace_root(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    let text = path.to_string_lossy();
+
+    if text == "~" {
+        return env_home_dir().unwrap_or_else(|| path.to_path_buf());
+    }
+
+    if let Some(stripped) = text.strip_prefix("~/") {
+        if let Some(home) = env_home_dir() {
+            return home.join(stripped);
+        }
+    }
+
+    path.to_path_buf()
+}
+
 pub fn load_manifest(path: &Path) -> Result<WorkspaceManifest, WorkspaceError> {
     let content = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&content)?)
@@ -259,6 +276,10 @@ pub fn derive_dir_name(url: &str) -> Result<String, WorkspaceError> {
         return Err(WorkspaceError::InvalidRepoUrl(url.to_string()));
     }
     Ok(candidate.to_string())
+}
+
+fn env_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 pub fn collect_repository_status(repo_path: &Path) -> RepositoryStatus {
@@ -988,7 +1009,30 @@ fn git_success<const N: usize>(repo_path: &Path, args: [&str; N]) -> Option<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn derive_dir_name_handles_ssh_urls() {
@@ -1031,6 +1075,21 @@ mod tests {
         save_manifest(&path, &manifest).unwrap();
         let loaded = load_manifest(&path).unwrap();
         assert_eq!(loaded, manifest);
+    }
+
+    #[test]
+    fn normalize_workspace_root_expands_tilde_prefix() {
+        let _home = EnvVarGuard::set("HOME", "/tmp/ronomepo-home");
+
+        assert_eq!(normalize_workspace_root("~"), PathBuf::from("/tmp/ronomepo-home"));
+        assert_eq!(
+            normalize_workspace_root("~/lelloprojects"),
+            PathBuf::from("/tmp/ronomepo-home/lelloprojects")
+        );
+        assert_eq!(
+            normalize_workspace_root("/tmp/already-absolute"),
+            PathBuf::from("/tmp/already-absolute")
+        );
     }
 
     #[test]

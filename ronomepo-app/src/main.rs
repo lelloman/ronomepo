@@ -7,11 +7,13 @@ use maruzzella::{
     CommandSpec, MaruzzellaConfig, MenuRootSpec, TabGroupSpec, ThemeSpec, ToolbarItemSpec,
     WorkbenchNodeSpec,
 };
+use ronomepo_core::normalize_workspace_root;
 
 fn main() {
     let workspace_root = parse_workspace_root_arg().unwrap_or_else(|| {
         env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     });
+    let workspace_root = normalize_workspace_root(workspace_root);
     env::set_var("RONOMEPO_WORKSPACE_ROOT", &workspace_root);
 
     let mut product = default_product_spec();
