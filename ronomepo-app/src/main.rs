@@ -80,6 +80,7 @@ fn main() {
             icon_name: Some("view-refresh-symbolic".to_string()),
             label: Some("Refresh".to_string()),
             command_id: "ronomepo.workspace.refresh".to_string(),
+            payload: Vec::new(),
             secondary: false,
         },
         ToolbarItemSpec {
@@ -87,6 +88,7 @@ fn main() {
             icon_name: Some("folder-download-symbolic".to_string()),
             label: Some("Clone Missing".to_string()),
             command_id: "ronomepo.workspace.clone_missing".to_string(),
+            payload: Vec::new(),
             secondary: false,
         },
         ToolbarItemSpec {
@@ -94,6 +96,7 @@ fn main() {
             icon_name: Some("go-down-symbolic".to_string()),
             label: Some("Pull".to_string()),
             command_id: "ronomepo.workspace.pull".to_string(),
+            payload: Vec::new(),
             secondary: false,
         },
         ToolbarItemSpec {
@@ -101,6 +104,7 @@ fn main() {
             icon_name: Some("go-up-symbolic".to_string()),
             label: Some("Push".to_string()),
             command_id: "ronomepo.workspace.push".to_string(),
+            payload: Vec::new(),
             secondary: false,
         },
         ToolbarItemSpec {
@@ -108,6 +112,7 @@ fn main() {
             icon_name: Some("emblem-synchronizing-symbolic".to_string()),
             label: Some("Apply Hooks".to_string()),
             command_id: "ronomepo.workspace.apply_hooks".to_string(),
+            payload: Vec::new(),
             secondary: false,
         },
         ToolbarItemSpec {
@@ -115,6 +120,7 @@ fn main() {
             icon_name: Some("view-grid-symbolic".to_string()),
             label: Some("Monorepo Overview".to_string()),
             command_id: "ronomepo.workspace.open_overview".to_string(),
+            payload: Vec::new(),
             secondary: true,
         },
     ];
