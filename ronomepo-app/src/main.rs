@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 
 use gtk::gio::prelude::ApplicationExtManual;
@@ -10,6 +11,8 @@ use maruzzella::{
 use ronomepo_core::normalize_workspace_root;
 
 fn main() {
+    reset_stale_persisted_layout();
+
     let workspace_root = parse_workspace_root_arg().unwrap_or_else(|| {
         env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     });
@@ -127,7 +130,7 @@ fn main() {
 
     product.layout.bottom_panel_layout = BottomPanelLayout::CenterOnly;
     product.layout.left_panel = TabGroupSpec::new(
-        "repo-monitor",
+        "panel-left",
         Some("repositories"),
         vec![plugin_tab(
             "repositories",
@@ -179,6 +182,35 @@ fn main() {
         .next()
         .unwrap_or_else(|| "ronomepo-app".to_string());
     application.run_with_args(&[argv0]);
+}
+
+fn reset_stale_persisted_layout() {
+    let path = persisted_layout_path("ronomepo");
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return;
+    };
+
+    // Old Ronomepo builds persisted a shell layout that points to non-existent
+    // views and placeholder tabs, which leaves the left panel blank on startup.
+    let has_stale_layout = raw.contains("\"plugin_view_id\": \"com.lelloman.ronomepo.repositories\"")
+        || raw.contains("\"placeholder\": \"Workspace path, filters, and import guidance will live here.\"");
+
+    if has_stale_layout {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn persisted_layout_path(persistence_id: &str) -> PathBuf {
+    let mut path = if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(dir)
+    } else if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home).join(".config")
+    } else {
+        PathBuf::from(".")
+    };
+    path.push(persistence_id);
+    path.push("layout.json");
+    path
 }
 
 fn parse_workspace_root_arg() -> Option<PathBuf> {
