@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,8 +26,8 @@ use ronomepo_core::{
     import_repos_txt, load_manifest, normalize_workspace_root, run_workspace_operation,
     save_manifest, workspace_summary,
     collect_generated_history_matches, collect_repository_details, collect_workspace_line_stats,
-    OperationEvent, OperationEventKind, OperationKind, RepositoryEntry, RepositoryListItem,
-    MANIFEST_FILE_NAME, WorkspaceManifest,
+    OperationEvent, OperationEventKind, OperationKind, RepositoryDetails, RepositoryEntry,
+    RepositoryListItem, RepositoryStatus, MANIFEST_FILE_NAME, WorkspaceManifest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,12 @@ struct AppState {
     workspace_root: PathBuf,
     manifest_path: Option<PathBuf>,
     manifest: Option<WorkspaceManifest>,
+    workspace_status: RepositoryStatus,
+    repository_items: Vec<RepositoryListItem>,
+    repository_items_loading: bool,
+    repository_items_refresh_pending: bool,
+    repo_details_cache: HashMap<String, RepositoryDetails>,
+    repo_details_loading: HashSet<String>,
     monitor_filter: String,
     monitor_show_all: bool,
     selected_repo_ids: Vec<String>,
@@ -79,6 +86,12 @@ impl Default for AppState {
             workspace_root: PathBuf::new(),
             manifest_path: None,
             manifest: None,
+            workspace_status: empty_repository_status(PathBuf::new()),
+            repository_items: Vec::new(),
+            repository_items_loading: false,
+            repository_items_refresh_pending: false,
+            repo_details_cache: HashMap::new(),
+            repo_details_loading: HashSet::new(),
             monitor_filter: String::new(),
             monitor_show_all: true,
             selected_repo_ids: Vec::new(),
@@ -121,6 +134,15 @@ static LAST_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
 
 fn state() -> &'static Mutex<AppState> {
     STATE.get_or_init(|| Mutex::new(AppState::default()))
+}
+
+fn empty_repository_status(repo_path: PathBuf) -> ronomepo_core::RepositoryStatus {
+    ronomepo_core::RepositoryStatus {
+        state: ronomepo_core::RepositoryState::Unknown,
+        branch: None,
+        sync: ronomepo_core::RepositorySync::Unknown,
+        repo_path,
+    }
 }
 
 impl Plugin for RonomepoPlugin {
@@ -349,12 +371,20 @@ fn initialize_state(config: &RonomepoPluginConfig) {
     app_state.workspace_root = workspace_root.clone();
     app_state.manifest_path = manifest.as_ref().map(|_| manifest_path.clone());
     app_state.manifest = manifest;
+    app_state.workspace_status = empty_repository_status(workspace_root.clone());
+    app_state.repository_items.clear();
+    app_state.repository_items_loading = false;
+    app_state.repository_items_refresh_pending = false;
+    app_state.repo_details_cache.clear();
+    app_state.repo_details_loading.clear();
     if app_state.logs.is_empty() {
         app_state.logs.push(format!(
             "Ronomepo initialized for workspace {}",
             workspace_root.display()
         ));
     }
+    drop(app_state);
+    schedule_workspace_scan();
 }
 
 extern "C" fn command_refresh_workspace(
@@ -515,14 +545,21 @@ extern "C" fn command_line_stats(
 fn refresh_workspace() -> Result<String, String> {
     let mut app_state = state().lock().expect("state mutex poisoned");
     let manifest_path = default_manifest_path(&app_state.workspace_root);
-    app_state.manifest = load_manifest_if_present(&manifest_path);
+    let manifest = load_manifest_if_present(&manifest_path);
+    let workspace_root = app_state.workspace_root.clone();
+    app_state.manifest = manifest.clone();
     app_state.manifest_path = app_state.manifest.as_ref().map(|_| manifest_path.clone());
-    if app_state.manifest.is_some() {
+    app_state.repository_items_refresh_pending = false;
+    app_state.repo_details_cache.clear();
+    app_state.repo_details_loading.clear();
+    drop(app_state);
+    schedule_workspace_scan();
+    if manifest.is_some() {
         Ok(format!("Reloaded {MANIFEST_FILE_NAME} from {}", manifest_path.display()))
     } else {
         Ok(format!(
             "No {MANIFEST_FILE_NAME} found in {}",
-            app_state.workspace_root.display()
+            workspace_root.display()
         ))
     }
 }
@@ -543,6 +580,11 @@ fn import_workspace_from_repos_txt() -> Result<String, String> {
     let repo_count = manifest.repos.len();
     app_state.manifest = Some(manifest);
     app_state.manifest_path = Some(manifest_path.clone());
+    app_state.repository_items_refresh_pending = false;
+    app_state.repo_details_cache.clear();
+    app_state.repo_details_loading.clear();
+    drop(app_state);
+    schedule_workspace_scan();
 
     Ok(format!(
         "Imported {repo_count} repositories from {} into {}",
@@ -673,7 +715,18 @@ fn launch_operation(kind: OperationKind) {
     thread::spawn(move || {
         run_workspace_operation(&manifest, &selected_repo_ids, kind, |event| {
             append_log(format!("[run {batch_id}] {}", format_operation_event(&event)));
-            main_context.invoke(refresh_views);
+            let event = event.clone();
+            let manifest = manifest.clone();
+            main_context.invoke(move || match event.kind {
+                OperationEventKind::Success
+                | OperationEventKind::Skipped
+                | OperationEventKind::Failed => {
+                    schedule_refresh_for_operation_event(&manifest, &event);
+                    refresh_views();
+                }
+                OperationEventKind::Finished => refresh_views(),
+                OperationEventKind::Started => refresh_views(),
+            });
         });
     });
 }
@@ -701,6 +754,23 @@ fn format_operation_event(event: &OperationEvent) -> String {
         Some(repo_name) => format!("[{prefix}] {repo_name}: {}", event.message),
         None => format!("[{prefix}] {}", event.message),
     }
+}
+
+fn schedule_refresh_for_operation_event(manifest: &WorkspaceManifest, event: &OperationEvent) {
+    if event.repository_name.as_deref() == Some("(monorepo)") {
+        schedule_workspace_root_status_refresh(manifest.root.clone());
+        return;
+    }
+
+    let Some(repo_id) = event.repository_id.as_deref() else {
+        return;
+    };
+    let Some(repo) = manifest.repos.iter().find(|repo| repo.id == repo_id) else {
+        return;
+    };
+
+    invalidate_repo_details(repo_id);
+    schedule_repository_status_refresh(repo_id, manifest.root.join(&repo.dir_name));
 }
 
 fn refresh_views() {
@@ -829,6 +899,11 @@ struct StateSnapshot {
     workspace_root: PathBuf,
     manifest_path: Option<PathBuf>,
     manifest: Option<WorkspaceManifest>,
+    workspace_status: RepositoryStatus,
+    repository_items: Vec<RepositoryListItem>,
+    repository_items_loading: bool,
+    repo_details_cache: HashMap<String, RepositoryDetails>,
+    repo_details_loading: HashSet<String>,
     monitor_filter: String,
     monitor_show_all: bool,
     selected_repo_ids: Vec<String>,
@@ -845,6 +920,11 @@ fn snapshot() -> StateSnapshot {
         workspace_root: app_state.workspace_root.clone(),
         manifest_path: app_state.manifest_path.clone(),
         manifest: app_state.manifest.clone(),
+        workspace_status: app_state.workspace_status.clone(),
+        repository_items: app_state.repository_items.clone(),
+        repository_items_loading: app_state.repository_items_loading,
+        repo_details_cache: app_state.repo_details_cache.clone(),
+        repo_details_loading: app_state.repo_details_loading.clone(),
         monitor_filter: app_state.monitor_filter.clone(),
         monitor_show_all: app_state.monitor_show_all,
         selected_repo_ids: app_state.selected_repo_ids.clone(),
@@ -881,6 +961,11 @@ fn render_repository_view_into(
     } else {
         format!("{} selected", snapshot.selected_repo_ids.len())
     };
+    let loading_scope = if snapshot.repository_items_loading {
+        "Refreshing Git status".to_string()
+    } else {
+        "Status ready".to_string()
+    };
     let filter_scope = if snapshot.monitor_filter.trim().is_empty() {
         format!(
             "{} shown ({})",
@@ -904,11 +989,12 @@ fn render_repository_view_into(
         )
     };
     summary_label.set_text(&format!(
-        "{} | {} repos | {} | {} | {} | Workspace: {}",
+        "{} | {} repos | {} | {} | {} | {} | Workspace: {}",
         summary.workspace_name,
         summary.repo_count,
         filter_scope,
         selection_scope,
+        loading_scope,
         manifest_status,
         snapshot.workspace_root.display()
     ));
@@ -952,6 +1038,7 @@ fn render_repository_view_into(
             content.append(&status);
             content.append(&sync);
             row.set_child(Some(&content));
+            row.set_widget_name(&item.id);
             row.set_tooltip_text(Some(&format!(
                 "{}\n{}\n{}",
                 item.status.repo_path.display(),
@@ -1015,11 +1102,7 @@ fn branch_label(item: &RepositoryListItem) -> &str {
 }
 
 fn repository_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
-    snapshot
-        .manifest
-        .as_ref()
-        .map(build_repository_list)
-        .unwrap_or_default()
+    snapshot.repository_items.clone()
 }
 
 const MONOREPO_ROW_ID: &str = "__ronomepo_monorepo__";
@@ -1030,7 +1113,7 @@ fn monorepo_monitor_item(snapshot: &StateSnapshot) -> RepositoryListItem {
         name: "(monorepo)".to_string(),
         dir_name: ".".to_string(),
         remote_url: snapshot.workspace_root.display().to_string(),
-        status: ronomepo_core::collect_repository_status(&snapshot.workspace_root),
+        status: snapshot.workspace_status.clone(),
     }
 }
 
@@ -1101,12 +1184,11 @@ fn repo_attention_rank(item: &RepositoryListItem) -> u8 {
 }
 
 fn selection_ids_from_list(list: &ListBox) -> Vec<String> {
-    let snapshot = snapshot();
-    let items = visible_monitor_items(&snapshot);
     let mut selected = list
         .selected_rows()
         .into_iter()
-        .filter_map(|row| items.get(row.index() as usize).map(|item| item.id.clone()))
+        .map(|row| row.widget_name().to_string())
+        .filter(|id| !id.is_empty())
         .filter(|id| id != MONOREPO_ROW_ID)
         .collect::<Vec<_>>();
     selected.sort();
@@ -1169,6 +1251,114 @@ fn open_repo_overviews(
         app_state.active_repo_id = Some(item.id.clone());
     }
     refresh_views();
+}
+
+fn schedule_workspace_scan() {
+    let (workspace_root, manifest) = {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        if app_state.repository_items_loading {
+            app_state.repository_items_refresh_pending = true;
+            return;
+        }
+        app_state.repository_items_loading = true;
+        app_state.repository_items_refresh_pending = false;
+        (
+            app_state.workspace_root.clone(),
+            app_state.manifest.clone(),
+        )
+    };
+
+    let main_context = glib::MainContext::default();
+    thread::spawn(move || {
+        let workspace_status = ronomepo_core::collect_repository_status(&workspace_root);
+        let repository_items = manifest
+            .as_ref()
+            .map(build_repository_list)
+            .unwrap_or_default();
+
+        main_context.invoke(move || {
+            let rerun = {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                app_state.workspace_status = workspace_status;
+                app_state.repository_items = repository_items;
+                app_state.repository_items_loading = false;
+                let rerun = app_state.repository_items_refresh_pending;
+                app_state.repository_items_refresh_pending = false;
+                rerun
+            };
+            if rerun {
+                schedule_workspace_scan();
+            }
+            refresh_views();
+        });
+    });
+}
+
+fn schedule_workspace_root_status_refresh(workspace_root: PathBuf) {
+    let main_context = glib::MainContext::default();
+    thread::spawn(move || {
+        let workspace_status = ronomepo_core::collect_repository_status(&workspace_root);
+        main_context.invoke(move || {
+            {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                app_state.workspace_status = workspace_status;
+            }
+            refresh_views();
+        });
+    });
+}
+
+fn schedule_repository_status_refresh(repo_id: &str, repo_path: PathBuf) {
+    let repo_id = repo_id.to_string();
+    let main_context = glib::MainContext::default();
+    thread::spawn(move || {
+        let status = ronomepo_core::collect_repository_status(&repo_path);
+        main_context.invoke(move || {
+            {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                if let Some(item) = app_state
+                    .repository_items
+                    .iter_mut()
+                    .find(|item| item.id == repo_id)
+                {
+                    item.status = status.clone();
+                }
+            }
+            refresh_views();
+        });
+    });
+}
+
+fn invalidate_repo_details(repo_id: &str) {
+    let mut app_state = state().lock().expect("state mutex poisoned");
+    app_state.repo_details_cache.remove(repo_id);
+    app_state.repo_details_loading.remove(repo_id);
+}
+
+fn schedule_repo_details_load(repo_id: &str, repo_path: &Path) {
+    let repo_id = repo_id.to_string();
+    let repo_path = repo_path.to_path_buf();
+    {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        if app_state.repo_details_cache.contains_key(&repo_id)
+            || !app_state.repo_details_loading.insert(repo_id.clone())
+        {
+            return;
+        }
+    }
+
+    let main_context = glib::MainContext::default();
+    thread::spawn(move || {
+        let details = collect_repository_details(&repo_path);
+        main_context.invoke(move || {
+            {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                app_state.repo_details_loading.remove(&repo_id);
+                app_state.repo_details_cache.insert(repo_id, details);
+            }
+            refresh_views();
+        });
+    });
 }
 
 fn open_repo_overview_for_item(
@@ -1333,16 +1523,15 @@ extern "C" fn create_repo_monitor_view(
         update_selected_repo_ids(selection_ids_from_list(list));
     });
     list.connect_row_activated(move |_, row| {
-        let snapshot = snapshot();
-        let items = visible_monitor_items(&snapshot);
-        let Some(item) = items.get(row.index() as usize) else {
+        let repo_id = row.widget_name().to_string();
+        if repo_id.is_empty() {
             return;
-        };
-        if item.id == MONOREPO_ROW_ID {
+        }
+        if repo_id == MONOREPO_ROW_ID {
             let _ = command_open_overview(maruzzella_sdk::ffi::MzBytes::empty());
             return;
         }
-        open_repo_overviews(host, std::slice::from_ref(&item.id));
+        open_repo_overviews(host, std::slice::from_ref(&repo_id));
     });
 
     let scroller = ScrolledWindow::builder()
@@ -2078,6 +2267,8 @@ fn save_workspace_manifest_from_editor(
         app_state.workspace_root = workspace_root.clone();
         app_state.manifest_path = Some(manifest_path.clone());
         app_state.manifest = Some(manifest.clone());
+        app_state.repo_details_cache.clear();
+        app_state.repo_details_loading.clear();
         app_state.selected_repo_ids
             .retain(|id| manifest.repos.iter().any(|repo| &repo.id == id));
         if app_state
@@ -2090,6 +2281,7 @@ fn save_workspace_manifest_from_editor(
     }
 
     persist_last_workspace_path(host_ptr, &workspace_root);
+    schedule_workspace_scan();
 
     Ok(format!(
         "Saved {} with {} repositories.",
@@ -2185,7 +2377,12 @@ fn render_repo_overview_into(
     }
 
     let sections = GtkBox::new(Orientation::Vertical, 12);
-    let details = collect_repository_details(&item.status.repo_path);
+    if !snapshot.repo_details_cache.contains_key(&item.id)
+        && !snapshot.repo_details_loading.contains(&item.id)
+    {
+        schedule_repo_details_load(&item.id, &item.status.repo_path);
+    }
+    let details = snapshot.repo_details_cache.get(&item.id);
     append_overview_section(
         &sections,
         "Path",
@@ -2213,21 +2410,42 @@ fn render_repo_overview_into(
         &sections,
         "Last Commit",
         &details
-            .last_commit
-            .as_ref()
+            .and_then(|details| details.last_commit.as_ref())
             .map(|commit| format!("{} {}", commit.short_sha, commit.subject))
-            .unwrap_or_else(|| "No commit information available.".to_string()),
+            .unwrap_or_else(|| {
+                if snapshot.repo_details_loading.contains(&item.id) {
+                    "Loading commit information...".to_string()
+                } else {
+                    "No commit information available.".to_string()
+                }
+            }),
     );
     append_lines_section(
         &sections,
         "Remotes",
-        &details.remotes,
+        &details
+            .map(|details| details.remotes.clone())
+            .unwrap_or_else(|| {
+                if snapshot.repo_details_loading.contains(&item.id) {
+                    vec!["Loading remotes...".to_string()]
+                } else {
+                    Vec::new()
+                }
+            }),
         "No remotes reported for this repository.",
     );
     append_lines_section(
         &sections,
         "Changed Files",
-        &details.changed_files,
+        &details
+            .map(|details| details.changed_files.clone())
+            .unwrap_or_else(|| {
+                if snapshot.repo_details_loading.contains(&item.id) {
+                    vec!["Loading working tree details...".to_string()]
+                } else {
+                    Vec::new()
+                }
+            }),
         "Working tree is clean.",
     );
     append_log_section(
