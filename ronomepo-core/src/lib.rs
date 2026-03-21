@@ -470,9 +470,14 @@ pub fn collect_generated_history_matches(
 ) -> Vec<HistoryMatch> {
     let mut matches = collect_repo_history_matches(&manifest.root, "(monorepo)", num_commits);
 
-    for repo in manifest.repos.iter().filter(|repo| repo.enabled).filter(|repo| {
-        selected_repo_ids.is_empty() || selected_repo_ids.iter().any(|id| id == &repo.id)
-    }) {
+    for repo in manifest
+        .repos
+        .iter()
+        .filter(|repo| repo.enabled)
+        .filter(|repo| {
+            selected_repo_ids.is_empty() || selected_repo_ids.iter().any(|id| id == &repo.id)
+        })
+    {
         let repo_path = manifest.root.join(&repo.dir_name);
         if !repo_path.exists() {
             continue;
@@ -501,7 +506,8 @@ pub fn collect_workspace_line_stats(
     rows.push(monorepo);
 
     for repo in manifest.repos.iter().filter(|repo| repo.enabled) {
-        let row = collect_repo_line_stats(&manifest.root.join(&repo.dir_name), &repo.name, since_date);
+        let row =
+            collect_repo_line_stats(&manifest.root.join(&repo.dir_name), &repo.name, since_date);
         total_additions += row.additions;
         total_deletions += row.deletions;
         rows.push(row);
@@ -554,7 +560,10 @@ fn pull_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> OperationE
     if matches!(repository_state(&repo_path), RepositoryState::Dirty) {
         return skipped_event(
             repo,
-            format!("Skipped {} because it has uncommitted changes.", repo.dir_name),
+            format!(
+                "Skipped {} because it has uncommitted changes.",
+                repo.dir_name
+            ),
         );
     }
 
@@ -592,18 +601,28 @@ fn push_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> OperationE
         return failed_event(repo, format!("{} is missing locally.", repo.dir_name));
     }
 
-    let Some(upstream) = git_stdout(&repo_path, ["rev-parse", "--abbrev-ref", "@{upstream}"]) else {
-        return skipped_event(repo, format!("Skipped {} because it has no upstream.", repo.dir_name));
+    let Some(upstream) = git_stdout(&repo_path, ["rev-parse", "--abbrev-ref", "@{upstream}"])
+    else {
+        return skipped_event(
+            repo,
+            format!("Skipped {} because it has no upstream.", repo.dir_name),
+        );
     };
     if upstream.is_empty() {
-        return skipped_event(repo, format!("Skipped {} because it has no upstream.", repo.dir_name));
+        return skipped_event(
+            repo,
+            format!("Skipped {} because it has no upstream.", repo.dir_name),
+        );
     }
 
     let ahead = git_stdout(&repo_path, ["rev-list", "--count", "@{upstream}..HEAD"])
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
     if ahead == 0 {
-        return skipped_event(repo, format!("Skipped {} because it has nothing to push.", repo.dir_name));
+        return skipped_event(
+            repo,
+            format!("Skipped {} because it has nothing to push.", repo.dir_name),
+        );
     }
 
     match Command::new("git")
@@ -612,9 +631,10 @@ fn push_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> OperationE
         .arg("push")
         .output()
     {
-        Ok(output) if output.status.success() => {
-            success_event(repo, format!("Pushed {} ({} commits).", repo.dir_name, ahead))
-        }
+        Ok(output) if output.status.success() => success_event(
+            repo,
+            format!("Pushed {} ({} commits).", repo.dir_name, ahead),
+        ),
         Ok(output) => failed_event(
             repo,
             format!(
@@ -1081,7 +1101,10 @@ mod tests {
     fn normalize_workspace_root_expands_tilde_prefix() {
         let _home = EnvVarGuard::set("HOME", "/tmp/ronomepo-home");
 
-        assert_eq!(normalize_workspace_root("~"), PathBuf::from("/tmp/ronomepo-home"));
+        assert_eq!(
+            normalize_workspace_root("~"),
+            PathBuf::from("/tmp/ronomepo-home")
+        );
         assert_eq!(
             normalize_workspace_root("~/lelloprojects"),
             PathBuf::from("/tmp/ronomepo-home/lelloprojects")
@@ -1140,7 +1163,10 @@ mod tests {
     fn collect_repository_details_reports_commit_and_changes() {
         let repo_path = temp_dir_path("details");
         init_git_repo(&repo_path);
-        run_git(repo_path.as_path(), ["remote", "add", "origin", "git@example.com:alpha.git"]);
+        run_git(
+            repo_path.as_path(),
+            ["remote", "add", "origin", "git@example.com:alpha.git"],
+        );
         fs::write(repo_path.join("scratch.txt"), "hello").unwrap();
 
         let details = collect_repository_details(&repo_path);
@@ -1160,11 +1186,24 @@ mod tests {
         let workspace = temp_dir_path("history-report");
         fs::create_dir_all(&workspace).unwrap();
         run_git(workspace.as_path(), ["init", "-b", "main"]);
-        run_git(workspace.as_path(), ["config", "user.name", "Ronomepo Tests"]);
-        run_git(workspace.as_path(), ["config", "user.email", "tests@example.com"]);
         run_git(
             workspace.as_path(),
-            ["commit", "--allow-empty", "-m", "workspace bot", "-m", "Generated-by: Agent"],
+            ["config", "user.name", "Ronomepo Tests"],
+        );
+        run_git(
+            workspace.as_path(),
+            ["config", "user.email", "tests@example.com"],
+        );
+        run_git(
+            workspace.as_path(),
+            [
+                "commit",
+                "--allow-empty",
+                "-m",
+                "workspace bot",
+                "-m",
+                "Generated-by: Agent",
+            ],
         );
 
         let manifest = WorkspaceManifest {
@@ -1213,7 +1252,10 @@ mod tests {
         assert_eq!(format_sync_label(&RepositorySync::NoUpstream), "-");
         assert_eq!(format_sync_label(&RepositorySync::Ahead(2)), "+2");
         assert_eq!(
-            format_sync_label(&RepositorySync::Diverged { ahead: 1, behind: 3 }),
+            format_sync_label(&RepositorySync::Diverged {
+                ahead: 1,
+                behind: 3
+            }),
             "+1/-3"
         );
     }
@@ -1222,7 +1264,17 @@ mod tests {
     fn generated_history_markers_are_detected() {
         let repo_path = temp_dir_path("generated-history");
         init_git_repo(&repo_path);
-        run_git(repo_path.as_path(), ["commit", "--allow-empty", "-m", "bot work", "-m", "Generated: Claude"]);
+        run_git(
+            repo_path.as_path(),
+            [
+                "commit",
+                "--allow-empty",
+                "-m",
+                "bot work",
+                "-m",
+                "Generated: Claude",
+            ],
+        );
 
         assert!(repo_history_has_generated_markers(&repo_path, 25));
     }
@@ -1232,11 +1284,24 @@ mod tests {
         let workspace = temp_dir_path("push-preflight");
         fs::create_dir_all(&workspace).unwrap();
         run_git(workspace.as_path(), ["init", "-b", "main"]);
-        run_git(workspace.as_path(), ["config", "user.name", "Ronomepo Tests"]);
-        run_git(workspace.as_path(), ["config", "user.email", "tests@example.com"]);
         run_git(
             workspace.as_path(),
-            ["commit", "--allow-empty", "-m", "workspace bot", "-m", "Generated-by: Agent"],
+            ["config", "user.name", "Ronomepo Tests"],
+        );
+        run_git(
+            workspace.as_path(),
+            ["config", "user.email", "tests@example.com"],
+        );
+        run_git(
+            workspace.as_path(),
+            [
+                "commit",
+                "--allow-empty",
+                "-m",
+                "workspace bot",
+                "-m",
+                "Generated-by: Agent",
+            ],
         );
 
         let manifest = WorkspaceManifest {
@@ -1251,12 +1316,10 @@ mod tests {
             events.push(event);
         });
 
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event.kind, OperationEventKind::Failed)
-                    && event.message.contains("Push aborted"))
-        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.kind, OperationEventKind::Failed)
+                && event.message.contains("Push aborted")));
     }
 
     #[test]
@@ -1287,8 +1350,13 @@ mod tests {
         });
 
         let root_hooks = git_stdout(&workspace, ["config", "--local", "core.hooksPath"]);
-        assert_eq!(root_hooks.as_deref(), Some(hooks_path.to_string_lossy().as_ref()));
-        assert!(events.iter().any(|event| event.repository_name.as_deref() == Some("(monorepo)")));
+        assert_eq!(
+            root_hooks.as_deref(),
+            Some(hooks_path.to_string_lossy().as_ref())
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.repository_name.as_deref() == Some("(monorepo)")));
     }
 
     fn init_git_repo(path: &Path) {
