@@ -961,6 +961,7 @@ fn render_repository_view_into(
 ) {
     let filtered_items = visible_monitor_items(snapshot);
     let reset_scroll_to_top = snapshot.selected_repo_ids.is_empty();
+    let previous_scroll = scroller.vadjustment().value();
     let summary = workspace_summary(
         snapshot.manifest.as_ref(),
         snapshot.manifest_path.as_deref(),
@@ -1109,12 +1110,16 @@ fn render_repository_view_into(
         list.append(&row);
     }
 
-    {
-        let scroller = scroller.clone();
-        glib::idle_add_local_once(move || {
-            scroller.vadjustment().set_value(0.0);
-        });
-    }
+    let scroller = scroller.clone();
+    glib::idle_add_local_once(move || {
+        let adjustment = scroller.vadjustment();
+        if reset_scroll_to_top {
+            adjustment.set_value(adjustment.lower());
+            return;
+        }
+        let max_value = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        adjustment.set_value(previous_scroll.clamp(adjustment.lower(), max_value));
+    });
 }
 
 fn status_label(state: &ronomepo_core::RepositoryState) -> &'static str {
@@ -1558,6 +1563,15 @@ extern "C" fn create_repo_monitor_view(
         update_selected_repo_ids(selection_ids_from_list(list));
     });
     list.connect_row_activated(move |_, row| {
+        if let Some(list) = row.parent().and_downcast::<ListBox>() {
+            let selected_ids = selection_ids_from_list(&list);
+            let row_id = row.widget_name().to_string();
+            if selected_ids.len() != 1 || selected_ids.first() != Some(&row_id) {
+                list.unselect_all();
+                list.select_row(Some(row));
+                update_selected_repo_ids(selection_ids_from_list(&list));
+            }
+        }
         let repo_id = row.widget_name().to_string();
         if repo_id.is_empty() {
             return;
