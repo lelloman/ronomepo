@@ -10,13 +10,15 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use gtk::glib::{self, translate::IntoGlibPtr};
+use gtk::gio;
+use gtk::glib::{self, translate::IntoGlibPtr, BoxedAnyObject};
 use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
-    Align, Box as GtkBox, Button, CheckButton, Entry, GestureClick, Label, ListBox, ListBoxRow,
-    Orientation, PolicyType, Popover, PositionType, ScrolledWindow, SelectionMode, Separator,
-    TextBuffer, TextView, WrapMode,
+    Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, Entry, FilterChange,
+    GestureClick, Label, ListBox, ListBoxRow, Orientation, PolicyType, Popover, PositionType,
+    ScrolledWindow, SelectionMode, Separator, SortListModel, SorterChange, TextBuffer, TextView,
+    WrapMode,
 };
 use maruzzella_sdk::{
     export_plugin, CommandSpec, HostApi, MenuItemSpec, MzLogLevel, MzMenuSurface, MzStatusCode,
@@ -286,7 +288,9 @@ struct RepositoryViewHandle {
     filter_entry: glib::WeakRef<Entry>,
     list: glib::WeakRef<ListBox>,
     scroller: glib::WeakRef<ScrolledWindow>,
-    host_ptr: usize,
+    store: gio::ListStore,
+    filter: CustomFilter,
+    sorter: CustomSorter,
 }
 
 #[derive(Default)]
@@ -1247,15 +1251,13 @@ fn refresh_views() {
             let Some(scroller) = handle.scroller.upgrade() else {
                 return false;
             };
-            if filter_entry.text().as_str() != snapshot.monitor_filter {
-                filter_entry.set_text(&snapshot.monitor_filter);
-            }
-            render_repository_view_into(
+            refresh_repository_view_handle(
+                handle,
                 &summary,
+                &filter_entry,
                 &list,
                 &scroller,
                 &snapshot,
-                handle.host_ptr as *const _,
             );
             true
         });
@@ -1406,16 +1408,23 @@ fn snapshot() -> StateSnapshot {
     }
 }
 
-fn render_repository_view_into(
+fn refresh_repository_view_handle(
+    handle: &RepositoryViewHandle,
     summary_label: &Label,
+    filter_entry: &Entry,
     list: &ListBox,
-    scroller: &ScrolledWindow,
+    _scroller: &ScrolledWindow,
     snapshot: &StateSnapshot,
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
+    if filter_entry.text().as_str() != snapshot.monitor_filter {
+        filter_entry.set_text(&snapshot.monitor_filter);
+    }
+    sync_repository_monitor_store(&handle.store, &all_monitor_items(snapshot));
+    handle.filter.changed(FilterChange::Different);
+    handle.sorter.changed(SorterChange::Different);
+    sync_repository_monitor_selection(list, &snapshot.selected_repo_ids);
+
     let filtered_items = visible_monitor_items(snapshot);
-    let reset_scroll_to_top = snapshot.selected_repo_ids.is_empty();
-    let previous_scroll = scroller.vadjustment().value();
     let summary = workspace_summary(
         snapshot.manifest.as_ref(),
         snapshot.manifest_path.as_deref(),
@@ -1471,109 +1480,7 @@ fn render_repository_view_into(
         manifest_status,
         snapshot.workspace_root.display()
     ));
-
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
-    }
-    if reset_scroll_to_top {
-        list.unselect_all();
-    }
-
-    if !filtered_items.is_empty() {
-        for item in &filtered_items {
-            let row = ListBoxRow::new();
-            let content = GtkBox::new(Orientation::Horizontal, 10);
-            content.set_margin_top(8);
-            content.set_margin_bottom(8);
-            content.set_margin_start(10);
-            content.set_margin_end(10);
-
-            let name = monitor_text_cell(
-                &item.name,
-                MONITOR_NAME_COL_CHARS,
-                MONITOR_NAME_COL_WIDTH,
-                false,
-            );
-
-            let branch = monitor_text_cell(
-                branch_label(item),
-                MONITOR_BRANCH_COL_CHARS,
-                MONITOR_BRANCH_COL_WIDTH,
-                false,
-            );
-
-            let status = monitor_state_cell(&item.status.state);
-            status.add_css_class("pill");
-
-            let sync = Label::new(Some(&format_sync_label(&item.status.sync)));
-            sync.set_xalign(0.0);
-            sync.add_css_class("mono");
-            sync.set_hexpand(true);
-            sync.set_ellipsize(EllipsizeMode::End);
-
-            content.append(&name);
-            content.append(&branch);
-            content.append(&status);
-            content.append(&sync);
-            row.set_child(Some(&content));
-            row.set_widget_name(&item.id);
-            row.set_tooltip_text(Some(&format!(
-                "{}\n{}\n{}",
-                item.status.repo_path.display(),
-                item.remote_url,
-                item.dir_name
-            )));
-            attach_row_context_menu(&row, host_ptr);
-            list.append(&row);
-        }
-
-        for (index, item) in filtered_items.iter().enumerate() {
-            if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
-                if let Some(row) = list.row_at_index(index as i32) {
-                    list.select_row(Some(&row));
-                }
-            }
-        }
-    } else {
-        let row = ListBoxRow::new();
-        let empty = GtkBox::new(Orientation::Vertical, 6);
-        empty.set_margin_top(18);
-        empty.set_margin_bottom(18);
-        empty.set_margin_start(12);
-        empty.set_margin_end(12);
-
-        let title = Label::new(Some(if snapshot.manifest.is_some() {
-            "No repositories match the current filter"
-        } else {
-            "No workspace manifest loaded"
-        }));
-        title.set_xalign(0.0);
-        title.add_css_class("title-4");
-
-        let body = Label::new(Some(if snapshot.manifest.is_some() {
-            "Try a broader search term or clear the filter to see the full workspace."
-        } else {
-            "Ronomepo is running, but no ronomepo.json was found. Import repos.txt from the current workspace root to bootstrap the manifest."
-        }));
-        body.set_xalign(0.0);
-        body.set_wrap(true);
-
-        empty.append(&title);
-        empty.append(&body);
-        row.set_child(Some(&empty));
-        list.append(&row);
-    }
-
-    let scroller = scroller.clone();
-    glib::idle_add_local_once(move || {
-        let adjustment = scroller.vadjustment();
-        if reset_scroll_to_top {
-            adjustment.set_value(adjustment.lower());
-            return;
-        }
-        let max_value = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
-        adjustment.set_value(previous_scroll.clamp(adjustment.lower(), max_value));
-    });
+    update_repository_monitor_empty_state(list, snapshot, filtered_items.is_empty());
 }
 
 fn status_label(state: &ronomepo_core::RepositoryState) -> &'static str {
@@ -1588,6 +1495,172 @@ fn status_label(state: &ronomepo_core::RepositoryState) -> &'static str {
 
 fn branch_label(item: &RepositoryListItem) -> &str {
     item.status.branch.as_deref().unwrap_or("detached")
+}
+
+fn all_monitor_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
+    let mut items = vec![monorepo_monitor_item(snapshot)];
+    items.extend(repository_items(snapshot));
+    items
+}
+
+fn sync_repository_monitor_store(store: &gio::ListStore, next_items: &[RepositoryListItem]) {
+    let mut index = 0usize;
+    while index < next_items.len() {
+        let next_item = &next_items[index];
+        let current = store
+            .item(index as u32)
+            .and_then(|item| item.downcast::<BoxedAnyObject>().ok())
+            .map(|boxed| boxed.borrow::<RepositoryListItem>().clone());
+
+        match current {
+            Some(current_item) if current_item.id == next_item.id => {
+                if current_item != *next_item {
+                    store.splice(index as u32, 1, &[BoxedAnyObject::new(next_item.clone())]);
+                }
+                index += 1;
+            }
+            Some(_) => {
+                store.splice(index as u32, 1, &[BoxedAnyObject::new(next_item.clone())]);
+                index += 1;
+            }
+            None => {
+                store.append(&BoxedAnyObject::new(next_item.clone()));
+                index += 1;
+            }
+        }
+    }
+
+    while store.n_items() > next_items.len() as u32 {
+        store.remove(store.n_items() - 1);
+    }
+}
+
+fn update_repository_monitor_empty_state(list: &ListBox, snapshot: &StateSnapshot, is_empty: bool) {
+    if is_empty {
+        list.add_css_class("repo-monitor-empty");
+        list.set_placeholder(Some(&repository_monitor_empty_placeholder(snapshot)));
+    } else {
+        list.remove_css_class("repo-monitor-empty");
+        list.set_placeholder(Option::<&gtk::Widget>::None);
+    }
+}
+
+fn repository_monitor_empty_placeholder(snapshot: &StateSnapshot) -> GtkBox {
+    let empty = GtkBox::new(Orientation::Vertical, 6);
+    empty.set_margin_top(18);
+    empty.set_margin_bottom(18);
+    empty.set_margin_start(12);
+    empty.set_margin_end(12);
+
+    let title = Label::new(Some(if snapshot.manifest.is_some() {
+        "No repositories match the current filter"
+    } else {
+        "No workspace manifest loaded"
+    }));
+    title.set_xalign(0.0);
+    title.add_css_class("title-4");
+
+    let body = Label::new(Some(if snapshot.manifest.is_some() {
+        "Try a broader search term or clear the filter to see the full workspace."
+    } else {
+        "Ronomepo is running, but no ronomepo.json was found. Import repos.txt from the current workspace root to bootstrap the manifest."
+    }));
+    body.set_xalign(0.0);
+    body.set_wrap(true);
+
+    empty.append(&title);
+    empty.append(&body);
+    empty
+}
+
+fn sync_repository_monitor_selection(list: &ListBox, selected_repo_ids: &[String]) {
+    list.unselect_all();
+    let mut index = 0;
+    while let Some(row) = list.row_at_index(index) {
+        if repo_id_from_list_box_row(&row)
+            .is_some_and(|id| selected_repo_ids.iter().any(|selected| selected == &id))
+        {
+            list.select_row(Some(&row));
+        }
+        index += 1;
+    }
+}
+
+fn repo_id_from_list_box_row(row: &ListBoxRow) -> Option<String> {
+    row.child()
+        .map(|child| child.widget_name().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn repo_item_from_object(object: &glib::Object) -> Option<RepositoryListItem> {
+    object
+        .downcast_ref::<BoxedAnyObject>()
+        .map(|boxed| boxed.borrow::<RepositoryListItem>().clone())
+}
+
+fn repo_monitor_filter_matches(item: &RepositoryListItem, snapshot: &StateSnapshot) -> bool {
+    if !snapshot.monitor_show_all && !repo_requires_attention(item) {
+        return false;
+    }
+    let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
+    if filter.is_empty() {
+        return true;
+    }
+    let branch = branch_label(item).to_ascii_lowercase();
+    let sync = format_sync_label(&item.status.sync).to_ascii_lowercase();
+    let state = status_label(&item.status.state).to_ascii_lowercase();
+    item.name.to_ascii_lowercase().contains(&filter)
+        || item.dir_name.to_ascii_lowercase().contains(&filter)
+        || item.remote_url.to_ascii_lowercase().contains(&filter)
+        || branch.contains(&filter)
+        || sync.contains(&filter)
+        || state.contains(&filter)
+}
+
+fn build_repo_monitor_row(
+    item: &RepositoryListItem,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) -> GtkBox {
+    let content = GtkBox::new(Orientation::Horizontal, 10);
+    content.set_margin_top(8);
+    content.set_margin_bottom(8);
+    content.set_margin_start(10);
+    content.set_margin_end(10);
+    content.set_widget_name(&item.id);
+    content.set_tooltip_text(Some(&format!(
+        "{}\n{}\n{}",
+        item.status.repo_path.display(),
+        item.remote_url,
+        item.dir_name
+    )));
+
+    let name = monitor_text_cell(
+        &item.name,
+        MONITOR_NAME_COL_CHARS,
+        MONITOR_NAME_COL_WIDTH,
+        false,
+    );
+    let branch = monitor_text_cell(
+        branch_label(item),
+        MONITOR_BRANCH_COL_CHARS,
+        MONITOR_BRANCH_COL_WIDTH,
+        false,
+    );
+    let status = monitor_state_cell(&item.status.state);
+    status.add_css_class("pill");
+
+    let sync = Label::new(Some(&format_sync_label(&item.status.sync)));
+    sync.set_xalign(0.0);
+    sync.add_css_class("mono");
+    sync.set_hexpand(true);
+    sync.set_ellipsize(EllipsizeMode::End);
+
+    content.append(&name);
+    content.append(&branch);
+    content.append(&status);
+    content.append(&sync);
+    attach_repo_monitor_context_menu(&content, host_ptr);
+    content
 }
 
 fn repository_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
@@ -1607,9 +1680,7 @@ fn monorepo_monitor_item(snapshot: &StateSnapshot) -> RepositoryListItem {
 }
 
 fn visible_monitor_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
-    let mut items = vec![monorepo_monitor_item(snapshot)];
-    items.extend(repository_items(snapshot));
-    filtered_repository_items(snapshot, items)
+    filtered_repository_items(snapshot, all_monitor_items(snapshot))
 }
 
 fn filtered_repository_items(
@@ -1629,17 +1700,7 @@ fn filtered_repository_items(
 
     items
         .into_iter()
-        .filter(|item| {
-            let branch = branch_label(item).to_ascii_lowercase();
-            let sync = format_sync_label(&item.status.sync).to_ascii_lowercase();
-            let state = status_label(&item.status.state).to_ascii_lowercase();
-            item.name.to_ascii_lowercase().contains(&filter)
-                || item.dir_name.to_ascii_lowercase().contains(&filter)
-                || item.remote_url.to_ascii_lowercase().contains(&filter)
-                || branch.contains(&filter)
-                || sync.contains(&filter)
-                || state.contains(&filter)
-        })
+        .filter(|item| repo_monitor_filter_matches(item, snapshot))
         .collect()
 }
 
@@ -1679,7 +1740,7 @@ fn selection_ids_from_list(list: &ListBox) -> Vec<String> {
     let mut selected = list
         .selected_rows()
         .into_iter()
-        .map(|row| row.widget_name().to_string())
+        .filter_map(|row| repo_id_from_list_box_row(&row))
         .filter(|id| !id.is_empty())
         .filter(|id| id != MONOREPO_ROW_ID)
         .collect::<Vec<_>>();
@@ -1853,16 +1914,19 @@ fn open_repo_overview_for_item(
     }
 }
 
-fn attach_row_context_menu(row: &ListBoxRow, host_ptr: *const maruzzella_sdk::ffi::MzHostApi) {
-    let popover = build_repo_context_menu(row, host_ptr);
+fn attach_repo_monitor_context_menu(
+    relative_to: &impl IsA<gtk::Widget>,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) {
+    let popover = build_repo_context_menu(relative_to, host_ptr);
     let gesture = GestureClick::new();
     gesture.set_button(3);
     gesture.connect_pressed({
-        let row = row.clone();
+        let relative_to = relative_to.clone();
         let popover = popover.clone();
         move |_, _, _, _| {
-            if let Some(list) = row.parent().and_downcast::<ListBox>() {
-                if !row.is_selected() {
+            if let Some(row) = relative_to.parent().and_downcast::<ListBoxRow>() {
+                if let Some(list) = row.parent().and_downcast::<ListBox>() {
                     list.unselect_all();
                     list.select_row(Some(&row));
                     update_selected_repo_ids(selection_ids_from_list(&list));
@@ -1871,7 +1935,7 @@ fn attach_row_context_menu(row: &ListBoxRow, host_ptr: *const maruzzella_sdk::ff
             popover.popup();
         }
     });
-    row.add_controller(gesture);
+    relative_to.add_controller(gesture);
 }
 
 fn build_repo_context_menu(
@@ -1985,25 +2049,50 @@ extern "C" fn create_repo_monitor_view(
 
     let monitor_actions = repo_monitor_actions(host);
 
+    let store = gio::ListStore::new::<BoxedAnyObject>();
+    let filter = CustomFilter::new(|object| {
+        let snapshot = snapshot();
+        repo_item_from_object(object)
+            .is_some_and(|item| repo_monitor_filter_matches(&item, &snapshot))
+    });
+    let filter_model = gtk::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
+    let sorter = CustomSorter::new(|left, right| {
+        let left = repo_item_from_object(left);
+        let right = repo_item_from_object(right);
+        match (left, right) {
+            (Some(left), Some(right)) => repo_monitor_sort_key(&left)
+                .cmp(&repo_monitor_sort_key(&right))
+                .into(),
+            _ => gtk::Ordering::Equal,
+        }
+    });
+    let sort_model = SortListModel::new(Some(filter_model.clone()), Some(sorter.clone()));
+
     let list = ListBox::new();
     list.add_css_class("boxed-list");
     list.set_hexpand(true);
     list.set_valign(Align::Start);
     list.set_selection_mode(SelectionMode::Multiple);
+    list.bind_model(Some(&sort_model), move |object| {
+        repo_item_from_object(object)
+            .map(|item| build_repo_monitor_row(&item, host))
+            .unwrap_or_else(|| GtkBox::new(Orientation::Horizontal, 0))
+            .upcast()
+    });
     list.connect_selected_rows_changed(|list| {
         update_selected_repo_ids(selection_ids_from_list(list));
     });
     list.connect_row_activated(move |_, row| {
         if let Some(list) = row.parent().and_downcast::<ListBox>() {
             let selected_ids = selection_ids_from_list(&list);
-            let row_id = row.widget_name().to_string();
+            let row_id = repo_id_from_list_box_row(row).unwrap_or_default();
             if selected_ids.len() != 1 || selected_ids.first() != Some(&row_id) {
                 list.unselect_all();
                 list.select_row(Some(row));
                 update_selected_repo_ids(selection_ids_from_list(&list));
             }
         }
-        let repo_id = row.widget_name().to_string();
+        let repo_id = repo_id_from_list_box_row(row).unwrap_or_default();
         if repo_id.is_empty() {
             return;
         }
@@ -2035,7 +2124,25 @@ extern "C" fn create_repo_monitor_view(
     content.append(&list);
 
     let snapshot = snapshot();
-    render_repository_view_into(&summary, &list, &scroller, &snapshot, host);
+    sync_repository_monitor_store(&store, &all_monitor_items(&snapshot));
+    filter.changed(FilterChange::Different);
+    sorter.changed(SorterChange::Different);
+    refresh_repository_view_handle(
+        &RepositoryViewHandle {
+            summary: glib::WeakRef::new(),
+            filter_entry: glib::WeakRef::new(),
+            list: glib::WeakRef::new(),
+            scroller: glib::WeakRef::new(),
+            store: store.clone(),
+            filter: filter.clone(),
+            sorter: sorter.clone(),
+        },
+        &summary,
+        &filter_entry,
+        &list,
+        &scroller,
+        &snapshot,
+    );
 
     let summary_ref = glib::WeakRef::new();
     summary_ref.set(Some(&summary));
@@ -2051,7 +2158,9 @@ extern "C" fn create_repo_monitor_view(
             filter_entry: filter_ref,
             list: list_ref,
             scroller: scroller_ref,
-            host_ptr: host as usize,
+            store,
+            filter,
+            sorter,
         });
     });
 
