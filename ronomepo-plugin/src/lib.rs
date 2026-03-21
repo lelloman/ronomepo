@@ -2568,10 +2568,6 @@ extern "C" fn create_repo_monitor_view(
     content.set_margin_start(18);
     content.set_margin_end(18);
 
-    let title = Label::new(Some("Repository Monitor"));
-    title.set_xalign(0.0);
-    title.add_css_class("title-4");
-
     let summary = Label::new(None);
     summary.set_xalign(0.0);
     summary.set_wrap(true);
@@ -2653,19 +2649,18 @@ extern "C" fn create_repo_monitor_view(
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
         .min_content_height(0)
-        .child(&content)
+        .child(&list)
         .build();
     scroller.set_valign(Align::Fill);
     scroller.set_propagate_natural_height(false);
 
-    content.append(&title);
     content.append(&summary);
     content.append(&filter_entry);
     content.append(&show_all);
     content.append(&monitor_actions);
     content.append(&Separator::new(Orientation::Horizontal));
     content.append(&repo_monitor_header());
-    content.append(&list);
+    content.append(&scroller);
 
     let snapshot = snapshot();
     sync_repository_monitor_store(&store, &all_monitor_items(&snapshot));
@@ -2709,7 +2704,7 @@ extern "C" fn create_repo_monitor_view(
     });
 
     unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(content.upcast())
             as *mut std::ffi::c_void
     }
 }

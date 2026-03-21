@@ -144,7 +144,8 @@ fn main() {
             "The Ronomepo repository monitor could not be created.",
             false,
         )],
-    );
+    )
+    .with_tab_strip_hidden();
     product.layout.right_panel = TabGroupSpec::new("panel-right", None, Vec::new());
     product.layout.bottom_panel = TabGroupSpec::new(
         "panel-bottom",
