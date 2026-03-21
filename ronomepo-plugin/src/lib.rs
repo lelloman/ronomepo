@@ -4267,15 +4267,14 @@ extern "C" fn create_operations_view(
     root.set_margin_end(18);
 
     let header = GtkBox::new(Orientation::Horizontal, 8);
-    let title = Label::new(Some("Operations"));
-    title.set_xalign(0.0);
-    title.add_css_class("title-4");
-    title.set_hexpand(true);
+    header.set_halign(Align::Fill);
+    header.set_hexpand(true);
 
     let summary = Label::new(Some(&operation_summary_text(&snapshot().logs)));
     summary.set_xalign(0.0);
     summary.add_css_class("muted");
     summary.set_wrap(true);
+    summary.set_hexpand(true);
 
     let refresh = Button::with_label("Refresh Logs");
     let clear = Button::with_label("Clear");
@@ -4333,7 +4332,6 @@ extern "C" fn create_operations_view(
         .child(&text)
         .build();
 
-    header.append(&title);
     header.append(&clear);
     header.append(&refresh);
     root.append(&header);

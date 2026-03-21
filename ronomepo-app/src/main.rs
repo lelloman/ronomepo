@@ -157,7 +157,8 @@ fn main() {
             "The Ronomepo operations view could not be created.",
             false,
         )],
-    );
+    )
+    .with_tab_strip_hidden();
     product.layout.workbench = WorkbenchNodeSpec::Group(TabGroupSpec::new(
         "workbench-main",
         Some("monorepo-overview"),
