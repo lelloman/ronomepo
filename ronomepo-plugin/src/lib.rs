@@ -6,29 +6,30 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use gtk::glib::{self, translate::IntoGlibPtr};
 use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
-    Align, Box as GtkBox, Button, Entry, GestureClick, Label, ListBox, ListBoxRow, Orientation,
-    PolicyType, Popover, PositionType, ScrolledWindow, SelectionMode, Separator, TextBuffer,
-    TextView, WrapMode, CheckButton,
+    Align, Box as GtkBox, Button, CheckButton, Entry, GestureClick, Label, ListBox, ListBoxRow,
+    Orientation, PolicyType, Popover, PositionType, ScrolledWindow, SelectionMode, Separator,
+    TextBuffer, TextView, WrapMode,
 };
 use maruzzella_sdk::{
-    export_plugin, CommandSpec, HostApi, MenuItemSpec, MzLogLevel, MzMenuSurface,
-    MzStatusCode, MzViewOpenDisposition, MzViewPlacement, OpenViewRequest, Plugin,
-    PluginDependency, PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
+    export_plugin, CommandSpec, HostApi, MenuItemSpec, MzLogLevel, MzMenuSurface, MzStatusCode,
+    MzViewOpenDisposition, MzViewPlacement, OpenViewRequest, Plugin, PluginDependency,
+    PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use ronomepo_core::{
-    build_repository_list, default_manifest_path, derive_dir_name, format_sync_label,
+    build_repository_list, collect_generated_history_matches, collect_repository_details,
+    collect_workspace_line_stats, default_manifest_path, derive_dir_name, format_sync_label,
     import_repos_txt, load_manifest, normalize_workspace_root, run_workspace_operation,
-    save_manifest, workspace_summary,
-    collect_generated_history_matches, collect_repository_details, collect_workspace_line_stats,
-    OperationEvent, OperationEventKind, OperationKind, RepositoryDetails, RepositoryEntry,
-    RepositoryListItem, RepositoryStatus, MANIFEST_FILE_NAME, WorkspaceManifest,
+    save_manifest, workspace_summary, OperationEvent, OperationEventKind, OperationKind,
+    RepositoryDetails, RepositoryEntry, RepositoryListItem, RepositoryStatus, WorkspaceManifest,
+    MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,7 @@ const MONITOR_STATE_COL_CHARS: i32 = 12;
 const MONITOR_NAME_COL_WIDTH: i32 = 300;
 const MONITOR_BRANCH_COL_WIDTH: i32 = 120;
 const MONITOR_STATE_COL_WIDTH: i32 = 120;
+const WORKER_POOL_SIZE: usize = 4;
 
 pub struct RonomepoPlugin;
 
@@ -83,7 +85,9 @@ struct AppState {
     logs: Vec<String>,
     next_operation_batch: usize,
     history_report: Vec<String>,
+    history_report_loading: bool,
     line_stats_report: Vec<String>,
+    line_stats_loading: bool,
     line_stats_since: String,
 }
 
@@ -106,10 +110,175 @@ impl Default for AppState {
             logs: Vec::new(),
             next_operation_batch: 0,
             history_report: Vec::new(),
+            history_report_loading: false,
             line_stats_report: Vec::new(),
+            line_stats_loading: false,
             line_stats_since: String::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum JobKey {
+    WorkspaceScan,
+    WorkspaceRootStatus,
+    RepoStatus(String),
+    RepoDetails(String),
+    HistoryReport,
+    LineStats(Option<String>),
+}
+
+struct ExecutorState {
+    sender: mpsc::Sender<QueuedJob>,
+    in_flight: Mutex<HashSet<JobKey>>,
+}
+
+struct QueuedJob {
+    key: Option<JobKey>,
+    job: WorkerJob,
+}
+
+enum WorkerJob {
+    OperationBatch {
+        manifest: WorkspaceManifest,
+        selected_repo_ids: Vec<String>,
+        kind: OperationKind,
+        batch_id: usize,
+    },
+    WorkspaceScan {
+        workspace_root: PathBuf,
+        manifest: Option<WorkspaceManifest>,
+    },
+    WorkspaceRootStatusRefresh {
+        workspace_root: PathBuf,
+    },
+    RepositoryStatusRefresh {
+        repo_id: String,
+        repo_path: PathBuf,
+    },
+    RepoDetailsLoad {
+        repo_id: String,
+        repo_path: PathBuf,
+    },
+    RefreshWorkspace {
+        workspace_root: PathBuf,
+        status_sender: Option<mpsc::Sender<String>>,
+    },
+    ImportWorkspaceFromReposTxt {
+        workspace_root: PathBuf,
+        status_sender: Option<mpsc::Sender<String>>,
+    },
+    HistoryReport {
+        manifest: WorkspaceManifest,
+        selected_repo_ids: Vec<String>,
+        num_commits: usize,
+    },
+    LineStats {
+        manifest: WorkspaceManifest,
+        since_date: Option<String>,
+    },
+    SaveManifestFromEditor {
+        host_ptr: usize,
+        workspace_name: String,
+        workspace_root: String,
+        shared_hooks_path: String,
+        repo_rows: Vec<RepoEditorRowInput>,
+        status_sender: mpsc::Sender<String>,
+    },
+    EditorLoad {
+        path: PathBuf,
+        reply: mpsc::Sender<EditorLoadMessage>,
+    },
+    EditorSave {
+        path: PathBuf,
+        content: String,
+        reply: mpsc::Sender<EditorSaveMessage>,
+    },
+}
+
+enum WorkerResult {
+    WorkspaceScanCompleted {
+        workspace_status: RepositoryStatus,
+        repository_items: Vec<RepositoryListItem>,
+    },
+    WorkspaceRootStatusRefreshed {
+        workspace_status: RepositoryStatus,
+    },
+    RepositoryStatusRefreshed {
+        repo_id: String,
+        status: RepositoryStatus,
+    },
+    RepoDetailsLoaded {
+        repo_id: String,
+        details: RepositoryDetails,
+    },
+    RefreshWorkspaceCompleted {
+        result: Result<RefreshWorkspaceResult, String>,
+        status_sender: Option<mpsc::Sender<String>>,
+    },
+    ImportWorkspaceCompleted {
+        result: Result<ImportWorkspaceResult, String>,
+        status_sender: Option<mpsc::Sender<String>>,
+    },
+    HistoryReportCompleted {
+        result: Result<HistoryReportResult, String>,
+    },
+    LineStatsCompleted {
+        result: Result<LineStatsResult, String>,
+    },
+    SaveManifestCompleted {
+        result: Result<SaveManifestResult, String>,
+        status_sender: mpsc::Sender<String>,
+    },
+}
+
+struct RefreshWorkspaceResult {
+    workspace_root: PathBuf,
+    manifest_path: PathBuf,
+    manifest: Option<WorkspaceManifest>,
+    message: String,
+}
+
+struct ImportWorkspaceResult {
+    manifest_path: PathBuf,
+    manifest: WorkspaceManifest,
+    message: String,
+}
+
+struct HistoryReportResult {
+    lines: Vec<String>,
+    message: String,
+}
+
+struct LineStatsResult {
+    lines: Vec<String>,
+    message: String,
+}
+
+struct SaveManifestResult {
+    host_ptr: usize,
+    workspace_root: PathBuf,
+    manifest_path: PathBuf,
+    manifest: WorkspaceManifest,
+    message: String,
+}
+
+#[derive(Clone)]
+struct RepoEditorRowInput {
+    enabled: bool,
+    name: String,
+    dir_name: String,
+    remote_url: String,
+}
+
+struct EditorLoadMessage {
+    path: PathBuf,
+    result: Result<String, String>,
+}
+
+struct EditorSaveMessage {
+    path: PathBuf,
+    result: Result<(), String>,
 }
 
 struct RepositoryViewHandle {
@@ -137,10 +306,197 @@ thread_local! {
 }
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
+static EXECUTOR: OnceLock<ExecutorState> = OnceLock::new();
 static LAST_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
 
 fn state() -> &'static Mutex<AppState> {
     STATE.get_or_init(|| Mutex::new(AppState::default()))
+}
+
+fn executor() -> &'static ExecutorState {
+    EXECUTOR.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<QueuedJob>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..WORKER_POOL_SIZE {
+            let receiver = Arc::clone(&receiver);
+            thread::Builder::new()
+                .name(format!("ronomepo-worker-{index}"))
+                .spawn(move || worker_loop(receiver))
+                .expect("failed to spawn ronomepo worker");
+        }
+        ExecutorState {
+            sender,
+            in_flight: Mutex::new(HashSet::new()),
+        }
+    })
+}
+
+fn submit_job(job: WorkerJob) -> Result<(), String> {
+    submit_queued_job(QueuedJob { key: None, job })
+}
+
+fn submit_coalesced_job(key: JobKey, job: WorkerJob) -> Result<bool, String> {
+    let executor = executor();
+    {
+        let mut in_flight = executor.in_flight.lock().expect("executor mutex poisoned");
+        if !in_flight.insert(key.clone()) {
+            return Ok(false);
+        }
+    }
+    if let Err(error) = submit_queued_job(QueuedJob {
+        key: Some(key.clone()),
+        job,
+    }) {
+        let mut in_flight = executor.in_flight.lock().expect("executor mutex poisoned");
+        in_flight.remove(&key);
+        return Err(error);
+    }
+    Ok(true)
+}
+
+fn submit_queued_job(queued_job: QueuedJob) -> Result<(), String> {
+    executor()
+        .sender
+        .send(queued_job)
+        .map_err(|_| "worker pool is unavailable".to_string())
+}
+
+fn worker_loop(receiver: Arc<Mutex<mpsc::Receiver<QueuedJob>>>) {
+    loop {
+        let queued_job = {
+            let receiver = receiver.lock().expect("worker receiver poisoned");
+            receiver.recv()
+        };
+        let Ok(queued_job) = queued_job else {
+            break;
+        };
+        run_worker_job(queued_job);
+    }
+}
+
+fn run_worker_job(queued_job: QueuedJob) {
+    let key = queued_job.key.clone();
+    match queued_job.job {
+        WorkerJob::OperationBatch {
+            manifest,
+            selected_repo_ids,
+            kind,
+            batch_id,
+        } => {
+            let main_context = glib::MainContext::default();
+            run_workspace_operation(&manifest, &selected_repo_ids, kind, |event| {
+                let event = event.clone();
+                let manifest = manifest.clone();
+                main_context.invoke(move || handle_operation_event(batch_id, manifest, event));
+            });
+        }
+        WorkerJob::WorkspaceScan {
+            workspace_root,
+            manifest,
+        } => {
+            let workspace_status = ronomepo_core::collect_repository_status(&workspace_root);
+            let repository_items = manifest
+                .as_ref()
+                .map(build_repository_list)
+                .unwrap_or_default();
+            dispatch_worker_result(WorkerResult::WorkspaceScanCompleted {
+                workspace_status,
+                repository_items,
+            });
+        }
+        WorkerJob::WorkspaceRootStatusRefresh { workspace_root } => {
+            let workspace_status = ronomepo_core::collect_repository_status(&workspace_root);
+            dispatch_worker_result(WorkerResult::WorkspaceRootStatusRefreshed { workspace_status });
+        }
+        WorkerJob::RepositoryStatusRefresh { repo_id, repo_path } => {
+            let status = ronomepo_core::collect_repository_status(&repo_path);
+            dispatch_worker_result(WorkerResult::RepositoryStatusRefreshed { repo_id, status });
+        }
+        WorkerJob::RepoDetailsLoad { repo_id, repo_path } => {
+            let details = collect_repository_details(&repo_path);
+            dispatch_worker_result(WorkerResult::RepoDetailsLoaded { repo_id, details });
+        }
+        WorkerJob::RefreshWorkspace {
+            workspace_root,
+            status_sender,
+        } => {
+            let result = load_workspace_manifest(&workspace_root);
+            dispatch_worker_result(WorkerResult::RefreshWorkspaceCompleted {
+                result,
+                status_sender,
+            });
+        }
+        WorkerJob::ImportWorkspaceFromReposTxt {
+            workspace_root,
+            status_sender,
+        } => {
+            let result = import_workspace_manifest_from_repos_txt(&workspace_root);
+            dispatch_worker_result(WorkerResult::ImportWorkspaceCompleted {
+                result,
+                status_sender,
+            });
+        }
+        WorkerJob::HistoryReport {
+            manifest,
+            selected_repo_ids,
+            num_commits,
+        } => {
+            let result = build_history_report(&manifest, &selected_repo_ids, num_commits);
+            dispatch_worker_result(WorkerResult::HistoryReportCompleted { result });
+        }
+        WorkerJob::LineStats {
+            manifest,
+            since_date,
+        } => {
+            let result = build_line_stats_report(&manifest, since_date.as_deref());
+            dispatch_worker_result(WorkerResult::LineStatsCompleted { result });
+        }
+        WorkerJob::SaveManifestFromEditor {
+            host_ptr,
+            workspace_name,
+            workspace_root,
+            shared_hooks_path,
+            repo_rows,
+            status_sender,
+        } => {
+            let result = save_workspace_manifest_from_inputs(
+                host_ptr,
+                &workspace_name,
+                &workspace_root,
+                &shared_hooks_path,
+                &repo_rows,
+            );
+            dispatch_worker_result(WorkerResult::SaveManifestCompleted {
+                result,
+                status_sender,
+            });
+        }
+        WorkerJob::EditorLoad { path, reply } => {
+            let result = fs::read_to_string(&path).map_err(|error| error.to_string());
+            let _ = reply.send(EditorLoadMessage { path, result });
+        }
+        WorkerJob::EditorSave {
+            path,
+            content,
+            reply,
+        } => {
+            let result = fs::write(&path, content).map_err(|error| error.to_string());
+            let _ = reply.send(EditorSaveMessage { path, result });
+        }
+    }
+
+    if let Some(key) = key {
+        let mut in_flight = executor()
+            .in_flight
+            .lock()
+            .expect("executor mutex poisoned");
+        in_flight.remove(&key);
+    }
+}
+
+fn dispatch_worker_result(result: WorkerResult) {
+    let main_context = glib::MainContext::default();
+    main_context.invoke(move || handle_worker_result(result));
 }
 
 fn empty_repository_status(repo_path: PathBuf) -> ronomepo_core::RepositoryStatus {
@@ -397,12 +753,8 @@ fn initialize_state(config: &RonomepoPluginConfig) {
 extern "C" fn command_refresh_workspace(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    match refresh_workspace() {
-        Ok(message) => {
-            append_log(message);
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::OK
-        }
+    match queue_refresh_workspace(None) {
+        Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
         Err(message) => {
             append_log(format!("Refresh failed: {message}"));
             refresh_views();
@@ -414,12 +766,8 @@ extern "C" fn command_refresh_workspace(
 extern "C" fn command_import_repos_txt(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    match import_workspace_from_repos_txt() {
-        Ok(message) => {
-            append_log(message);
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::OK
-        }
+    match queue_import_workspace_from_repos_txt(None) {
+        Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
         Err(message) => {
             append_log(format!("Import failed: {message}"));
             refresh_views();
@@ -518,12 +866,8 @@ extern "C" fn command_open_overview(
 extern "C" fn command_check_history(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    match refresh_history_report(25) {
-        Ok(message) => {
-            append_log(message);
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::OK
-        }
+    match queue_history_report(25) {
+        Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
         Err(message) => {
             append_log(message);
             refresh_views();
@@ -535,12 +879,8 @@ extern "C" fn command_check_history(
 extern "C" fn command_line_stats(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    match refresh_line_stats_report_from_state() {
-        Ok(message) => {
-            append_log(message);
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::OK
-        }
+    match queue_line_stats_report_from_state() {
+        Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
         Err(message) => {
             append_log(message);
             refresh_views();
@@ -549,146 +889,105 @@ extern "C" fn command_line_stats(
     }
 }
 
-fn refresh_workspace() -> Result<String, String> {
-    let mut app_state = state().lock().expect("state mutex poisoned");
-    let manifest_path = default_manifest_path(&app_state.workspace_root);
-    let manifest = load_manifest_if_present(&manifest_path);
-    let workspace_root = app_state.workspace_root.clone();
-    app_state.manifest = manifest.clone();
-    app_state.manifest_path = app_state.manifest.as_ref().map(|_| manifest_path.clone());
-    app_state.repository_items_refresh_pending = false;
-    app_state.repo_details_cache.clear();
-    app_state.repo_details_loading.clear();
-    drop(app_state);
-    schedule_workspace_scan();
-    if manifest.is_some() {
-        Ok(format!("Reloaded {MANIFEST_FILE_NAME} from {}", manifest_path.display()))
-    } else {
-        Ok(format!(
-            "No {MANIFEST_FILE_NAME} found in {}",
-            workspace_root.display()
-        ))
-    }
-}
-
-fn import_workspace_from_repos_txt() -> Result<String, String> {
-    let mut app_state = state().lock().expect("state mutex poisoned");
-    let repos_path = app_state.workspace_root.join("repos.txt");
-    let manifest_path = default_manifest_path(&app_state.workspace_root);
-
-    let manifest = import_repos_txt(
-        &repos_path,
-        &app_state.workspace_root,
-        &workspace_name_from_root(&app_state.workspace_root),
-    )
-    .map_err(|error| error.to_string())?;
-    save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
-
-    let repo_count = manifest.repos.len();
-    app_state.manifest = Some(manifest);
-    app_state.manifest_path = Some(manifest_path.clone());
-    app_state.repository_items_refresh_pending = false;
-    app_state.repo_details_cache.clear();
-    app_state.repo_details_loading.clear();
-    drop(app_state);
-    schedule_workspace_scan();
-
-    Ok(format!(
-        "Imported {repo_count} repositories from {} into {}",
-        repos_path.display(),
-        manifest_path.display()
-    ))
-}
-
-fn refresh_history_report(num_commits: usize) -> Result<String, String> {
-    let (manifest, selected_repo_ids) = {
+fn queue_refresh_workspace(status_sender: Option<mpsc::Sender<String>>) -> Result<(), String> {
+    let workspace_root = {
         let app_state = state().lock().expect("state mutex poisoned");
-        (
-            app_state.manifest.clone(),
-            app_state.selected_repo_ids.clone(),
-        )
+        app_state.workspace_root.clone()
     };
-    let Some(manifest) = manifest else {
-        return Err(format!(
-            "Check History skipped because no {} is loaded.",
-            MANIFEST_FILE_NAME
-        ));
-    };
-
-    let matches = collect_generated_history_matches(&manifest, &selected_repo_ids, num_commits);
-    let lines = if matches.is_empty() {
-        vec![format!(
-            "No generated-commit markers found in the last {num_commits} commits."
-        )]
-    } else {
-        matches
-            .into_iter()
-            .map(|entry| {
-                let markers = entry.matching_lines.join(" | ");
-                format!(
-                    "{} | HEAD~{} | {} | {} | {}",
-                    entry.repository_name, entry.head_offset, entry.commit_hash, entry.subject, markers
-                )
-            })
-            .collect()
-    };
-
-    let count = lines.len();
-    let mut app_state = state().lock().expect("state mutex poisoned");
-    app_state.history_report = lines;
-    Ok(format!(
-        "History check completed over the last {num_commits} commits ({count} report line(s))."
-    ))
-}
-
-fn refresh_line_stats_report(since_date: Option<&str>) -> Result<String, String> {
-    let manifest = {
-        let app_state = state().lock().expect("state mutex poisoned");
-        app_state.manifest.clone()
-    };
-    let Some(manifest) = manifest else {
-        return Err(format!(
-            "Line Stats skipped because no {} is loaded.",
-            MANIFEST_FILE_NAME
-        ));
-    };
-
-    let stats = collect_workspace_line_stats(&manifest, since_date);
-    let mut lines = stats
-        .rows
-        .into_iter()
-        .map(|row| {
-            if row.missing {
-                format!("{} | missing", row.repository_name)
-            } else {
-                format!(
-                    "{} | +{} | -{} | {:+}",
-                    row.repository_name, row.additions, row.deletions, row.net
-                )
-            }
-        })
-        .collect::<Vec<_>>();
-    lines.push(format!(
-        "TOTAL | +{} | -{} | {:+}",
-        stats.total_additions, stats.total_deletions, stats.total_net
-    ));
-
-    let rows = lines.len();
-    let mut app_state = state().lock().expect("state mutex poisoned");
-    app_state.line_stats_report = lines;
-    Ok(match since_date {
-        Some(since_date) => format!("Line stats refreshed since {since_date} ({rows} row(s))."),
-        None => format!("Line stats refreshed for all time ({rows} row(s))."),
+    submit_job(WorkerJob::RefreshWorkspace {
+        workspace_root,
+        status_sender,
     })
 }
 
-fn refresh_line_stats_report_from_state() -> Result<String, String> {
-    let since = {
+fn queue_import_workspace_from_repos_txt(
+    status_sender: Option<mpsc::Sender<String>>,
+) -> Result<(), String> {
+    let workspace_root = {
         let app_state = state().lock().expect("state mutex poisoned");
-        let trimmed = app_state.line_stats_since.trim().to_string();
-        (!trimmed.is_empty()).then_some(trimmed)
+        app_state.workspace_root.clone()
     };
-    refresh_line_stats_report(since.as_deref())
+    submit_job(WorkerJob::ImportWorkspaceFromReposTxt {
+        workspace_root,
+        status_sender,
+    })
+}
+
+fn queue_history_report(num_commits: usize) -> Result<(), String> {
+    let (manifest, selected_repo_ids) = {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        let Some(manifest) = app_state.manifest.clone() else {
+            return Err(format!(
+                "Check History skipped because no {} is loaded.",
+                MANIFEST_FILE_NAME
+            ));
+        };
+        app_state.history_report_loading = true;
+        (manifest, app_state.selected_repo_ids.clone())
+    };
+
+    match submit_coalesced_job(
+        JobKey::HistoryReport,
+        WorkerJob::HistoryReport {
+            manifest,
+            selected_repo_ids,
+            num_commits,
+        },
+    ) {
+        Ok(true) => {
+            refresh_views();
+            Ok(())
+        }
+        Ok(false) => {
+            append_log("History check is already running.".to_string());
+            refresh_views();
+            Ok(())
+        }
+        Err(error) => {
+            let mut app_state = state().lock().expect("state mutex poisoned");
+            app_state.history_report_loading = false;
+            Err(error)
+        }
+    }
+}
+
+fn queue_line_stats_report_from_state() -> Result<(), String> {
+    let (manifest, since_date) = {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        let Some(manifest) = app_state.manifest.clone() else {
+            return Err(format!(
+                "Line Stats skipped because no {} is loaded.",
+                MANIFEST_FILE_NAME
+            ));
+        };
+        let trimmed = app_state.line_stats_since.trim().to_string();
+        let since_date = (!trimmed.is_empty()).then_some(trimmed);
+        app_state.line_stats_loading = true;
+        (manifest, since_date)
+    };
+
+    match submit_coalesced_job(
+        JobKey::LineStats(since_date.clone()),
+        WorkerJob::LineStats {
+            manifest,
+            since_date,
+        },
+    ) {
+        Ok(true) => {
+            refresh_views();
+            Ok(())
+        }
+        Ok(false) => {
+            append_log("Line stats refresh is already running.".to_string());
+            refresh_views();
+            Ok(())
+        }
+        Err(error) => {
+            let mut app_state = state().lock().expect("state mutex poisoned");
+            app_state.line_stats_loading = false;
+            Err(error)
+        }
+    }
 }
 
 fn append_log(message: String) {
@@ -718,24 +1017,18 @@ fn launch_operation(kind: OperationKind) {
         return;
     };
 
-    let main_context = glib::MainContext::default();
-    thread::spawn(move || {
-        run_workspace_operation(&manifest, &selected_repo_ids, kind, |event| {
-            append_log(format!("[run {batch_id}] {}", format_operation_event(&event)));
-            let event = event.clone();
-            let manifest = manifest.clone();
-            main_context.invoke(move || match event.kind {
-                OperationEventKind::Success
-                | OperationEventKind::Skipped
-                | OperationEventKind::Failed => {
-                    schedule_refresh_for_operation_event(&manifest, &event);
-                    refresh_views();
-                }
-                OperationEventKind::Finished => refresh_views(),
-                OperationEventKind::Started => refresh_views(),
-            });
-        });
-    });
+    if let Err(message) = submit_job(WorkerJob::OperationBatch {
+        manifest,
+        selected_repo_ids,
+        kind,
+        batch_id,
+    }) {
+        append_log(format!(
+            "[run {batch_id}] {} failed to start: {message}",
+            operation_kind_title(kind)
+        ));
+        refresh_views();
+    }
 }
 
 fn operation_kind_title(kind: OperationKind) -> &'static str {
@@ -760,6 +1053,163 @@ fn format_operation_event(event: &OperationEvent) -> String {
     match event.repository_name.as_deref() {
         Some(repo_name) => format!("[{prefix}] {repo_name}: {}", event.message),
         None => format!("[{prefix}] {}", event.message),
+    }
+}
+
+fn handle_operation_event(batch_id: usize, manifest: WorkspaceManifest, event: OperationEvent) {
+    append_log(format!(
+        "[run {batch_id}] {}",
+        format_operation_event(&event)
+    ));
+    match event.kind {
+        OperationEventKind::Success | OperationEventKind::Skipped | OperationEventKind::Failed => {
+            schedule_refresh_for_operation_event(&manifest, &event);
+            refresh_views();
+        }
+        OperationEventKind::Finished | OperationEventKind::Started => refresh_views(),
+    }
+}
+
+fn handle_worker_result(result: WorkerResult) {
+    match result {
+        WorkerResult::WorkspaceScanCompleted {
+            workspace_status,
+            repository_items,
+        } => {
+            let rerun = {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                app_state.workspace_status = workspace_status;
+                app_state.repository_items = repository_items;
+                app_state.repository_items_loading = false;
+                let rerun = app_state.repository_items_refresh_pending;
+                app_state.repository_items_refresh_pending = false;
+                rerun
+            };
+            if rerun {
+                schedule_workspace_scan();
+            }
+            refresh_views();
+        }
+        WorkerResult::WorkspaceRootStatusRefreshed { workspace_status } => {
+            {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                app_state.workspace_status = workspace_status;
+            }
+            refresh_views();
+        }
+        WorkerResult::RepositoryStatusRefreshed { repo_id, status } => {
+            {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                if let Some(item) = app_state
+                    .repository_items
+                    .iter_mut()
+                    .find(|item| item.id == repo_id)
+                {
+                    item.status = status;
+                }
+            }
+            refresh_views();
+        }
+        WorkerResult::RepoDetailsLoaded { repo_id, details } => {
+            {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                app_state.repo_details_loading.remove(&repo_id);
+                app_state.repo_details_cache.insert(repo_id, details);
+            }
+            refresh_views();
+        }
+        WorkerResult::RefreshWorkspaceCompleted {
+            result,
+            status_sender,
+        } => {
+            let message = match result {
+                Ok(result) => {
+                    apply_loaded_manifest(
+                        result.workspace_root,
+                        result.manifest_path,
+                        result.manifest,
+                    );
+                    result.message
+                }
+                Err(message) => format!("Refresh failed: {message}"),
+            };
+            if let Some(sender) = status_sender {
+                let _ = sender.send(message.clone());
+            }
+            append_log(message);
+            refresh_views();
+        }
+        WorkerResult::ImportWorkspaceCompleted {
+            result,
+            status_sender,
+        } => {
+            let message = match result {
+                Ok(result) => {
+                    apply_imported_manifest(result.manifest_path, result.manifest);
+                    result.message
+                }
+                Err(message) => format!("Import failed: {message}"),
+            };
+            if let Some(sender) = status_sender {
+                let _ = sender.send(message.clone());
+            }
+            append_log(message);
+            refresh_views();
+        }
+        WorkerResult::HistoryReportCompleted { result } => {
+            let message = match result {
+                Ok(result) => {
+                    let mut app_state = state().lock().expect("state mutex poisoned");
+                    app_state.history_report = result.lines;
+                    app_state.history_report_loading = false;
+                    result.message
+                }
+                Err(message) => {
+                    let mut app_state = state().lock().expect("state mutex poisoned");
+                    app_state.history_report_loading = false;
+                    message
+                }
+            };
+            append_log(message);
+            refresh_views();
+        }
+        WorkerResult::LineStatsCompleted { result } => {
+            let message = match result {
+                Ok(result) => {
+                    let mut app_state = state().lock().expect("state mutex poisoned");
+                    app_state.line_stats_report = result.lines;
+                    app_state.line_stats_loading = false;
+                    result.message
+                }
+                Err(message) => {
+                    let mut app_state = state().lock().expect("state mutex poisoned");
+                    app_state.line_stats_loading = false;
+                    message
+                }
+            };
+            append_log(message);
+            refresh_views();
+        }
+        WorkerResult::SaveManifestCompleted {
+            result,
+            status_sender,
+        } => {
+            let message = match result {
+                Ok(result) => {
+                    apply_saved_manifest(
+                        result.host_ptr,
+                        result.workspace_root,
+                        result.manifest_path,
+                        result.manifest,
+                    );
+                    result.message
+                }
+                Err(message) => message,
+            };
+            let _ = status_sender.send(message.clone());
+            append_log(message);
+            refresh_views();
+        }
     }
 }
 
@@ -926,7 +1376,9 @@ struct StateSnapshot {
     active_repo_id: Option<String>,
     logs: Vec<String>,
     history_report: Vec<String>,
+    history_report_loading: bool,
     line_stats_report: Vec<String>,
+    line_stats_loading: bool,
     line_stats_since: String,
 }
 
@@ -947,7 +1399,9 @@ fn snapshot() -> StateSnapshot {
         active_repo_id: app_state.active_repo_id.clone(),
         logs: app_state.logs.clone(),
         history_report: app_state.history_report.clone(),
+        history_report_loading: app_state.history_report_loading,
         line_stats_report: app_state.line_stats_report.clone(),
+        line_stats_loading: app_state.line_stats_loading,
         line_stats_since: app_state.line_stats_since.clone(),
     }
 }
@@ -1190,7 +1644,10 @@ fn filtered_repository_items(
 }
 
 fn repo_monitor_sort_key(item: &RepositoryListItem) -> (u8, String) {
-    (u8::from(item.id == MONOREPO_ROW_ID), item.name.to_ascii_lowercase())
+    (
+        u8::from(item.id == MONOREPO_ROW_ID),
+        item.name.to_ascii_lowercase(),
+    )
 }
 
 fn repo_requires_attention(item: &RepositoryListItem) -> bool {
@@ -1251,10 +1708,7 @@ fn update_line_stats_since(value: String) {
     app_state.line_stats_since = value;
 }
 
-fn open_repo_overviews(
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-    repo_ids: &[String],
-) {
+fn open_repo_overviews(host_ptr: *const maruzzella_sdk::ffi::MzHostApi, repo_ids: &[String]) {
     let snapshot = snapshot();
     let items = repository_items(&snapshot);
     let selected = items
@@ -1297,71 +1751,44 @@ fn schedule_workspace_scan() {
         }
         app_state.repository_items_loading = true;
         app_state.repository_items_refresh_pending = false;
-        (
-            app_state.workspace_root.clone(),
-            app_state.manifest.clone(),
-        )
+        (app_state.workspace_root.clone(), app_state.manifest.clone())
     };
 
-    let main_context = glib::MainContext::default();
-    thread::spawn(move || {
-        let workspace_status = ronomepo_core::collect_repository_status(&workspace_root);
-        let repository_items = manifest
-            .as_ref()
-            .map(build_repository_list)
-            .unwrap_or_default();
-
-        main_context.invoke(move || {
-            let rerun = {
-                let mut app_state = state().lock().expect("state mutex poisoned");
-                app_state.workspace_status = workspace_status;
-                app_state.repository_items = repository_items;
-                app_state.repository_items_loading = false;
-                let rerun = app_state.repository_items_refresh_pending;
-                app_state.repository_items_refresh_pending = false;
-                rerun
-            };
-            if rerun {
-                schedule_workspace_scan();
-            }
-            refresh_views();
-        });
-    });
+    if let Err(message) = submit_coalesced_job(
+        JobKey::WorkspaceScan,
+        WorkerJob::WorkspaceScan {
+            workspace_root,
+            manifest,
+        },
+    ) {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        app_state.repository_items_loading = false;
+        append_log(format!("Workspace scan failed to start: {message}"));
+        refresh_views();
+    }
 }
 
 fn schedule_workspace_root_status_refresh(workspace_root: PathBuf) {
-    let main_context = glib::MainContext::default();
-    thread::spawn(move || {
-        let workspace_status = ronomepo_core::collect_repository_status(&workspace_root);
-        main_context.invoke(move || {
-            {
-                let mut app_state = state().lock().expect("state mutex poisoned");
-                app_state.workspace_status = workspace_status;
-            }
-            refresh_views();
-        });
-    });
+    if let Err(message) = submit_coalesced_job(
+        JobKey::WorkspaceRootStatus,
+        WorkerJob::WorkspaceRootStatusRefresh { workspace_root },
+    ) {
+        append_log(format!("Workspace root refresh failed to start: {message}"));
+        refresh_views();
+    }
 }
 
 fn schedule_repository_status_refresh(repo_id: &str, repo_path: PathBuf) {
     let repo_id = repo_id.to_string();
-    let main_context = glib::MainContext::default();
-    thread::spawn(move || {
-        let status = ronomepo_core::collect_repository_status(&repo_path);
-        main_context.invoke(move || {
-            {
-                let mut app_state = state().lock().expect("state mutex poisoned");
-                if let Some(item) = app_state
-                    .repository_items
-                    .iter_mut()
-                    .find(|item| item.id == repo_id)
-                {
-                    item.status = status.clone();
-                }
-            }
-            refresh_views();
-        });
-    });
+    if let Err(message) = submit_coalesced_job(
+        JobKey::RepoStatus(repo_id.clone()),
+        WorkerJob::RepositoryStatusRefresh { repo_id, repo_path },
+    ) {
+        append_log(format!(
+            "Repository status refresh failed to start: {message}"
+        ));
+        refresh_views();
+    }
 }
 
 fn invalidate_repo_details(repo_id: &str) {
@@ -1382,18 +1809,21 @@ fn schedule_repo_details_load(repo_id: &str, repo_path: &Path) {
         }
     }
 
-    let main_context = glib::MainContext::default();
-    thread::spawn(move || {
-        let details = collect_repository_details(&repo_path);
-        main_context.invoke(move || {
-            {
-                let mut app_state = state().lock().expect("state mutex poisoned");
-                app_state.repo_details_loading.remove(&repo_id);
-                app_state.repo_details_cache.insert(repo_id, details);
-            }
-            refresh_views();
-        });
-    });
+    let job_repo_id = repo_id.clone();
+    if let Err(message) = submit_coalesced_job(
+        JobKey::RepoDetails(repo_id.clone()),
+        WorkerJob::RepoDetailsLoad {
+            repo_id: job_repo_id,
+            repo_path,
+        },
+    ) {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        app_state.repo_details_loading.remove(&repo_id);
+        append_log(format!(
+            "Repository details load failed to start: {message}"
+        ));
+        refresh_views();
+    }
 }
 
 fn open_repo_overview_for_item(
@@ -1401,7 +1831,8 @@ fn open_repo_overview_for_item(
     item: &RepositoryListItem,
 ) -> Result<(), String> {
     let host = unsafe { HostApi::from_raw(&*host_ptr) };
-    let mut request = OpenViewRequest::new(PLUGIN_ID, VIEW_REPO_OVERVIEW, MzViewPlacement::Workbench);
+    let mut request =
+        OpenViewRequest::new(PLUGIN_ID, VIEW_REPO_OVERVIEW, MzViewPlacement::Workbench);
     request.instance_key = Some(&item.id);
     request.requested_title = Some(&item.name);
     request.payload = item.id.as_bytes();
@@ -1634,7 +2065,12 @@ fn repo_monitor_header() -> GtkBox {
     let header = GtkBox::new(Orientation::Horizontal, 10);
     header.add_css_class("mono");
     header.set_margin_bottom(4);
-    let name = monitor_text_cell("Name", MONITOR_NAME_COL_CHARS, MONITOR_NAME_COL_WIDTH, false);
+    let name = monitor_text_cell(
+        "Name",
+        MONITOR_NAME_COL_CHARS,
+        MONITOR_NAME_COL_WIDTH,
+        false,
+    );
     let branch = monitor_text_cell(
         "Branch",
         MONITOR_BRANCH_COL_CHARS,
@@ -1713,7 +2149,10 @@ fn repo_monitor_actions(host_ptr: *const maruzzella_sdk::ffi::MzHostApi) -> GtkB
             return;
         }
         set_selected_repo_ids(ids.clone());
-        append_log(format!("Selected {} visible repos from the monitor.", ids.len()));
+        append_log(format!(
+            "Selected {} visible repos from the monitor.",
+            ids.len()
+        ));
     });
     actions.append(&select_visible);
 
@@ -1736,7 +2175,10 @@ fn repo_monitor_actions(host_ptr: *const maruzzella_sdk::ffi::MzHostApi) -> GtkB
             return;
         }
         set_selected_repo_ids(ids.clone());
-        append_log(format!("Selected {} dirty repos from the monitor.", ids.len()));
+        append_log(format!(
+            "Selected {} dirty repos from the monitor.",
+            ids.len()
+        ));
     });
     actions.append(&select_dirty);
 
@@ -1753,7 +2195,10 @@ fn repo_monitor_actions(host_ptr: *const maruzzella_sdk::ffi::MzHostApi) -> GtkB
             return;
         }
         set_selected_repo_ids(ids.clone());
-        append_log(format!("Selected {} missing repos from the monitor.", ids.len()));
+        append_log(format!(
+            "Selected {} missing repos from the monitor.",
+            ids.len()
+        ));
     });
     actions.append(&select_missing);
 
@@ -1838,12 +2283,7 @@ fn render_monorepo_overview_into(
     let items = repository_items(snapshot);
     let missing = items
         .iter()
-        .filter(|item| {
-            matches!(
-                item.status.state,
-                ronomepo_core::RepositoryState::Missing
-            )
-        })
+        .filter(|item| matches!(item.status.state, ronomepo_core::RepositoryState::Missing))
         .count();
     let dirty = items
         .iter()
@@ -1970,13 +2410,21 @@ fn render_monorepo_overview_into(
     append_lines_section(
         &sections,
         "History Check",
-        &snapshot.history_report,
+        &if snapshot.history_report_loading {
+            vec!["History check is running...".to_string()]
+        } else {
+            snapshot.history_report.clone()
+        },
         "Run Check History to scan recent commits for generated markers.",
     );
     append_lines_section(
         &sections,
         "Line Stats",
-        &snapshot.line_stats_report,
+        &if snapshot.line_stats_loading {
+            vec!["Line stats refresh is running...".to_string()]
+        } else {
+            snapshot.line_stats_report.clone()
+        },
         "Run Line Stats to inspect additions and deletions across the workspace.",
     );
     append_log_section(&sections, "Recent Operations", &snapshot.logs, 8);
@@ -2017,8 +2465,8 @@ extern "C" fn create_repo_overview_view(
     scroller.set_valign(Align::Fill);
     scroller.set_propagate_natural_height(false);
 
-    let instance_key = unsafe { request.as_ref() }
-        .and_then(|request| decode_mzstr(request.instance_key));
+    let instance_key =
+        unsafe { request.as_ref() }.and_then(|request| decode_mzstr(request.instance_key));
     let snapshot = snapshot();
     render_repo_overview_into(&root, &snapshot, instance_key.as_deref(), host);
 
@@ -2088,12 +2536,15 @@ fn render_workspace_settings_into(
 ) {
     clear_box(root);
 
-    let manifest = snapshot.manifest.clone().unwrap_or_else(|| WorkspaceManifest {
-        name: workspace_name_from_root(&snapshot.workspace_root),
-        root: snapshot.workspace_root.clone(),
-        repos: Vec::new(),
-        shared_hooks_path: Some(snapshot.workspace_root.join("hooks")),
-    });
+    let manifest = snapshot
+        .manifest
+        .clone()
+        .unwrap_or_else(|| WorkspaceManifest {
+            name: workspace_name_from_root(&snapshot.workspace_root),
+            root: snapshot.workspace_root.clone(),
+            repos: Vec::new(),
+            shared_hooks_path: Some(snapshot.workspace_root.join("hooks")),
+        });
 
     let title = Label::new(Some("Workspace Settings"));
     title.set_xalign(0.0);
@@ -2176,56 +2627,50 @@ fn render_workspace_settings_into(
     });
 
     save.connect_clicked({
+        let status = status.clone();
+        let repo_rows = repo_rows.clone();
         let name_entry = name_entry.clone();
         let root_entry = root_entry.clone();
         let hooks_entry = hooks_entry.clone();
-        let status = status.clone();
-        let repo_rows = repo_rows.clone();
-        move |_| match save_workspace_manifest_from_editor(
-            host_ptr,
-            name_entry.text().as_str(),
-            root_entry.text().as_str(),
-            hooks_entry.text().as_str(),
-            &repo_rows.borrow(),
-        ) {
-            Ok(message) => {
+        move |_| {
+            status.set_text("Saving manifest...");
+            if let Err(message) = queue_save_workspace_manifest_from_editor(
+                host_ptr,
+                name_entry.text().as_str(),
+                root_entry.text().as_str(),
+                hooks_entry.text().as_str(),
+                &repo_rows.borrow(),
+                &status,
+            ) {
                 status.set_text(&message);
                 append_log(message);
                 refresh_views();
-            }
-            Err(message) => {
-                status.set_text(&message);
-                append_log(message);
             }
         }
     });
 
     reload.connect_clicked({
         let status = status.clone();
-        move |_| match refresh_workspace() {
-            Ok(message) => {
+        move |_| {
+            status.set_text("Refreshing workspace...");
+            if let Err(message) = queue_refresh_workspace(Some(status_text_sender(&status))) {
                 status.set_text(&message);
                 append_log(message);
                 refresh_views();
-            }
-            Err(message) => {
-                status.set_text(&message);
-                append_log(message);
             }
         }
     });
 
     import.connect_clicked({
         let status = status.clone();
-        move |_| match import_workspace_from_repos_txt() {
-            Ok(message) => {
+        move |_| {
+            status.set_text("Importing repos.txt...");
+            if let Err(message) =
+                queue_import_workspace_from_repos_txt(Some(status_text_sender(&status)))
+            {
                 status.set_text(&message);
                 append_log(message);
                 refresh_views();
-            }
-            Err(message) => {
-                status.set_text(&message);
-                append_log(message);
             }
         }
     });
@@ -2323,28 +2768,199 @@ fn append_repo_editor_row(
     });
 }
 
-fn save_workspace_manifest_from_editor(
+fn persist_last_workspace_path(
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    workspace_root: &Path,
+) {
+    if host_ptr.is_null() {
+        return;
+    }
+    let host = unsafe { HostApi::from_raw(&*host_ptr) };
+    let Ok(mut config) = ensure_config(&host) else {
+        return;
+    };
+    config.last_workspace_path = Some(workspace_root.display().to_string());
+    if let Ok(payload) = serde_json::to_vec(&config) {
+        let _ = host.write_config(&payload);
+    }
+}
+
+fn status_text_sender(status: &Label) -> mpsc::Sender<String> {
+    let (sender, receiver) = mpsc::channel::<String>();
+    let status = status.clone();
+    glib::idle_add_local(move || match receiver.try_recv() {
+        Ok(message) => {
+            status.set_text(&message);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+    });
+    sender
+}
+
+fn queue_save_workspace_manifest_from_editor(
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
     workspace_name: &str,
     workspace_root: &str,
     shared_hooks_path: &str,
     repo_rows: &[RepoEditorRowHandle],
-) -> Result<String, String> {
+    status: &Label,
+) -> Result<(), String> {
+    let repo_rows = repo_rows
+        .iter()
+        .map(|handle| RepoEditorRowInput {
+            enabled: handle.enabled.is_active(),
+            name: handle.name.text().trim().to_string(),
+            dir_name: handle.dir_name.text().trim().to_string(),
+            remote_url: handle.remote_url.text().trim().to_string(),
+        })
+        .collect::<Vec<_>>();
+    submit_job(WorkerJob::SaveManifestFromEditor {
+        host_ptr: host_ptr as usize,
+        workspace_name: workspace_name.to_string(),
+        workspace_root: workspace_root.to_string(),
+        shared_hooks_path: shared_hooks_path.to_string(),
+        repo_rows,
+        status_sender: status_text_sender(status),
+    })
+}
+
+fn load_workspace_manifest(workspace_root: &Path) -> Result<RefreshWorkspaceResult, String> {
+    let manifest_path = default_manifest_path(workspace_root);
+    let manifest = load_manifest_if_present(&manifest_path);
+    let message = if manifest.is_some() {
+        format!(
+            "Reloaded {MANIFEST_FILE_NAME} from {}",
+            manifest_path.display()
+        )
+    } else {
+        format!(
+            "No {MANIFEST_FILE_NAME} found in {}",
+            workspace_root.display()
+        )
+    };
+    Ok(RefreshWorkspaceResult {
+        workspace_root: workspace_root.to_path_buf(),
+        manifest_path,
+        manifest,
+        message,
+    })
+}
+
+fn import_workspace_manifest_from_repos_txt(
+    workspace_root: &Path,
+) -> Result<ImportWorkspaceResult, String> {
+    let repos_path = workspace_root.join("repos.txt");
+    let manifest_path = default_manifest_path(workspace_root);
+    let manifest = import_repos_txt(
+        &repos_path,
+        workspace_root,
+        &workspace_name_from_root(workspace_root),
+    )
+    .map_err(|error| error.to_string())?;
+    let repo_count = manifest.repos.len();
+    save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
+    Ok(ImportWorkspaceResult {
+        manifest_path,
+        manifest,
+        message: format!(
+            "Imported {repo_count} repositories from {} into {}",
+            repos_path.display(),
+            default_manifest_path(workspace_root).display()
+        ),
+    })
+}
+
+fn build_history_report(
+    manifest: &WorkspaceManifest,
+    selected_repo_ids: &[String],
+    num_commits: usize,
+) -> Result<HistoryReportResult, String> {
+    let matches = collect_generated_history_matches(manifest, selected_repo_ids, num_commits);
+    let lines = if matches.is_empty() {
+        vec![format!(
+            "No generated-commit markers found in the last {num_commits} commits."
+        )]
+    } else {
+        matches
+            .into_iter()
+            .map(|entry| {
+                let markers = entry.matching_lines.join(" | ");
+                format!(
+                    "{} | HEAD~{} | {} | {} | {}",
+                    entry.repository_name,
+                    entry.head_offset,
+                    entry.commit_hash,
+                    entry.subject,
+                    markers
+                )
+            })
+            .collect()
+    };
+    let count = lines.len();
+    Ok(HistoryReportResult {
+        lines,
+        message: format!(
+            "History check completed over the last {num_commits} commits ({count} report line(s))."
+        ),
+    })
+}
+
+fn build_line_stats_report(
+    manifest: &WorkspaceManifest,
+    since_date: Option<&str>,
+) -> Result<LineStatsResult, String> {
+    let stats = collect_workspace_line_stats(manifest, since_date);
+    let mut lines = stats
+        .rows
+        .into_iter()
+        .map(|row| {
+            if row.missing {
+                format!("{} | missing", row.repository_name)
+            } else {
+                format!(
+                    "{} | +{} | -{} | {:+}",
+                    row.repository_name, row.additions, row.deletions, row.net
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    lines.push(format!(
+        "TOTAL | +{} | -{} | {:+}",
+        stats.total_additions, stats.total_deletions, stats.total_net
+    ));
+    let rows = lines.len();
+    Ok(LineStatsResult {
+        lines,
+        message: match since_date {
+            Some(since_date) => format!("Line stats refreshed since {since_date} ({rows} row(s))."),
+            None => format!("Line stats refreshed for all time ({rows} row(s))."),
+        },
+    })
+}
+
+fn save_workspace_manifest_from_inputs(
+    host_ptr: usize,
+    workspace_name: &str,
+    workspace_root: &str,
+    shared_hooks_path: &str,
+    repo_rows: &[RepoEditorRowInput],
+) -> Result<SaveManifestResult, String> {
     let workspace_root = normalize_workspace_root(workspace_root.trim());
     if workspace_root.as_os_str().is_empty() {
         return Err("Workspace root cannot be empty.".to_string());
     }
 
     let mut repos = Vec::new();
-    for handle in repo_rows {
-        let remote_url = handle.remote_url.text().trim().to_string();
-        let mut dir_name = handle.dir_name.text().trim().to_string();
-        let mut name = handle.name.text().trim().to_string();
+    for row in repo_rows {
+        let remote_url = row.remote_url.trim().to_string();
+        let mut dir_name = row.dir_name.trim().to_string();
+        let mut name = row.name.trim().to_string();
 
         if remote_url.is_empty() && dir_name.is_empty() && name.is_empty() {
             continue;
         }
-
         if remote_url.is_empty() {
             return Err("Each non-empty repository row needs a remote URL.".to_string());
         }
@@ -2360,7 +2976,7 @@ fn save_workspace_manifest_from_editor(
             name,
             dir_name,
             remote_url,
-            enabled: handle.enabled.is_active(),
+            enabled: row.enabled,
         });
     }
 
@@ -2382,14 +2998,61 @@ fn save_workspace_manifest_from_editor(
     let manifest_path = default_manifest_path(&workspace_root);
     save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
 
+    Ok(SaveManifestResult {
+        host_ptr,
+        workspace_root,
+        manifest_path: manifest_path.clone(),
+        message: format!(
+            "Saved {} with {} repositories.",
+            manifest_path.display(),
+            manifest.repos.len()
+        ),
+        manifest,
+    })
+}
+
+fn apply_loaded_manifest(
+    workspace_root: PathBuf,
+    manifest_path: PathBuf,
+    manifest: Option<WorkspaceManifest>,
+) {
+    let mut app_state = state().lock().expect("state mutex poisoned");
+    app_state.workspace_root = workspace_root;
+    app_state.manifest = manifest.clone();
+    app_state.manifest_path = manifest.as_ref().map(|_| manifest_path);
+    app_state.repository_items_refresh_pending = false;
+    app_state.repo_details_cache.clear();
+    app_state.repo_details_loading.clear();
+    drop(app_state);
+    schedule_workspace_scan();
+}
+
+fn apply_imported_manifest(manifest_path: PathBuf, manifest: WorkspaceManifest) {
+    let mut app_state = state().lock().expect("state mutex poisoned");
+    app_state.manifest = Some(manifest);
+    app_state.manifest_path = Some(manifest_path);
+    app_state.repository_items_refresh_pending = false;
+    app_state.repo_details_cache.clear();
+    app_state.repo_details_loading.clear();
+    drop(app_state);
+    schedule_workspace_scan();
+}
+
+fn apply_saved_manifest(
+    host_ptr: usize,
+    workspace_root: PathBuf,
+    manifest_path: PathBuf,
+    manifest: WorkspaceManifest,
+) {
     {
         let mut app_state = state().lock().expect("state mutex poisoned");
         app_state.workspace_root = workspace_root.clone();
-        app_state.manifest_path = Some(manifest_path.clone());
+        app_state.manifest_path = Some(manifest_path);
         app_state.manifest = Some(manifest.clone());
         app_state.repo_details_cache.clear();
         app_state.repo_details_loading.clear();
-        app_state.selected_repo_ids
+        app_state
+            .selected_repo_ids
             .retain(|id| manifest.repos.iter().any(|repo| &repo.id == id));
         if app_state
             .active_repo_id
@@ -2400,31 +3063,8 @@ fn save_workspace_manifest_from_editor(
         }
     }
 
-    persist_last_workspace_path(host_ptr, &workspace_root);
+    persist_last_workspace_path(host_ptr as *const _, &workspace_root);
     schedule_workspace_scan();
-
-    Ok(format!(
-        "Saved {} with {} repositories.",
-        manifest_path.display(),
-        manifest.repos.len()
-    ))
-}
-
-fn persist_last_workspace_path(
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-    workspace_root: &Path,
-) {
-    if host_ptr.is_null() {
-        return;
-    }
-    let host = unsafe { HostApi::from_raw(&*host_ptr) };
-    let Ok(mut config) = ensure_config(&host) else {
-        return;
-    };
-    config.last_workspace_path = Some(workspace_root.display().to_string());
-    if let Ok(payload) = serde_json::to_vec(&config) {
-        let _ = host.write_config(&payload);
-    }
 }
 
 fn render_repo_overview_into(
@@ -2487,11 +3127,14 @@ fn render_repo_overview_into(
         ("Branch", branch_label(item).to_string()),
         ("State", status_label(&item.status.state).to_string()),
         ("Sync", format_sync_label(&item.status.sync)),
-        ("Selected", if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
-            "Yes".to_string()
-        } else {
-            "No".to_string()
-        }),
+        (
+            "Selected",
+            if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
+                "Yes".to_string()
+            } else {
+                "No".to_string()
+            },
+        ),
     ] {
         status_cards.append(&stat_card(label, &value));
     }
@@ -2511,11 +3154,7 @@ fn render_repo_overview_into(
     append_overview_section(&sections, "Remote", &item.remote_url);
     append_overview_section(&sections, "Directory", &item.dir_name);
     append_overview_section(&sections, "State", status_label(&item.status.state));
-    append_overview_section(
-        &sections,
-        "Sync",
-        &format_sync_label(&item.status.sync),
-    );
+    append_overview_section(&sections, "Sync", &format_sync_label(&item.status.sync));
     append_overview_section(
         &sections,
         "Current Selection Scope",
@@ -2582,8 +3221,14 @@ fn render_repo_overview_into(
 fn overview_actions() -> GtkBox {
     let actions = GtkBox::new(Orientation::Horizontal, 8);
     for (label, handler) in [
-        ("Refresh", command_refresh_workspace as extern "C" fn(_) -> _),
-        ("Clone Missing", command_clone_missing as extern "C" fn(_) -> _),
+        (
+            "Refresh",
+            command_refresh_workspace as extern "C" fn(_) -> _,
+        ),
+        (
+            "Clone Missing",
+            command_clone_missing as extern "C" fn(_) -> _,
+        ),
         ("Pull", command_pull as extern "C" fn(_) -> _),
         ("Push", command_push as extern "C" fn(_) -> _),
         ("Push Force", command_push_force as extern "C" fn(_) -> _),
@@ -2620,32 +3265,30 @@ fn repo_overview_actions(
         let repo_id = item.id.clone();
         let repo_name = item.name.clone();
         let repo_path = item.status.repo_path.clone();
-        button.connect_clicked(move |_| {
-            match label {
-                "Target This Repo" => {
-                    set_selected_repo_ids(vec![repo_id.clone()]);
-                    append_log(format!("Targeted {repo_id} as the active selection."));
-                }
-                "Open Folder" => {
-                    open_path_in_file_manager(&repo_path, &repo_name);
-                }
-                "Open Terminal" => {
-                    open_path_in_terminal(&repo_path, &repo_name);
-                }
-                "Open In Editor" => {
-                    open_path_in_editor(&repo_path, &repo_name);
-                }
-                "Edit README" => {
-                    open_text_editor_for_path(host_ptr, &repo_path.join("README.md"));
-                }
-                "Edit .git/config" => {
-                    open_text_editor_for_path(host_ptr, &repo_path.join(".git/config"));
-                }
-                _ => {
-                    set_selected_repo_ids(vec![repo_id.clone()]);
-                    if let Some(kind) = kind {
-                        launch_operation(kind);
-                    }
+        button.connect_clicked(move |_| match label {
+            "Target This Repo" => {
+                set_selected_repo_ids(vec![repo_id.clone()]);
+                append_log(format!("Targeted {repo_id} as the active selection."));
+            }
+            "Open Folder" => {
+                open_path_in_file_manager(&repo_path, &repo_name);
+            }
+            "Open Terminal" => {
+                open_path_in_terminal(&repo_path, &repo_name);
+            }
+            "Open In Editor" => {
+                open_path_in_editor(&repo_path, &repo_name);
+            }
+            "Edit README" => {
+                open_text_editor_for_path(host_ptr, &repo_path.join("README.md"));
+            }
+            "Edit .git/config" => {
+                open_text_editor_for_path(host_ptr, &repo_path.join(".git/config"));
+            }
+            _ => {
+                set_selected_repo_ids(vec![repo_id.clone()]);
+                if let Some(kind) = kind {
+                    launch_operation(kind);
                 }
             }
         });
@@ -2721,7 +3364,9 @@ fn monorepo_selection_actions(
         let button = Button::with_label(label);
         button.connect_clicked(move |_| {
             if ids.is_empty() {
-                append_log(format!("{label} skipped because no repos match that bucket."));
+                append_log(format!(
+                    "{label} skipped because no repos match that bucket."
+                ));
             } else {
                 set_selected_repo_ids(ids.clone());
                 append_log(format!("{label} matched {} repos.", ids.len()));
@@ -2790,7 +3435,8 @@ fn collect_repo_ids<F>(items: &[RepositoryListItem], predicate: F) -> Vec<String
 where
     F: Fn(&RepositoryListItem) -> bool,
 {
-    items.iter()
+    items
+        .iter()
         .filter(|item| predicate(item))
         .map(|item| item.id.clone())
         .collect()
@@ -2827,12 +3473,7 @@ fn append_overview_section(container: &GtkBox, heading: &str, body: &str) {
     container.append(&Separator::new(Orientation::Horizontal));
 }
 
-fn append_lines_section(
-    container: &GtkBox,
-    heading: &str,
-    lines: &[String],
-    empty_message: &str,
-) {
+fn append_lines_section(container: &GtkBox, heading: &str, lines: &[String], empty_message: &str) {
     let block = GtkBox::new(Orientation::Vertical, 6);
     let heading_label = Label::new(Some(heading));
     heading_label.set_xalign(0.0);
@@ -3001,16 +3642,25 @@ fn repo_action_eligibility(item: &RepositoryListItem) -> String {
         _ => "Pull is allowed if the repo has a valid remote.",
     };
     let push = match &item.status.sync {
-        RepositorySync::Ahead(count) => format!("Push is available with {count} local commit(s) ahead."),
-        RepositorySync::Diverged { ahead, behind } => format!(
-            "Push is risky: the branch diverged (+{ahead}/-{behind})."
-        ),
-        RepositorySync::NoUpstream => "Push will be skipped because no upstream is configured.".to_string(),
-        RepositorySync::Behind(count) => format!(
-            "Push is not useful yet because the branch is behind by {count} commit(s)."
-        ),
-        RepositorySync::UpToDate => "Push will be skipped because the repo is already up to date.".to_string(),
-        RepositorySync::Unknown => "Push eligibility is unknown because Git sync state could not be determined.".to_string(),
+        RepositorySync::Ahead(count) => {
+            format!("Push is available with {count} local commit(s) ahead.")
+        }
+        RepositorySync::Diverged { ahead, behind } => {
+            format!("Push is risky: the branch diverged (+{ahead}/-{behind}).")
+        }
+        RepositorySync::NoUpstream => {
+            "Push will be skipped because no upstream is configured.".to_string()
+        }
+        RepositorySync::Behind(count) => {
+            format!("Push is not useful yet because the branch is behind by {count} commit(s).")
+        }
+        RepositorySync::UpToDate => {
+            "Push will be skipped because the repo is already up to date.".to_string()
+        }
+        RepositorySync::Unknown => {
+            "Push eligibility is unknown because Git sync state could not be determined."
+                .to_string()
+        }
     };
 
     format!("{clone} {pull} {push}")
@@ -3091,10 +3741,7 @@ fn open_selected_repo_in_editor() {
     open_path_in_editor(&item.status.repo_path, &item.name);
 }
 
-fn open_text_editor_for_path(
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-    path: &Path,
-) {
+fn open_text_editor_for_path(host_ptr: *const maruzzella_sdk::ffi::MzHostApi, path: &Path) {
     let resolved = resolve_editor_path(&path.display().to_string());
     let instance_key = resolved.to_string_lossy().to_string();
     let requested_title = editor_title_for_path(&resolved);
@@ -3169,7 +3816,11 @@ fn open_path_in_terminal(path: &Path, label: &str) {
         ("alacritty", "--working-directory"),
         ("kitty", "--directory"),
     ] {
-        if Command::new(program).args([flag, path_text.as_str()]).spawn().is_ok() {
+        if Command::new(program)
+            .args([flag, path_text.as_str()])
+            .spawn()
+            .is_ok()
+        {
             append_log(format!("Opened terminal for {label}: {}", path.display()));
             return;
         }
@@ -3236,8 +3887,9 @@ extern "C" fn create_text_editor_view(
                 if request.payload.ptr.is_null() || request.payload.len == 0 {
                     None
                 } else {
-                    let bytes =
-                        unsafe { std::slice::from_raw_parts(request.payload.ptr, request.payload.len) };
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(request.payload.ptr, request.payload.len)
+                    };
                     let text = String::from_utf8_lossy(bytes).trim().to_string();
                     (!text.is_empty()).then_some(text)
                 }
@@ -3283,8 +3935,9 @@ extern "C" fn create_text_editor_view(
 
     if let Some(path) = initial_path.as_deref() {
         path_entry.set_text(path);
-        load_editor_buffer(&buffer, &status, &resolve_editor_path(path));
-        title.set_text(&editor_title_for_path(&resolve_editor_path(path)));
+        let resolved = resolve_editor_path(path);
+        title.set_text(&editor_title_for_path(&resolved));
+        queue_editor_load(&buffer, &status, &title, &path_entry, &resolved);
     }
 
     open_button.connect_clicked({
@@ -3302,7 +3955,7 @@ extern "C" fn create_text_editor_view(
             if !current_instance.as_os_str().is_empty() && current_instance != path {
                 open_text_editor_for_path(host, &path);
             } else {
-                load_editor_buffer(&buffer, &status, &path);
+                queue_editor_load(&buffer, &status, &title, &path_entry, &path);
                 title.set_text(&editor_title_for_path(&path));
             }
         }
@@ -3316,23 +3969,7 @@ extern "C" fn create_text_editor_view(
         move |_| {
             let path = resolve_editor_path(path_entry.text().as_str());
             let content = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
-            match fs::write(&path, content.as_str()) {
-                Ok(()) => {
-                    status.set_text(&format!("Saved {}", path.display()));
-                    let title_text = editor_title_for_path(&path);
-                    title.set_text(&title_text);
-                    if !host.is_null() {
-                        let host = unsafe { HostApi::from_raw(&*host) };
-                        let mut query = maruzzella_sdk::ViewQuery::new(PLUGIN_ID, VIEW_TEXT_EDITOR);
-                        let path_key = path.to_string_lossy().to_string();
-                        query.instance_key = Some(&path_key);
-                        let _ = host.update_view_title(&query, &title_text);
-                    }
-                }
-                Err(error) => {
-                    status.set_text(&format!("Failed to save {}: {error}", path.display()));
-                }
-            }
+            queue_editor_save(&status, &title, &path, content.to_string(), host as usize);
         }
     });
 
@@ -3366,16 +4003,103 @@ fn resolve_editor_path(input: &str) -> PathBuf {
     }
 }
 
-fn load_editor_buffer(buffer: &TextBuffer, status: &Label, path: &Path) {
-    match fs::read_to_string(path) {
-        Ok(content) => {
-            buffer.set_text(&content);
-            status.set_text(&format!("Loaded {}", path.display()));
+fn queue_editor_load(
+    buffer: &TextBuffer,
+    status: &Label,
+    title: &Label,
+    path_entry: &Entry,
+    path: &Path,
+) {
+    status.set_text(&format!("Loading {}...", path.display()));
+    let (sender, receiver) = mpsc::channel::<EditorLoadMessage>();
+    let buffer = buffer.clone();
+    let status = status.clone();
+    let title = title.clone();
+    let path_entry = path_entry.clone();
+    let queue_error_buffer = buffer.clone();
+    let queue_error_status = status.clone();
+    glib::idle_add_local(move || match receiver.try_recv() {
+        Ok(message) => {
+            if resolve_editor_path(path_entry.text().as_str()) == message.path {
+                match message.result {
+                    Ok(content) => {
+                        buffer.set_text(&content);
+                        status.set_text(&format!("Loaded {}", message.path.display()));
+                        title.set_text(&editor_title_for_path(&message.path));
+                    }
+                    Err(error) => {
+                        buffer.set_text("");
+                        status.set_text(&format!(
+                            "Failed to open {}: {error}",
+                            message.path.display()
+                        ));
+                    }
+                }
+            }
+            glib::ControlFlow::Break
         }
-        Err(error) => {
-            buffer.set_text("");
-            status.set_text(&format!("Failed to open {}: {error}", path.display()));
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+    });
+
+    if let Err(message) = submit_job(WorkerJob::EditorLoad {
+        path: path.to_path_buf(),
+        reply: sender,
+    }) {
+        queue_error_buffer.set_text("");
+        queue_error_status.set_text(&format!(
+            "Failed to queue load for {}: {message}",
+            path.display()
+        ));
+    }
+}
+
+fn queue_editor_save(status: &Label, title: &Label, path: &Path, content: String, host_ptr: usize) {
+    status.set_text(&format!("Saving {}...", path.display()));
+    let (sender, receiver) = mpsc::channel::<EditorSaveMessage>();
+    let status = status.clone();
+    let title = title.clone();
+    let path = path.to_path_buf();
+    let queue_error_status = status.clone();
+    glib::idle_add_local(move || match receiver.try_recv() {
+        Ok(message) => {
+            match message.result {
+                Ok(()) => {
+                    status.set_text(&format!("Saved {}", message.path.display()));
+                    let title_text = editor_title_for_path(&message.path);
+                    title.set_text(&title_text);
+                    if host_ptr != 0 {
+                        let host = unsafe {
+                            HostApi::from_raw(&*(host_ptr as *const maruzzella_sdk::ffi::MzHostApi))
+                        };
+                        let mut query = maruzzella_sdk::ViewQuery::new(PLUGIN_ID, VIEW_TEXT_EDITOR);
+                        let path_key = message.path.to_string_lossy().to_string();
+                        query.instance_key = Some(&path_key);
+                        let _ = host.update_view_title(&query, &title_text);
+                    }
+                }
+                Err(error) => {
+                    status.set_text(&format!(
+                        "Failed to save {}: {error}",
+                        message.path.display()
+                    ));
+                }
+            }
+            glib::ControlFlow::Break
         }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+    });
+
+    if let Err(message) = submit_job(WorkerJob::EditorSave {
+        path: path.clone(),
+        content,
+        reply: sender,
+    }) {
+        queue_error_status.set_text(&format!(
+            "Failed to queue save for {}: {message}",
+            path.display()
+        ));
     }
 }
 
@@ -3494,10 +4218,19 @@ extern "C" fn create_operations_view(
 
 fn operation_summary_text(logs: &[String]) -> String {
     let total = logs.len();
-    let starts = logs.iter().filter(|line| line.starts_with("[START]")).count();
+    let starts = logs
+        .iter()
+        .filter(|line| line.starts_with("[START]"))
+        .count();
     let ok = logs.iter().filter(|line| line.starts_with("[OK]")).count();
-    let skipped = logs.iter().filter(|line| line.starts_with("[SKIP]")).count();
-    let failed = logs.iter().filter(|line| line.starts_with("[FAIL]")).count();
+    let skipped = logs
+        .iter()
+        .filter(|line| line.starts_with("[SKIP]"))
+        .count();
+    let failed = logs
+        .iter()
+        .filter(|line| line.starts_with("[FAIL]"))
+        .count();
     let latest = logs
         .last()
         .map(String::as_str)
