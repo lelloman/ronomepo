@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use gtk::glib::{self, translate::IntoGlibPtr};
+use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
     Align, Box as GtkBox, Button, Entry, GestureClick, Label, ListBox, ListBoxRow, Orientation,
@@ -49,6 +50,12 @@ const CMD_APPLY_HOOKS: &str = "ronomepo.workspace.apply_hooks";
 const CMD_OPEN_OVERVIEW: &str = "ronomepo.workspace.open_overview";
 const CMD_CHECK_HISTORY: &str = "ronomepo.workspace.check_history";
 const CMD_LINE_STATS: &str = "ronomepo.workspace.line_stats";
+const MONITOR_NAME_COL_CHARS: i32 = 28;
+const MONITOR_BRANCH_COL_CHARS: i32 = 14;
+const MONITOR_STATE_COL_CHARS: i32 = 12;
+const MONITOR_NAME_COL_WIDTH: i32 = 300;
+const MONITOR_BRANCH_COL_WIDTH: i32 = 120;
+const MONITOR_STATE_COL_WIDTH: i32 = 120;
 
 pub struct RonomepoPlugin;
 
@@ -105,7 +112,6 @@ impl Default for AppState {
     }
 }
 
-#[derive(Default)]
 struct RepositoryViewHandle {
     summary: glib::WeakRef<Label>,
     filter_entry: glib::WeakRef<Entry>,
@@ -1027,26 +1033,28 @@ fn render_repository_view_into(
             content.set_margin_start(10);
             content.set_margin_end(10);
 
-            let name = Label::new(Some(&item.name));
-            name.set_xalign(0.0);
-            name.add_css_class("mono");
-            name.set_hexpand(true);
-            name.set_width_chars(16);
+            let name = monitor_text_cell(
+                &item.name,
+                MONITOR_NAME_COL_CHARS,
+                MONITOR_NAME_COL_WIDTH,
+                false,
+            );
 
-            let branch = Label::new(Some(branch_label(item)));
-            branch.set_xalign(0.0);
-            branch.add_css_class("mono");
-            branch.set_width_chars(12);
+            let branch = monitor_text_cell(
+                branch_label(item),
+                MONITOR_BRANCH_COL_CHARS,
+                MONITOR_BRANCH_COL_WIDTH,
+                false,
+            );
 
-            let status = Label::new(Some(status_label(&item.status.state)));
-            status.set_xalign(0.0);
+            let status = monitor_state_cell(&item.status.state);
             status.add_css_class("pill");
-            status.set_width_chars(10);
 
             let sync = Label::new(Some(&format_sync_label(&item.status.sync)));
-            sync.set_xalign(1.0);
+            sync.set_xalign(0.0);
             sync.add_css_class("mono");
             sync.set_hexpand(true);
+            sync.set_ellipsize(EllipsizeMode::End);
 
             content.append(&name);
             content.append(&branch);
@@ -1612,24 +1620,67 @@ fn repo_monitor_header() -> GtkBox {
     let header = GtkBox::new(Orientation::Horizontal, 10);
     header.add_css_class("mono");
     header.set_margin_bottom(4);
+    let name = monitor_text_cell("Name", MONITOR_NAME_COL_CHARS, MONITOR_NAME_COL_WIDTH, false);
+    let branch = monitor_text_cell(
+        "Branch",
+        MONITOR_BRANCH_COL_CHARS,
+        MONITOR_BRANCH_COL_WIDTH,
+        false,
+    );
+    let state = monitor_text_cell(
+        "State",
+        MONITOR_STATE_COL_CHARS,
+        MONITOR_STATE_COL_WIDTH,
+        false,
+    );
+    let sync = Label::new(Some("Sync"));
+    sync.set_xalign(0.0);
+    sync.set_hexpand(true);
+    sync.set_ellipsize(EllipsizeMode::End);
 
-    for (title, width, expand) in [
-        ("Name", 16, false),
-        ("Branch", 12, false),
-        ("State", 10, false),
-        ("Sync", 0, true),
-    ] {
-        let label = Label::new(Some(title));
-        label.set_xalign(0.0);
-        if width > 0 {
-            label.set_width_chars(width);
-        }
-        label.set_hexpand(expand);
+    for label in [&name, &branch, &state, &sync] {
         label.add_css_class("dim-label");
-        header.append(&label);
+        header.append(label);
     }
 
     header
+}
+
+fn monitor_text_cell(text: &str, width_chars: i32, width_px: i32, expand: bool) -> Label {
+    let label = Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.add_css_class("mono");
+    label.set_width_chars(width_chars);
+    label.set_max_width_chars(width_chars);
+    label.set_size_request(width_px, -1);
+    label.set_ellipsize(EllipsizeMode::End);
+    label.set_hexpand(expand);
+    label
+}
+
+fn monitor_state_cell(state: &ronomepo_core::RepositoryState) -> Label {
+    let label = monitor_text_cell(
+        status_label(state),
+        MONITOR_STATE_COL_CHARS,
+        MONITOR_STATE_COL_WIDTH,
+        false,
+    );
+    let escaped = glib::markup_escape_text(status_label(state));
+    label.set_markup(&format!(
+        "<span foreground=\"{}\">{escaped}</span>",
+        state_color(state)
+    ));
+    label
+}
+
+fn state_color(state: &ronomepo_core::RepositoryState) -> &'static str {
+    match state {
+        ronomepo_core::RepositoryState::Clean => "#7fdc8a",
+        ronomepo_core::RepositoryState::Missing => "#ff6b6b",
+        ronomepo_core::RepositoryState::Dirty
+        | ronomepo_core::RepositoryState::Untracked
+        | ronomepo_core::RepositoryState::Unknown => "#ff8e5f",
+    }
 }
 
 fn repo_monitor_actions(host_ptr: *const maruzzella_sdk::ffi::MzHostApi) -> GtkBox {
