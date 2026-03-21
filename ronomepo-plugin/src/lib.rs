@@ -997,6 +997,8 @@ fn queue_line_stats_report_from_state() -> Result<(), String> {
 fn append_log(message: String) {
     let mut app_state = state().lock().expect("state mutex poisoned");
     app_state.logs.push(message);
+    drop(app_state);
+    refresh_log_surfaces();
 }
 
 fn launch_operation(kind: OperationKind) {
@@ -1068,9 +1070,9 @@ fn handle_operation_event(batch_id: usize, manifest: WorkspaceManifest, event: O
     match event.kind {
         OperationEventKind::Success | OperationEventKind::Skipped | OperationEventKind::Failed => {
             schedule_refresh_for_operation_event(&manifest, &event);
-            refresh_views();
+            refresh_overview_views(&snapshot());
         }
-        OperationEventKind::Finished | OperationEventKind::Started => refresh_views(),
+        OperationEventKind::Finished | OperationEventKind::Started => {}
     }
 }
 
@@ -1236,6 +1238,13 @@ fn schedule_refresh_for_operation_event(manifest: &WorkspaceManifest, event: &Op
 
 fn refresh_views() {
     let snapshot = snapshot();
+    refresh_repository_views(&snapshot);
+    refresh_overview_views(&snapshot);
+    refresh_workspace_settings_views(&snapshot);
+    refresh_operation_views(&snapshot);
+}
+
+fn refresh_repository_views(snapshot: &StateSnapshot) {
     REPOSITORY_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
         views.retain(|handle| {
@@ -1262,7 +1271,9 @@ fn refresh_views() {
             true
         });
     });
+}
 
+fn refresh_overview_views(snapshot: &StateSnapshot) {
     MONOREPO_OVERVIEWS.with(|views| {
         let mut views = views.borrow_mut();
         views.retain(|handle| match handle.root.upgrade() {
@@ -1289,7 +1300,9 @@ fn refresh_views() {
             None => false,
         });
     });
+}
 
+fn refresh_workspace_settings_views(snapshot: &StateSnapshot) {
     WORKSPACE_SETTINGS_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
         views.retain(|handle| match handle.root.upgrade() {
@@ -1300,7 +1313,9 @@ fn refresh_views() {
             None => false,
         });
     });
+}
 
+fn refresh_operation_views(snapshot: &StateSnapshot) {
     OPERATION_BUFFERS.with(|buffers| {
         let mut buffers = buffers.borrow_mut();
         buffers.retain(|buffer_ref| match buffer_ref.upgrade() {
@@ -1322,6 +1337,12 @@ fn refresh_views() {
             None => false,
         });
     });
+}
+
+fn refresh_log_surfaces() {
+    let snapshot = snapshot();
+    refresh_overview_views(&snapshot);
+    refresh_operation_views(&snapshot);
 }
 
 fn remember_host_ptr(host: *const maruzzella_sdk::ffi::MzHostApi) {
