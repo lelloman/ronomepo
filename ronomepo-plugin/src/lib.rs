@@ -1,7 +1,9 @@
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -9,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, SystemTime};
 
 use gtk::gio;
 use gtk::glib::{self, translate::IntoGlibPtr, BoxedAnyObject};
@@ -25,6 +28,7 @@ use maruzzella_sdk::{
     MzViewOpenDisposition, MzViewPlacement, OpenViewRequest, Plugin, PluginDependency,
     PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
 };
+use notify::{Config as NotifyConfig, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use ronomepo_core::{
     build_repository_list, collect_generated_history_matches, collect_repository_details,
     collect_workspace_line_stats, default_manifest_path, derive_dir_name, format_sync_label,
@@ -60,6 +64,12 @@ const MONITOR_NAME_COL_WIDTH: i32 = 300;
 const MONITOR_BRANCH_COL_WIDTH: i32 = 120;
 const MONITOR_STATE_COL_WIDTH: i32 = 120;
 const WORKER_POOL_SIZE: usize = 4;
+const LOCAL_RESCAN_INTERVAL_SECS: u32 = 20;
+const REMOTE_FETCH_TICK_SECS: u32 = 30;
+const REMOTE_FETCH_INTERVAL_SECS: u64 = 60 * 60;
+const REMOTE_FETCH_JITTER_SECS: u64 = 30 * 60;
+const REMOTE_FETCH_CONCURRENCY: usize = 1;
+const WATCH_POLL_FALLBACK_SECS: u64 = 15;
 
 pub struct RonomepoPlugin;
 
@@ -91,6 +101,7 @@ struct AppState {
     line_stats_report: Vec<String>,
     line_stats_loading: bool,
     line_stats_since: String,
+    repo_runtime: HashMap<String, RepoRuntimeState>,
 }
 
 impl Default for AppState {
@@ -116,8 +127,49 @@ impl Default for AppState {
             line_stats_report: Vec::new(),
             line_stats_loading: false,
             line_stats_since: String::new(),
+            repo_runtime: HashMap::new(),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct RepoRuntimeState {
+    invalidation_seq: u64,
+    scheduled_scan_seq: u64,
+    last_scanned_seq: u64,
+    local_refresh_in_flight: bool,
+    remote_fetch_in_flight: bool,
+    last_local_scan_at: Option<SystemTime>,
+    last_fetch_at: Option<SystemTime>,
+    next_fetch_due_at: SystemTime,
+}
+
+impl RepoRuntimeState {
+    fn new(now: SystemTime, repo_id: &str) -> Self {
+        Self {
+            invalidation_seq: 0,
+            scheduled_scan_seq: 0,
+            last_scanned_seq: 0,
+            local_refresh_in_flight: false,
+            remote_fetch_in_flight: false,
+            last_local_scan_at: None,
+            last_fetch_at: None,
+            next_fetch_due_at: next_remote_fetch_due_at(now, repo_id),
+        }
+    }
+
+    fn needs_rescan(&self) -> bool {
+        self.invalidation_seq > self.last_scanned_seq
+    }
+}
+
+enum WatchBackend {
+    Recommended(RecommendedWatcher),
+    Poll(PollWatcher),
+}
+
+struct WatchManager {
+    _backend: WatchBackend,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -125,6 +177,7 @@ enum JobKey {
     WorkspaceScan,
     WorkspaceRootStatus,
     RepoStatus(String),
+    RepoFetch(String),
     RepoDetails(String),
     HistoryReport,
     LineStats(Option<String>),
@@ -156,6 +209,11 @@ enum WorkerJob {
     },
     RepositoryStatusRefresh {
         repo_id: String,
+        repo_path: PathBuf,
+    },
+    RepositoryRemoteFetch {
+        repo_id: String,
+        repo_name: String,
         repo_path: PathBuf,
     },
     RepoDetailsLoad {
@@ -209,6 +267,11 @@ enum WorkerResult {
     RepositoryStatusRefreshed {
         repo_id: String,
         status: RepositoryStatus,
+    },
+    RepositoryRemoteFetchCompleted {
+        repo_id: String,
+        repo_name: String,
+        result: Result<(), String>,
     },
     RepoDetailsLoaded {
         repo_id: String,
@@ -311,7 +374,9 @@ thread_local! {
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
 static EXECUTOR: OnceLock<ExecutorState> = OnceLock::new();
+static WATCH_MANAGER: OnceLock<Mutex<Option<WatchManager>>> = OnceLock::new();
 static LAST_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
+static BACKGROUND_LOOPS_STARTED: AtomicUsize = AtomicUsize::new(0);
 
 fn state() -> &'static Mutex<AppState> {
     STATE.get_or_init(|| Mutex::new(AppState::default()))
@@ -333,6 +398,10 @@ fn executor() -> &'static ExecutorState {
             in_flight: Mutex::new(HashSet::new()),
         }
     })
+}
+
+fn watch_manager() -> &'static Mutex<Option<WatchManager>> {
+    WATCH_MANAGER.get_or_init(|| Mutex::new(None))
 }
 
 fn submit_job(job: WorkerJob) -> Result<(), String> {
@@ -415,6 +484,18 @@ fn run_worker_job(queued_job: QueuedJob) {
         WorkerJob::RepositoryStatusRefresh { repo_id, repo_path } => {
             let status = ronomepo_core::collect_repository_status(&repo_path);
             dispatch_worker_result(WorkerResult::RepositoryStatusRefreshed { repo_id, status });
+        }
+        WorkerJob::RepositoryRemoteFetch {
+            repo_id,
+            repo_name,
+            repo_path,
+        } => {
+            let result = fetch_repository_remote(&repo_path);
+            dispatch_worker_result(WorkerResult::RepositoryRemoteFetchCompleted {
+                repo_id,
+                repo_name,
+                result,
+            });
         }
         WorkerJob::RepoDetailsLoad { repo_id, repo_path } => {
             let details = collect_repository_details(&repo_path);
@@ -510,6 +591,40 @@ fn empty_repository_status(repo_path: PathBuf) -> ronomepo_core::RepositoryStatu
         sync: ronomepo_core::RepositorySync::Unknown,
         repo_path,
     }
+}
+
+fn next_remote_fetch_due_at(now: SystemTime, repo_id: &str) -> SystemTime {
+    let jitter = Duration::from_secs(repo_fetch_jitter_secs(repo_id));
+    now + Duration::from_secs(REMOTE_FETCH_INTERVAL_SECS) + jitter
+}
+
+fn retry_remote_fetch_due_at(now: SystemTime, repo_id: &str) -> SystemTime {
+    let capped = repo_fetch_jitter_secs(repo_id).min(REMOTE_FETCH_INTERVAL_SECS / 4);
+    now + Duration::from_secs((REMOTE_FETCH_INTERVAL_SECS / 4) + capped)
+}
+
+fn repo_fetch_jitter_secs(repo_id: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    repo_id.hash(&mut hasher);
+    hasher.finish() % (REMOTE_FETCH_JITTER_SECS + 1)
+}
+
+fn ensure_background_loops_started() {
+    if BACKGROUND_LOOPS_STARTED
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    glib::timeout_add_seconds_local(LOCAL_RESCAN_INTERVAL_SECS, || {
+        schedule_pending_local_rescans();
+        glib::ControlFlow::Continue
+    });
+    glib::timeout_add_seconds_local(REMOTE_FETCH_TICK_SECS, || {
+        schedule_due_remote_fetches();
+        glib::ControlFlow::Continue
+    });
 }
 
 impl Plugin for RonomepoPlugin {
@@ -725,6 +840,8 @@ fn ensure_config(host: &HostApi<'_>) -> Result<RonomepoPluginConfig, MzStatusCod
 }
 
 fn initialize_state(config: &RonomepoPluginConfig) {
+    ensure_background_loops_started();
+
     let workspace_root = env::var_os("RONOMEPO_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
@@ -744,6 +861,7 @@ fn initialize_state(config: &RonomepoPluginConfig) {
     app_state.repository_items_refresh_pending = false;
     app_state.repo_details_cache.clear();
     app_state.repo_details_loading.clear();
+    sync_repo_runtime_state(&mut app_state);
     if app_state.logs.is_empty() {
         app_state.logs.push(format!(
             "Ronomepo initialized for workspace {}",
@@ -751,6 +869,7 @@ fn initialize_state(config: &RonomepoPluginConfig) {
         ));
     }
     drop(app_state);
+    sync_watch_manager_from_state();
     schedule_workspace_scan();
 }
 
@@ -1072,7 +1191,10 @@ fn handle_operation_event(batch_id: usize, manifest: WorkspaceManifest, event: O
             schedule_refresh_for_operation_event(&manifest, &event);
             refresh_overview_views(&snapshot());
         }
-        OperationEventKind::Finished | OperationEventKind::Started => {}
+        OperationEventKind::Finished => {
+            sync_watch_manager_from_state();
+        }
+        OperationEventKind::Started => {}
     }
 }
 
@@ -1084,6 +1206,7 @@ fn handle_worker_result(result: WorkerResult) {
         } => {
             let rerun = {
                 let mut app_state = state().lock().expect("state mutex poisoned");
+                mark_full_workspace_scan_completed(&mut app_state, &repository_items);
                 app_state.workspace_status = workspace_status;
                 app_state.repository_items = repository_items;
                 app_state.repository_items_loading = false;
@@ -1091,6 +1214,7 @@ fn handle_worker_result(result: WorkerResult) {
                 app_state.repository_items_refresh_pending = false;
                 rerun
             };
+            sync_watch_manager_from_state();
             if rerun {
                 schedule_workspace_scan();
             }
@@ -1106,6 +1230,7 @@ fn handle_worker_result(result: WorkerResult) {
         WorkerResult::RepositoryStatusRefreshed { repo_id, status } => {
             {
                 let mut app_state = state().lock().expect("state mutex poisoned");
+                mark_repo_scan_completed(&mut app_state, &repo_id);
                 if let Some(item) = app_state
                     .repository_items
                     .iter_mut()
@@ -1114,6 +1239,35 @@ fn handle_worker_result(result: WorkerResult) {
                     item.status = status;
                 }
             }
+            refresh_views();
+        }
+        WorkerResult::RepositoryRemoteFetchCompleted {
+            repo_id,
+            repo_name,
+            result,
+        } => {
+            let mut refresh_path = None;
+            let message = match result {
+                Ok(()) => {
+                    let mut app_state = state().lock().expect("state mutex poisoned");
+                    mark_remote_fetch_completed(&mut app_state, &repo_id, true);
+                    refresh_path = app_state
+                        .repository_items
+                        .iter()
+                        .find(|item| item.id == repo_id)
+                        .map(|item| item.status.repo_path.clone());
+                    format!("Remote sync refreshed for {repo_name}.")
+                }
+                Err(error) => {
+                    let mut app_state = state().lock().expect("state mutex poisoned");
+                    mark_remote_fetch_completed(&mut app_state, &repo_id, false);
+                    format!("Remote sync refresh failed for {repo_name}: {error}")
+                }
+            };
+            if let Some(repo_path) = refresh_path {
+                schedule_repository_status_refresh(&repo_id, repo_path);
+            }
+            append_log(message);
             refresh_views();
         }
         WorkerResult::RepoDetailsLoaded { repo_id, details } => {
@@ -1824,6 +1978,170 @@ fn open_repo_overviews(host_ptr: *const maruzzella_sdk::ffi::MzHostApi, repo_ids
     refresh_views();
 }
 
+fn sync_repo_runtime_state(app_state: &mut AppState) {
+    let now = SystemTime::now();
+    let expected_ids = app_state
+        .manifest
+        .as_ref()
+        .map(|manifest| {
+            manifest
+                .repos
+                .iter()
+                .map(|repo| repo.id.clone())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+
+    app_state
+        .repo_runtime
+        .retain(|repo_id, _| expected_ids.contains(repo_id));
+
+    for repo_id in expected_ids {
+        app_state
+            .repo_runtime
+            .entry(repo_id.clone())
+            .or_insert_with(|| RepoRuntimeState::new(now, &repo_id));
+    }
+}
+
+fn mark_full_workspace_scan_completed(
+    app_state: &mut AppState,
+    repository_items: &[RepositoryListItem],
+) {
+    let now = SystemTime::now();
+    for item in repository_items {
+        let runtime = app_state
+            .repo_runtime
+            .entry(item.id.clone())
+            .or_insert_with(|| RepoRuntimeState::new(now, &item.id));
+        runtime.last_scanned_seq = runtime.invalidation_seq;
+        runtime.scheduled_scan_seq = runtime.invalidation_seq;
+        runtime.local_refresh_in_flight = false;
+        runtime.last_local_scan_at = Some(now);
+    }
+}
+
+fn mark_repo_scan_completed(app_state: &mut AppState, repo_id: &str) {
+    let now = SystemTime::now();
+    let runtime = app_state
+        .repo_runtime
+        .entry(repo_id.to_string())
+        .or_insert_with(|| RepoRuntimeState::new(now, repo_id));
+    runtime.local_refresh_in_flight = false;
+    runtime.last_scanned_seq = runtime.last_scanned_seq.max(runtime.scheduled_scan_seq);
+    runtime.last_local_scan_at = Some(now);
+}
+
+fn mark_remote_fetch_completed(app_state: &mut AppState, repo_id: &str, success: bool) {
+    let now = SystemTime::now();
+    let runtime = app_state
+        .repo_runtime
+        .entry(repo_id.to_string())
+        .or_insert_with(|| RepoRuntimeState::new(now, repo_id));
+    runtime.remote_fetch_in_flight = false;
+    if success {
+        runtime.last_fetch_at = Some(now);
+        runtime.next_fetch_due_at = next_remote_fetch_due_at(now, repo_id);
+    } else {
+        runtime.next_fetch_due_at = retry_remote_fetch_due_at(now, repo_id);
+    }
+}
+
+fn mark_repo_stale(app_state: &mut AppState, repo_id: &str) {
+    let now = SystemTime::now();
+    let runtime = app_state
+        .repo_runtime
+        .entry(repo_id.to_string())
+        .or_insert_with(|| RepoRuntimeState::new(now, repo_id));
+    runtime.invalidation_seq = runtime.invalidation_seq.saturating_add(1);
+}
+
+fn schedule_pending_local_rescans() {
+    let scheduled = {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        let items = app_state
+            .repository_items
+            .iter()
+            .map(|item| (item.id.clone(), item.status.repo_path.clone()))
+            .collect::<Vec<_>>();
+        items
+            .into_iter()
+            .filter_map(|(repo_id, repo_path)| {
+                let runtime = app_state.repo_runtime.get_mut(&repo_id)?;
+                if runtime.local_refresh_in_flight || !runtime.needs_rescan() {
+                    return None;
+                }
+                runtime.local_refresh_in_flight = true;
+                runtime.scheduled_scan_seq = runtime.invalidation_seq;
+                Some((repo_id, repo_path))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (repo_id, repo_path) in scheduled {
+        schedule_repository_status_refresh(&repo_id, repo_path);
+    }
+}
+
+fn schedule_due_remote_fetches() {
+    let scheduled = {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        let inflight = app_state
+            .repo_runtime
+            .values()
+            .filter(|runtime| runtime.remote_fetch_in_flight)
+            .count();
+        let capacity = REMOTE_FETCH_CONCURRENCY.saturating_sub(inflight);
+        if capacity == 0 {
+            Vec::new()
+        } else {
+            let now = SystemTime::now();
+            let items = app_state
+                .repository_items
+                .iter()
+                .map(|item| {
+                    (
+                        item.id.clone(),
+                        item.name.clone(),
+                        item.status.repo_path.clone(),
+                        item.status.state.clone(),
+                        item.status.sync.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut due = items
+                .into_iter()
+                .filter_map(|(repo_id, repo_name, repo_path, state, sync)| {
+                    if matches!(state, ronomepo_core::RepositoryState::Missing)
+                        || matches!(
+                            sync,
+                            ronomepo_core::RepositorySync::NoUpstream
+                                | ronomepo_core::RepositorySync::Unknown
+                        )
+                    {
+                        return None;
+                    }
+                    let runtime = app_state.repo_runtime.get_mut(&repo_id)?;
+                    if runtime.remote_fetch_in_flight || runtime.next_fetch_due_at > now {
+                        return None;
+                    }
+                    runtime.remote_fetch_in_flight = true;
+                    Some((repo_id, repo_name, repo_path, runtime.next_fetch_due_at))
+                })
+                .collect::<Vec<_>>();
+            due.sort_by_key(|(_, _, _, due_at)| *due_at);
+            due.truncate(capacity);
+            due.into_iter()
+                .map(|(repo_id, repo_name, repo_path, _)| (repo_id, repo_name, repo_path))
+                .collect()
+        }
+    };
+
+    for (repo_id, repo_name, repo_path) in scheduled {
+        schedule_repository_remote_fetch(&repo_id, &repo_name, repo_path);
+    }
+}
+
 fn schedule_workspace_scan() {
     let (workspace_root, manifest) = {
         let mut app_state = state().lock().expect("state mutex poisoned");
@@ -1862,14 +2180,56 @@ fn schedule_workspace_root_status_refresh(workspace_root: PathBuf) {
 
 fn schedule_repository_status_refresh(repo_id: &str, repo_path: PathBuf) {
     let repo_id = repo_id.to_string();
-    if let Err(message) = submit_coalesced_job(
+    match submit_coalesced_job(
         JobKey::RepoStatus(repo_id.clone()),
-        WorkerJob::RepositoryStatusRefresh { repo_id, repo_path },
+        WorkerJob::RepositoryStatusRefresh {
+            repo_id: repo_id.clone(),
+            repo_path,
+        },
     ) {
-        append_log(format!(
-            "Repository status refresh failed to start: {message}"
-        ));
-        refresh_views();
+        Ok(true) => {}
+        Ok(false) => {}
+        Err(message) => {
+            let mut app_state = state().lock().expect("state mutex poisoned");
+            if let Some(runtime) = app_state.repo_runtime.get_mut(&repo_id) {
+                runtime.local_refresh_in_flight = false;
+            }
+            drop(app_state);
+            append_log(format!(
+                "Repository status refresh failed to start: {message}"
+            ));
+            refresh_views();
+        }
+    }
+}
+
+fn schedule_repository_remote_fetch(repo_id: &str, repo_name: &str, repo_path: PathBuf) {
+    let repo_id = repo_id.to_string();
+    let repo_name = repo_name.to_string();
+    match submit_coalesced_job(
+        JobKey::RepoFetch(repo_id.clone()),
+        WorkerJob::RepositoryRemoteFetch {
+            repo_id: repo_id.clone(),
+            repo_name,
+            repo_path,
+        },
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            let mut app_state = state().lock().expect("state mutex poisoned");
+            if let Some(runtime) = app_state.repo_runtime.get_mut(&repo_id) {
+                runtime.remote_fetch_in_flight = false;
+            }
+        }
+        Err(message) => {
+            let mut app_state = state().lock().expect("state mutex poisoned");
+            if let Some(runtime) = app_state.repo_runtime.get_mut(&repo_id) {
+                runtime.remote_fetch_in_flight = false;
+            }
+            drop(app_state);
+            append_log(format!("Remote sync refresh failed to start: {message}"));
+            refresh_views();
+        }
     }
 }
 
@@ -1905,6 +2265,153 @@ fn schedule_repo_details_load(repo_id: &str, repo_path: &Path) {
             "Repository details load failed to start: {message}"
         ));
         refresh_views();
+    }
+}
+
+fn sync_watch_manager_from_state() {
+    let manifest = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        app_state.manifest.clone()
+    };
+
+    let mut manager = watch_manager()
+        .lock()
+        .expect("watch manager mutex poisoned");
+    *manager = match manifest {
+        Some(manifest) => match build_watch_manager(&manifest) {
+            Ok(manager) => Some(manager),
+            Err(message) => {
+                append_log(format!("Repository watcher setup failed: {message}"));
+                None
+            }
+        },
+        None => None,
+    };
+}
+
+fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, String> {
+    let repos = manifest
+        .repos
+        .iter()
+        .map(|repo| (repo.id.clone(), manifest.root.join(&repo.dir_name)))
+        .filter(|(_, path)| path.exists())
+        .collect::<Vec<_>>();
+
+    if repos.is_empty() {
+        return Err("no local repositories are available to watch".to_string());
+    }
+
+    let mut backend = create_watch_backend()?;
+    for (_, path) in &repos {
+        watch_backend_mut(&mut backend)
+            .watch(path, RecursiveMode::Recursive)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+
+    Ok(WatchManager { _backend: backend })
+}
+
+fn create_watch_backend() -> Result<WatchBackend, String> {
+    let config = NotifyConfig::default();
+    match RecommendedWatcher::new(dispatch_watch_event_result, config) {
+        Ok(watcher) => Ok(WatchBackend::Recommended(watcher)),
+        Err(_) => PollWatcher::new(
+            dispatch_watch_event_result,
+            config.with_poll_interval(Duration::from_secs(WATCH_POLL_FALLBACK_SECS)),
+        )
+        .map(WatchBackend::Poll)
+        .map_err(|error| error.to_string()),
+    }
+}
+
+fn watch_backend_mut(backend: &mut WatchBackend) -> &mut dyn Watcher {
+    match backend {
+        WatchBackend::Recommended(watcher) => watcher,
+        WatchBackend::Poll(watcher) => watcher,
+    }
+}
+
+fn dispatch_watch_event_result(event: notify::Result<notify::Event>) {
+    let main_context = glib::MainContext::default();
+    match event {
+        Ok(event) => {
+            if event.paths.is_empty() {
+                return;
+            }
+            let paths = event.paths;
+            main_context.invoke(move || handle_watch_paths(paths));
+        }
+        Err(error) => {
+            let message = error.to_string();
+            main_context.invoke(move || append_log(format!("Repository watcher error: {message}")));
+        }
+    }
+}
+
+fn handle_watch_paths(paths: Vec<PathBuf>) {
+    let mut touched = HashSet::new();
+    let mut app_state = state().lock().expect("state mutex poisoned");
+    let Some(manifest) = app_state.manifest.clone() else {
+        return;
+    };
+
+    for path in paths {
+        if let Some(repo_id) = repo_id_for_watch_path(&manifest, &path) {
+            touched.insert(repo_id);
+        }
+    }
+
+    for repo_id in touched {
+        mark_repo_stale(&mut app_state, &repo_id);
+    }
+}
+
+fn repo_id_for_watch_path(manifest: &WorkspaceManifest, path: &Path) -> Option<String> {
+    let mut matches = manifest
+        .repos
+        .iter()
+        .filter_map(|repo| {
+            let repo_root = manifest.root.join(&repo.dir_name);
+            let relative = path.strip_prefix(&repo_root).ok()?;
+            if !watch_path_is_relevant(relative) {
+                return None;
+            }
+            Some((repo.id.clone(), repo_root.components().count()))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(_, depth)| *depth);
+    matches.pop().map(|(repo_id, _)| repo_id)
+}
+
+fn watch_path_is_relevant(relative: &Path) -> bool {
+    let path_text = relative.to_string_lossy();
+    if path_text.starts_with(".git/objects") || path_text.starts_with(".git/lfs") {
+        return false;
+    }
+    if path_text.ends_with(".swp")
+        || path_text.ends_with(".swx")
+        || path_text.ends_with('~')
+        || path_text.ends_with(".tmp")
+    {
+        return false;
+    }
+    true
+}
+
+fn fetch_repository_remote(repo_path: &Path) -> Result<(), String> {
+    if !repo_path.exists() {
+        return Err(format!("{} is missing locally", repo_path.display()));
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["fetch", "--quiet", "--all", "--prune"])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
 }
 
@@ -3153,7 +3660,9 @@ fn apply_loaded_manifest(
     app_state.repository_items_refresh_pending = false;
     app_state.repo_details_cache.clear();
     app_state.repo_details_loading.clear();
+    sync_repo_runtime_state(&mut app_state);
     drop(app_state);
+    sync_watch_manager_from_state();
     schedule_workspace_scan();
 }
 
@@ -3164,7 +3673,9 @@ fn apply_imported_manifest(manifest_path: PathBuf, manifest: WorkspaceManifest) 
     app_state.repository_items_refresh_pending = false;
     app_state.repo_details_cache.clear();
     app_state.repo_details_loading.clear();
+    sync_repo_runtime_state(&mut app_state);
     drop(app_state);
+    sync_watch_manager_from_state();
     schedule_workspace_scan();
 }
 
@@ -3191,9 +3702,11 @@ fn apply_saved_manifest(
         {
             app_state.active_repo_id = None;
         }
+        sync_repo_runtime_state(&mut app_state);
     }
 
     persist_last_workspace_path(host_ptr as *const _, &workspace_root);
+    sync_watch_manager_from_state();
     schedule_workspace_scan();
 }
 
@@ -4386,6 +4899,7 @@ fn workspace_name_from_root(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn descriptor_uses_expected_plugin_id() {
@@ -4393,6 +4907,32 @@ mod tests {
         assert_eq!(descriptor.id, PLUGIN_ID);
         assert_eq!(descriptor.dependencies.len(), 1);
         assert_eq!(descriptor.dependencies[0].plugin_id, "maruzzella.base");
+    }
+
+    #[test]
+    fn fetch_jitter_is_stable_and_bounded() {
+        let first = repo_fetch_jitter_secs("repo-a");
+        let second = repo_fetch_jitter_secs("repo-a");
+        let other = repo_fetch_jitter_secs("repo-b");
+        assert_eq!(first, second);
+        assert!(first <= REMOTE_FETCH_JITTER_SECS);
+        assert!(other <= REMOTE_FETCH_JITTER_SECS);
+    }
+
+    #[test]
+    fn retry_due_at_is_earlier_than_full_interval() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let retry = retry_remote_fetch_due_at(now, "repo-a");
+        let full = next_remote_fetch_due_at(now, "repo-a");
+        assert!(retry < full);
+    }
+
+    #[test]
+    fn watch_filter_ignores_git_objects_and_editor_noise() {
+        assert!(!watch_path_is_relevant(Path::new(".git/objects/ab/cd")));
+        assert!(!watch_path_is_relevant(Path::new("src/lib.rs.swp")));
+        assert!(watch_path_is_relevant(Path::new(".git/HEAD")));
+        assert!(watch_path_is_relevant(Path::new("src/lib.rs")));
     }
 }
 
