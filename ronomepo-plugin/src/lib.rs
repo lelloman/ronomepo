@@ -110,6 +110,7 @@ struct RepositoryViewHandle {
     summary: glib::WeakRef<Label>,
     filter_entry: glib::WeakRef<Entry>,
     list: glib::WeakRef<ListBox>,
+    scroller: glib::WeakRef<ScrolledWindow>,
     host_ptr: usize,
 }
 
@@ -787,10 +788,19 @@ fn refresh_views() {
             let Some(list) = handle.list.upgrade() else {
                 return false;
             };
+            let Some(scroller) = handle.scroller.upgrade() else {
+                return false;
+            };
             if filter_entry.text().as_str() != snapshot.monitor_filter {
                 filter_entry.set_text(&snapshot.monitor_filter);
             }
-            render_repository_view_into(&summary, &list, &snapshot, handle.host_ptr as *const _);
+            render_repository_view_into(
+                &summary,
+                &list,
+                &scroller,
+                &snapshot,
+                handle.host_ptr as *const _,
+            );
             true
         });
     });
@@ -939,10 +949,12 @@ fn snapshot() -> StateSnapshot {
 fn render_repository_view_into(
     summary_label: &Label,
     list: &ListBox,
+    scroller: &ScrolledWindow,
     snapshot: &StateSnapshot,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
     let filtered_items = visible_monitor_items(snapshot);
+    let reset_scroll_to_top = snapshot.selected_repo_ids.is_empty();
     let summary = workspace_summary(
         snapshot.manifest.as_ref(),
         snapshot.manifest_path.as_deref(),
@@ -1001,6 +1013,9 @@ fn render_repository_view_into(
 
     while let Some(child) = list.first_child() {
         list.remove(&child);
+    }
+    if reset_scroll_to_top {
+        list.unselect_all();
     }
 
     if !filtered_items.is_empty() {
@@ -1085,6 +1100,13 @@ fn render_repository_view_into(
         row.set_child(Some(&empty));
         list.append(&row);
     }
+
+    {
+        let scroller = scroller.clone();
+        glib::idle_add_local_once(move || {
+            scroller.vadjustment().set_value(0.0);
+        });
+    }
 }
 
 fn status_label(state: &ronomepo_core::RepositoryState) -> &'static str {
@@ -1155,7 +1177,7 @@ fn filtered_repository_items(
 }
 
 fn repo_monitor_sort_key(item: &RepositoryListItem) -> (u8, String) {
-    (repo_attention_rank(item), item.name.to_ascii_lowercase())
+    (u8::from(item.id == MONOREPO_ROW_ID), item.name.to_ascii_lowercase())
 }
 
 fn repo_requires_attention(item: &RepositoryListItem) -> bool {
@@ -1485,11 +1507,14 @@ extern "C" fn create_repo_monitor_view(
 
     remember_host_ptr(host);
 
-    let root = GtkBox::new(Orientation::Vertical, 12);
-    root.set_margin_top(18);
-    root.set_margin_bottom(18);
-    root.set_margin_start(18);
-    root.set_margin_end(18);
+    let content = GtkBox::new(Orientation::Vertical, 12);
+    content.set_hexpand(true);
+    content.set_valign(Align::Fill);
+    content.set_vexpand(true);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
 
     let title = Label::new(Some("Repository Monitor"));
     title.set_xalign(0.0);
@@ -1518,6 +1543,8 @@ extern "C" fn create_repo_monitor_view(
 
     let list = ListBox::new();
     list.add_css_class("boxed-list");
+    list.set_hexpand(true);
+    list.set_valign(Align::Start);
     list.set_selection_mode(SelectionMode::Multiple);
     list.connect_selected_rows_changed(|list| {
         update_selected_repo_ids(selection_ids_from_list(list));
@@ -1539,20 +1566,23 @@ extern "C" fn create_repo_monitor_view(
         .vexpand(true)
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .child(&list)
+        .min_content_height(0)
+        .child(&content)
         .build();
+    scroller.set_valign(Align::Fill);
+    scroller.set_propagate_natural_height(false);
 
-    root.append(&title);
-    root.append(&summary);
-    root.append(&filter_entry);
-    root.append(&show_all);
-    root.append(&monitor_actions);
-    root.append(&Separator::new(Orientation::Horizontal));
-    root.append(&repo_monitor_header());
-    root.append(&scroller);
+    content.append(&title);
+    content.append(&summary);
+    content.append(&filter_entry);
+    content.append(&show_all);
+    content.append(&monitor_actions);
+    content.append(&Separator::new(Orientation::Horizontal));
+    content.append(&repo_monitor_header());
+    content.append(&list);
 
     let snapshot = snapshot();
-    render_repository_view_into(&summary, &list, &snapshot, host);
+    render_repository_view_into(&summary, &list, &scroller, &snapshot, host);
 
     let summary_ref = glib::WeakRef::new();
     summary_ref.set(Some(&summary));
@@ -1560,17 +1590,20 @@ extern "C" fn create_repo_monitor_view(
     filter_ref.set(Some(&filter_entry));
     let list_ref = glib::WeakRef::new();
     list_ref.set(Some(&list));
+    let scroller_ref = glib::WeakRef::new();
+    scroller_ref.set(Some(&scroller));
     REPOSITORY_VIEWS.with(|views| {
         views.borrow_mut().push(RepositoryViewHandle {
             summary: summary_ref,
             filter_entry: filter_ref,
             list: list_ref,
+            scroller: scroller_ref,
             host_ptr: host as usize,
         });
     });
 
     unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
             as *mut std::ffi::c_void
     }
 }
@@ -1695,6 +1728,17 @@ extern "C" fn create_monorepo_overview_view(
     root.set_margin_start(24);
     root.set_margin_end(24);
 
+    let scroller = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(0)
+        .child(&root)
+        .build();
+    scroller.set_valign(Align::Fill);
+    scroller.set_propagate_natural_height(false);
+
     let snapshot = snapshot();
     render_monorepo_overview_into(&root, &snapshot, host);
 
@@ -1709,7 +1753,7 @@ extern "C" fn create_monorepo_overview_view(
     });
 
     unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
             as *mut std::ffi::c_void
     }
 }
@@ -1897,6 +1941,17 @@ extern "C" fn create_repo_overview_view(
     root.set_margin_start(24);
     root.set_margin_end(24);
 
+    let scroller = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(0)
+        .child(&root)
+        .build();
+    scroller.set_valign(Align::Fill);
+    scroller.set_propagate_natural_height(false);
+
     let instance_key = unsafe { request.as_ref() }
         .and_then(|request| decode_mzstr(request.instance_key));
     let snapshot = snapshot();
@@ -1913,7 +1968,7 @@ extern "C" fn create_repo_overview_view(
     });
 
     unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
             as *mut std::ffi::c_void
     }
 }
