@@ -2,7 +2,12 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+use gtk::gdk;
 use gtk::gio::prelude::ApplicationExtManual;
+use gtk::prelude::ApplicationExt;
+use gtk::{
+    style_context_add_provider_for_display, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION,
+};
 use maruzzella::{
     build_application, default_product_spec, load_static_plugin, plugin_tab, BottomPanelLayout,
     CommandSpec, MaruzzellaConfig, MenuRootSpec, TabGroupSpec, ThemeSpec, ToolbarItemSpec,
@@ -13,9 +18,8 @@ use ronomepo_core::normalize_workspace_root;
 fn main() {
     reset_stale_persisted_layout();
 
-    let workspace_root = parse_workspace_root_arg().unwrap_or_else(|| {
-        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    });
+    let workspace_root = parse_workspace_root_arg()
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let workspace_root = normalize_workspace_root(workspace_root);
     env::set_var("RONOMEPO_WORKSPACE_ROOT", &workspace_root);
 
@@ -141,11 +145,7 @@ fn main() {
             false,
         )],
     );
-    product.layout.right_panel = TabGroupSpec::new(
-        "panel-right",
-        None,
-        Vec::new(),
-    );
+    product.layout.right_panel = TabGroupSpec::new("panel-right", None, Vec::new());
     product.layout.bottom_panel = TabGroupSpec::new(
         "panel-bottom",
         Some("operations"),
@@ -171,13 +171,17 @@ fn main() {
         )],
     ));
 
+    let theme = app_theme();
     let config = MaruzzellaConfig::new("com.lelloman.ronomepo")
         .with_persistence_id("ronomepo")
-        .with_theme(app_theme())
+        .with_theme(theme.clone())
         .with_product(product)
         .with_builtin_plugin(embedded_ronomepo_plugin);
 
     let application = build_application(config);
+    application.connect_startup(move |_| {
+        install_app_css(&theme);
+    });
     let argv0 = env::args()
         .next()
         .unwrap_or_else(|| "ronomepo-app".to_string());
@@ -191,9 +195,17 @@ fn reset_stale_persisted_layout() {
     };
 
     // Old Ronomepo builds persisted a shell layout that points to non-existent
-    // views and placeholder tabs, which leaves the left panel blank on startup.
-    let has_stale_layout = raw.contains("\"plugin_view_id\": \"com.lelloman.ronomepo.repositories\"")
-        || raw.contains("\"placeholder\": \"Workspace path, filters, and import guidance will live here.\"");
+    // views, base-shell side tabs we don't use, and placeholder tabs, which can
+    // leave the workspace in a stale or confusing layout on startup.
+    let has_stale_layout = raw
+        .contains("\"plugin_view_id\": \"com.lelloman.ronomepo.repositories\"")
+        || raw.contains("\"plugin_view_id\": \"maruzzella.base.selection_inspector\"")
+        || raw.contains("\"plugin_view_id\": \"maruzzella.base.delivery\"")
+        || raw.contains("\"id\": \"selection-inspector\"")
+        || raw.contains("\"id\": \"delivery-checklist\"")
+        || raw.contains(
+            "\"placeholder\": \"Workspace path, filters, and import guidance will live here.\"",
+        );
 
     if has_stale_layout {
         let _ = fs::remove_file(path);
@@ -221,7 +233,10 @@ fn parse_workspace_root_arg() -> Option<PathBuf> {
         if arg == "--workspace" {
             return args.next().map(PathBuf::from);
         }
-        if let Some(value) = arg.to_str().and_then(|text| text.strip_prefix("--workspace=")) {
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|text| text.strip_prefix("--workspace="))
+        {
             return Some(PathBuf::from(value));
         }
         if positional.is_none() {
@@ -233,7 +248,10 @@ fn parse_workspace_root_arg() -> Option<PathBuf> {
 }
 
 fn embedded_ronomepo_plugin() -> Result<maruzzella::LoadedPlugin, maruzzella::PluginLoadError> {
-    load_static_plugin("builtin:ronomepo-plugin", ronomepo_plugin::maruzzella_plugin_entry)
+    load_static_plugin(
+        "builtin:ronomepo-plugin",
+        ronomepo_plugin::maruzzella_plugin_entry,
+    )
 }
 
 fn app_theme() -> ThemeSpec {
@@ -258,4 +276,37 @@ fn app_theme() -> ThemeSpec {
     theme.density.toolbar_height = 38;
     theme.density.tab_height = 28;
     theme
+}
+
+fn install_app_css(theme: &ThemeSpec) {
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
+
+    let css = format!(
+        "
+        label.repo-state-clean {{
+            color: {success};
+        }}
+
+        label.repo-state-warn {{
+            color: {warning};
+        }}
+
+        label.repo-state-error {{
+            color: {error};
+        }}
+        ",
+        success = "#7fdc8a",
+        warning = theme.palette.accent_strong,
+        error = "#ff6b6b",
+    );
+
+    let provider = CssProvider::new();
+    provider.load_from_data(&css);
+    style_context_add_provider_for_display(
+        &display,
+        &provider,
+        STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
 }
