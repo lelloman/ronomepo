@@ -57,6 +57,7 @@ const CMD_APPLY_HOOKS: &str = "ronomepo.workspace.apply_hooks";
 const CMD_OPEN_OVERVIEW: &str = "ronomepo.workspace.open_overview";
 const CMD_CHECK_HISTORY: &str = "ronomepo.workspace.check_history";
 const CMD_LINE_STATS: &str = "ronomepo.workspace.line_stats";
+const CMD_FILTER: &str = "ronomepo.workspace.filter";
 const MONITOR_NAME_COL_CHARS: i32 = 28;
 const MONITOR_BRANCH_COL_CHARS: i32 = 14;
 const MONITOR_STATE_COL_CHARS: i32 = 12;
@@ -349,7 +350,6 @@ struct EditorSaveMessage {
 
 struct RepositoryViewHandle {
     summary: glib::WeakRef<Label>,
-    filter_entry: glib::WeakRef<Entry>,
     list: glib::WeakRef<ListBox>,
     scroller: glib::WeakRef<ScrolledWindow>,
     store: gio::ListStore,
@@ -689,6 +689,10 @@ impl Plugin for RonomepoPlugin {
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_LINE_STATS, "Line Stats")
                 .with_handler(command_line_stats),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_FILTER, "Filter Repositories")
+                .with_handler(command_filter),
         )?;
 
         host.register_menu_item(MenuItemSpec::new(
@@ -1421,9 +1425,6 @@ fn refresh_repository_views(snapshot: &StateSnapshot) {
             let Some(summary) = handle.summary.upgrade() else {
                 return false;
             };
-            let Some(filter_entry) = handle.filter_entry.upgrade() else {
-                return false;
-            };
             let Some(list) = handle.list.upgrade() else {
                 return false;
             };
@@ -1433,7 +1434,6 @@ fn refresh_repository_views(snapshot: &StateSnapshot) {
             refresh_repository_view_handle(
                 handle,
                 &summary,
-                &filter_entry,
                 &list,
                 &scroller,
                 &snapshot,
@@ -1602,14 +1602,10 @@ fn snapshot() -> StateSnapshot {
 fn refresh_repository_view_handle(
     handle: &RepositoryViewHandle,
     summary_label: &Label,
-    filter_entry: &Entry,
     list: &ListBox,
     _scroller: &ScrolledWindow,
     snapshot: &StateSnapshot,
 ) {
-    if filter_entry.text().as_str() != snapshot.monitor_filter {
-        filter_entry.set_text(&snapshot.monitor_filter);
-    }
     sync_repository_monitor_store(&handle.store, &all_monitor_items(snapshot));
     handle.filter.changed(FilterChange::Different);
     handle.sorter.changed(SorterChange::Different);
@@ -1948,6 +1944,20 @@ fn update_selected_repo_ids(ids: Vec<String>) {
 fn update_monitor_filter(filter: String) {
     let mut app_state = state().lock().expect("state mutex poisoned");
     app_state.monitor_filter = filter;
+}
+
+extern "C" fn command_filter(
+    payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    let text = if payload.ptr.is_null() || payload.len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(payload.ptr, payload.len) };
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    update_monitor_filter(text);
+    refresh_views();
+    maruzzella_sdk::ffi::MzStatus::OK
 }
 
 fn update_monitor_show_all(show_all: bool) {
@@ -2573,13 +2583,6 @@ extern "C" fn create_repo_monitor_view(
     summary.set_wrap(true);
     summary.add_css_class("muted");
 
-    let filter_entry = Entry::new();
-    filter_entry.set_placeholder_text(Some("Filter repositories"));
-    filter_entry.connect_changed(|entry| {
-        update_monitor_filter(entry.text().to_string());
-        refresh_views();
-    });
-
     let show_all = CheckButton::with_label("Show all");
     show_all.set_active(snapshot().monitor_show_all);
     show_all.connect_toggled(|button| {
@@ -2655,7 +2658,6 @@ extern "C" fn create_repo_monitor_view(
     scroller.set_propagate_natural_height(false);
 
     content.append(&summary);
-    content.append(&filter_entry);
     content.append(&show_all);
     content.append(&monitor_actions);
     content.append(&Separator::new(Orientation::Horizontal));
@@ -2669,7 +2671,6 @@ extern "C" fn create_repo_monitor_view(
     refresh_repository_view_handle(
         &RepositoryViewHandle {
             summary: glib::WeakRef::new(),
-            filter_entry: glib::WeakRef::new(),
             list: glib::WeakRef::new(),
             scroller: glib::WeakRef::new(),
             store: store.clone(),
@@ -2677,7 +2678,6 @@ extern "C" fn create_repo_monitor_view(
             sorter: sorter.clone(),
         },
         &summary,
-        &filter_entry,
         &list,
         &scroller,
         &snapshot,
@@ -2685,8 +2685,6 @@ extern "C" fn create_repo_monitor_view(
 
     let summary_ref = glib::WeakRef::new();
     summary_ref.set(Some(&summary));
-    let filter_ref = glib::WeakRef::new();
-    filter_ref.set(Some(&filter_entry));
     let list_ref = glib::WeakRef::new();
     list_ref.set(Some(&list));
     let scroller_ref = glib::WeakRef::new();
@@ -2694,7 +2692,6 @@ extern "C" fn create_repo_monitor_view(
     REPOSITORY_VIEWS.with(|views| {
         views.borrow_mut().push(RepositoryViewHandle {
             summary: summary_ref,
-            filter_entry: filter_ref,
             list: list_ref,
             scroller: scroller_ref,
             store,

@@ -26,6 +26,7 @@ fn main() {
     let mut product = default_product_spec();
     product.branding.title = "Ronomepo".to_string();
     product.branding.search_placeholder = "Filter repositories".to_string();
+    product.branding.search_command_id = Some("ronomepo.workspace.filter".to_string());
     product.branding.status_text =
         "Desktop workspace for many sibling Git repositories".to_string();
     product.menu_roots = vec![
@@ -79,6 +80,10 @@ fn main() {
         CommandSpec {
             id: "ronomepo.workspace.line_stats".to_string(),
             title: "Line Stats".to_string(),
+        },
+        CommandSpec {
+            id: "ronomepo.workspace.filter".to_string(),
+            title: "Filter Repositories".to_string(),
         },
     ];
     product.toolbar_items = vec![
