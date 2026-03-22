@@ -349,7 +349,6 @@ struct EditorSaveMessage {
 }
 
 struct RepositoryViewHandle {
-    summary: glib::WeakRef<Label>,
     list: glib::WeakRef<ListBox>,
     scroller: glib::WeakRef<ScrolledWindow>,
     store: gio::ListStore,
@@ -1422,9 +1421,6 @@ fn refresh_repository_views(snapshot: &StateSnapshot) {
     REPOSITORY_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
         views.retain(|handle| {
-            let Some(summary) = handle.summary.upgrade() else {
-                return false;
-            };
             let Some(list) = handle.list.upgrade() else {
                 return false;
             };
@@ -1433,7 +1429,6 @@ fn refresh_repository_views(snapshot: &StateSnapshot) {
             };
             refresh_repository_view_handle(
                 handle,
-                &summary,
                 &list,
                 &scroller,
                 &snapshot,
@@ -1601,7 +1596,6 @@ fn snapshot() -> StateSnapshot {
 
 fn refresh_repository_view_handle(
     handle: &RepositoryViewHandle,
-    summary_label: &Label,
     list: &ListBox,
     _scroller: &ScrolledWindow,
     snapshot: &StateSnapshot,
@@ -1612,61 +1606,6 @@ fn refresh_repository_view_handle(
     sync_repository_monitor_selection(list, &snapshot.selected_repo_ids);
 
     let filtered_items = visible_monitor_items(snapshot);
-    let summary = workspace_summary(
-        snapshot.manifest.as_ref(),
-        snapshot.manifest_path.as_deref(),
-        &snapshot.workspace_root,
-    );
-    let manifest_status = match &snapshot.manifest_path {
-        Some(path) if snapshot.manifest.is_some() => format!("Manifest: {}", path.display()),
-        Some(path) => format!("Manifest missing: {}", path.display()),
-        None => format!(
-            "Manifest not loaded. Use Import repos.txt to create {}.",
-            MANIFEST_FILE_NAME
-        ),
-    };
-    let selection_scope = if snapshot.selected_repo_ids.is_empty() {
-        "No selection".to_string()
-    } else {
-        format!("{} selected", snapshot.selected_repo_ids.len())
-    };
-    let loading_scope = if snapshot.repository_items_loading {
-        "Refreshing Git status".to_string()
-    } else {
-        "Status ready".to_string()
-    };
-    let filter_scope = if snapshot.monitor_filter.trim().is_empty() {
-        format!(
-            "{} shown ({})",
-            filtered_items.len(),
-            if snapshot.monitor_show_all {
-                "all repos"
-            } else {
-                "attention only"
-            }
-        )
-    } else {
-        format!(
-            "{} shown for \"{}\" ({})",
-            filtered_items.len(),
-            snapshot.monitor_filter.trim(),
-            if snapshot.monitor_show_all {
-                "all repos"
-            } else {
-                "attention only"
-            }
-        )
-    };
-    summary_label.set_text(&format!(
-        "{} | {} repos | {} | {} | {} | {} | Workspace: {}",
-        summary.workspace_name,
-        summary.repo_count,
-        filter_scope,
-        selection_scope,
-        loading_scope,
-        manifest_status,
-        snapshot.workspace_root.display()
-    ));
     update_repository_monitor_empty_state(list, snapshot, filtered_items.is_empty());
 }
 
@@ -2578,19 +2517,12 @@ extern "C" fn create_repo_monitor_view(
     content.set_margin_start(18);
     content.set_margin_end(18);
 
-    let summary = Label::new(None);
-    summary.set_xalign(0.0);
-    summary.set_wrap(true);
-    summary.add_css_class("muted");
-
     let show_all = CheckButton::with_label("Show all");
     show_all.set_active(snapshot().monitor_show_all);
     show_all.connect_toggled(|button| {
         update_monitor_show_all(button.is_active());
         refresh_views();
     });
-
-    let monitor_actions = repo_monitor_actions(host);
 
     let store = gio::ListStore::new::<BoxedAnyObject>();
     let filter = CustomFilter::new(|object| {
@@ -2657,10 +2589,7 @@ extern "C" fn create_repo_monitor_view(
     scroller.set_valign(Align::Fill);
     scroller.set_propagate_natural_height(false);
 
-    content.append(&summary);
     content.append(&show_all);
-    content.append(&monitor_actions);
-    content.append(&Separator::new(Orientation::Horizontal));
     content.append(&repo_monitor_header());
     content.append(&scroller);
 
@@ -2670,28 +2599,23 @@ extern "C" fn create_repo_monitor_view(
     sorter.changed(SorterChange::Different);
     refresh_repository_view_handle(
         &RepositoryViewHandle {
-            summary: glib::WeakRef::new(),
             list: glib::WeakRef::new(),
             scroller: glib::WeakRef::new(),
             store: store.clone(),
             filter: filter.clone(),
             sorter: sorter.clone(),
         },
-        &summary,
         &list,
         &scroller,
         &snapshot,
     );
 
-    let summary_ref = glib::WeakRef::new();
-    summary_ref.set(Some(&summary));
     let list_ref = glib::WeakRef::new();
     list_ref.set(Some(&list));
     let scroller_ref = glib::WeakRef::new();
     scroller_ref.set(Some(&scroller));
     REPOSITORY_VIEWS.with(|views| {
         views.borrow_mut().push(RepositoryViewHandle {
-            summary: summary_ref,
             list: list_ref,
             scroller: scroller_ref,
             store,
@@ -2778,94 +2702,6 @@ fn state_color(state: &ronomepo_core::RepositoryState) -> &'static str {
     }
 }
 
-fn repo_monitor_actions(host_ptr: *const maruzzella_sdk::ffi::MzHostApi) -> GtkBox {
-    let actions = GtkBox::new(Orientation::Horizontal, 8);
-
-    let select_visible = Button::with_label("Select Visible");
-    select_visible.connect_clicked(move |_| {
-        let snapshot = snapshot();
-        let ids = visible_monitor_items(&snapshot)
-            .into_iter()
-            .filter(|item| item.id != MONOREPO_ROW_ID)
-            .map(|item| item.id)
-            .collect::<Vec<_>>();
-        if ids.is_empty() {
-            append_log("Select Visible skipped because there are no visible repos.".to_string());
-            return;
-        }
-        set_selected_repo_ids(ids.clone());
-        append_log(format!(
-            "Selected {} visible repos from the monitor.",
-            ids.len()
-        ));
-    });
-    actions.append(&select_visible);
-
-    let select_dirty = Button::with_label("Select Dirty");
-    select_dirty.connect_clicked(move |_| {
-        let snapshot = snapshot();
-        let ids = visible_monitor_items(&snapshot)
-            .into_iter()
-            .filter(|item| {
-                matches!(
-                    item.status.state,
-                    ronomepo_core::RepositoryState::Dirty
-                        | ronomepo_core::RepositoryState::Untracked
-                )
-            })
-            .map(|item| item.id)
-            .collect::<Vec<_>>();
-        if ids.is_empty() {
-            append_log("Select Dirty skipped because no visible repos are dirty.".to_string());
-            return;
-        }
-        set_selected_repo_ids(ids.clone());
-        append_log(format!(
-            "Selected {} dirty repos from the monitor.",
-            ids.len()
-        ));
-    });
-    actions.append(&select_dirty);
-
-    let select_missing = Button::with_label("Select Missing");
-    select_missing.connect_clicked(move |_| {
-        let snapshot = snapshot();
-        let ids = visible_monitor_items(&snapshot)
-            .into_iter()
-            .filter(|item| matches!(item.status.state, ronomepo_core::RepositoryState::Missing))
-            .map(|item| item.id)
-            .collect::<Vec<_>>();
-        if ids.is_empty() {
-            append_log("Select Missing skipped because no visible repos are missing.".to_string());
-            return;
-        }
-        set_selected_repo_ids(ids.clone());
-        append_log(format!(
-            "Selected {} missing repos from the monitor.",
-            ids.len()
-        ));
-    });
-    actions.append(&select_missing);
-
-    let clear_selection = Button::with_label("Clear");
-    clear_selection.connect_clicked(move |_| {
-        set_selected_repo_ids(Vec::new());
-        append_log("Cleared repo selection.".to_string());
-    });
-    actions.append(&clear_selection);
-
-    let open_selected = Button::with_label("Open Selected");
-    open_selected.connect_clicked(move |_| {
-        let repo_ids = {
-            let app_state = state().lock().expect("state mutex poisoned");
-            app_state.selected_repo_ids.clone()
-        };
-        open_repo_overviews(host_ptr, &repo_ids);
-    });
-    actions.append(&open_selected);
-
-    actions
-}
 
 extern "C" fn create_monorepo_overview_view(
     host: *const maruzzella_sdk::ffi::MzHostApi,
