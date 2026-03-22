@@ -277,6 +277,41 @@ fn app_theme() -> ThemeSpec {
     theme.density.radius_large = 12;
     theme.density.toolbar_height = 38;
     theme.density.tab_height = 28;
+
+    // Toolbar – action buttons match the neutral style, no special fill
+    theme = theme
+        .with_override("color_accent_action_bg", "transparent")
+        .with_override("color_accent_action_text", "#b4c0d0")
+        .with_override("color_accent_action_hover", "alpha(#b4c0d0, 0.10)")
+        // Tab strip – flat, no rounding, neutral underline for active
+        .with_override("color_workbench_tab_bg", "transparent")
+        .with_override("color_workbench_tab_text", "#6b7889")
+        .with_override("color_workbench_tab_hover", "alpha(#b4c0d0, 0.06)")
+        .with_override("color_workbench_tab_hover_text", "#b4c0d0")
+        .with_override("color_workbench_tab_active", "transparent")
+        .with_override("workbench_tab_border_width", "2px")
+        .with_override("color_notebook_tab_bg", "transparent")
+        .with_override("color_notebook_tab_text", "#6b7889")
+        .with_override("color_notebook_tab_hover", "alpha(#b4c0d0, 0.06)")
+        .with_override("color_notebook_tab_hover_text", "#b4c0d0")
+        .with_override("color_notebook_tab_active", "transparent")
+        .with_override("color_notebook_tab_active_border", "#546378")
+        .with_override("notebook_tab_active_border_width", "2px")
+        .with_override("color_tab_strip_scroller_bg", "#0f1318")
+        .with_override(
+            "tab_strip_scroller_border",
+            "1px solid alpha(#293241, 0.4)",
+        )
+        // Tighter button dimensions
+        .with_override("control_height_button", "30px")
+        .with_override("space_button_inline", "12px")
+        .with_override("button_radius", "2px")
+        .with_override("tab_radius", "0")
+        .with_override("search_radius", "3px")
+        .with_override("search_border", "0")
+        .with_override("color_search_bg", "#1e232b")
+        .with_override("color_entry_bg", "#1e232b");
+
     theme
 }
 
@@ -297,6 +332,45 @@ fn install_app_css(theme: &ThemeSpec) {
 
         label.repo-state-error {{
             color: {error};
+        }}
+
+        .studio-toolbar button,
+        .studio-toolbar .toolbar-button,
+        .studio-toolbar .toolbar-icon-button,
+        .toolbar-actions button,
+        .toolbar-utility-group button {{
+            border: 0;
+            background: transparent;
+            box-shadow: none;
+        }}
+
+        .studio-toolbar button:hover,
+        .studio-toolbar .toolbar-button:hover,
+        .studio-toolbar .toolbar-icon-button:hover {{
+            background: alpha(#b4c0d0, 0.10);
+            color: #e7edf7;
+        }}
+
+        .studio-toolbar button:active,
+        .studio-toolbar .toolbar-button:active,
+        .studio-toolbar .toolbar-icon-button:active {{
+            background: alpha(#b4c0d0, 0.16);
+        }}
+
+        .toolbar-actions .toolbar-button-label,
+        .toolbar-actions button .toolbar-button-label {{
+            color: #b4c0d0;
+        }}
+
+        .toolbar-actions button:hover .toolbar-button-label {{
+            color: #e7edf7;
+        }}
+
+        .workbench-tab-strip > .tab-header,
+        .drag-preview,
+        notebook header tab {{
+            border-radius: 0;
+            margin: 0;
         }}
         ",
         success = "#7fdc8a",
