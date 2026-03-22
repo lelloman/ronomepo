@@ -21,7 +21,7 @@ use gtk::{
     Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, Entry, FilterChange,
     GestureClick, Label, ListBox, ListBoxRow, Orientation, PolicyType, Popover, PositionType,
     ScrolledWindow, SelectionMode, Separator, SortListModel, SorterChange, TextBuffer, TextView,
-    WrapMode,
+    ToggleButton, WrapMode,
 };
 use maruzzella_sdk::{
     export_plugin, CommandSpec, HostApi, MenuItemSpec, MzLogLevel, MzMenuSurface, MzStatusCode,
@@ -81,6 +81,14 @@ struct RonomepoPluginConfig {
     import_banner_dismissed: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MonitorFilterMode {
+    #[default]
+    All,
+    Dirty,
+    ToSync,
+}
+
 #[derive(Clone, Debug)]
 struct AppState {
     workspace_root: PathBuf,
@@ -93,7 +101,7 @@ struct AppState {
     repo_details_cache: HashMap<String, RepositoryDetails>,
     repo_details_loading: HashSet<String>,
     monitor_filter: String,
-    monitor_show_all: bool,
+    monitor_filter_mode: MonitorFilterMode,
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
@@ -119,7 +127,7 @@ impl Default for AppState {
             repo_details_cache: HashMap::new(),
             repo_details_loading: HashSet::new(),
             monitor_filter: String::new(),
-            monitor_show_all: true,
+            monitor_filter_mode: MonitorFilterMode::default(),
             selected_repo_ids: Vec::new(),
             active_repo_id: None,
             logs: Vec::new(),
@@ -1559,7 +1567,7 @@ struct StateSnapshot {
     repo_details_cache: HashMap<String, RepositoryDetails>,
     repo_details_loading: HashSet<String>,
     monitor_filter: String,
-    monitor_show_all: bool,
+    monitor_filter_mode: MonitorFilterMode,
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
@@ -1582,7 +1590,7 @@ fn snapshot() -> StateSnapshot {
         repo_details_cache: app_state.repo_details_cache.clone(),
         repo_details_loading: app_state.repo_details_loading.clone(),
         monitor_filter: app_state.monitor_filter.clone(),
-        monitor_show_all: app_state.monitor_show_all,
+        monitor_filter_mode: app_state.monitor_filter_mode,
         selected_repo_ids: app_state.selected_repo_ids.clone(),
         active_repo_id: app_state.active_repo_id.clone(),
         logs: app_state.logs.clone(),
@@ -1725,7 +1733,7 @@ fn repo_item_from_object(object: &glib::Object) -> Option<RepositoryListItem> {
 }
 
 fn repo_monitor_filter_matches(item: &RepositoryListItem, snapshot: &StateSnapshot) -> bool {
-    if !snapshot.monitor_show_all && !repo_requires_attention(item) {
+    if !matches_filter_mode(item, snapshot.monitor_filter_mode) {
         return false;
     }
     let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
@@ -1815,9 +1823,8 @@ fn filtered_repository_items(
 ) -> Vec<RepositoryListItem> {
     items.sort_by_key(repo_monitor_sort_key);
 
-    if !snapshot.monitor_show_all {
-        items.retain(repo_requires_attention);
-    }
+    let mode = snapshot.monitor_filter_mode;
+    items.retain(|item| matches_filter_mode(item, mode));
 
     let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
     if filter.is_empty() {
@@ -1837,14 +1844,17 @@ fn repo_monitor_sort_key(item: &RepositoryListItem) -> (u8, String) {
     )
 }
 
-fn repo_requires_attention(item: &RepositoryListItem) -> bool {
+fn matches_filter_mode(item: &RepositoryListItem, mode: MonitorFilterMode) -> bool {
     use ronomepo_core::{RepositoryState, RepositorySync};
 
-    !matches!(item.status.state, RepositoryState::Clean)
-        || !matches!(
+    match mode {
+        MonitorFilterMode::All => true,
+        MonitorFilterMode::Dirty => !matches!(item.status.state, RepositoryState::Clean),
+        MonitorFilterMode::ToSync => !matches!(
             item.status.sync,
             RepositorySync::UpToDate | RepositorySync::NoUpstream
-        )
+        ),
+    }
 }
 
 fn repo_attention_rank(item: &RepositoryListItem) -> u8 {
@@ -1899,9 +1909,9 @@ extern "C" fn command_filter(
     maruzzella_sdk::ffi::MzStatus::OK
 }
 
-fn update_monitor_show_all(show_all: bool) {
+fn update_monitor_filter_mode(mode: MonitorFilterMode) {
     let mut app_state = state().lock().expect("state mutex poisoned");
-    app_state.monitor_show_all = show_all;
+    app_state.monitor_filter_mode = mode;
 }
 
 fn update_line_stats_since(value: String) {
@@ -2517,12 +2527,43 @@ extern "C" fn create_repo_monitor_view(
     content.set_margin_start(18);
     content.set_margin_end(18);
 
-    let show_all = CheckButton::with_label("Show all");
-    show_all.set_active(snapshot().monitor_show_all);
-    show_all.connect_toggled(|button| {
-        update_monitor_show_all(button.is_active());
-        refresh_views();
+    let filter_box = GtkBox::new(Orientation::Horizontal, 0);
+    filter_box.add_css_class("linked");
+
+    let btn_all = ToggleButton::with_label("All");
+    let btn_dirty = ToggleButton::with_label("Dirty");
+    let btn_to_sync = ToggleButton::with_label("To sync");
+    btn_dirty.set_group(Some(&btn_all));
+    btn_to_sync.set_group(Some(&btn_all));
+
+    match snapshot().monitor_filter_mode {
+        MonitorFilterMode::All => btn_all.set_active(true),
+        MonitorFilterMode::Dirty => btn_dirty.set_active(true),
+        MonitorFilterMode::ToSync => btn_to_sync.set_active(true),
+    }
+
+    btn_all.connect_toggled(|button| {
+        if button.is_active() {
+            update_monitor_filter_mode(MonitorFilterMode::All);
+            refresh_views();
+        }
     });
+    btn_dirty.connect_toggled(|button| {
+        if button.is_active() {
+            update_monitor_filter_mode(MonitorFilterMode::Dirty);
+            refresh_views();
+        }
+    });
+    btn_to_sync.connect_toggled(|button| {
+        if button.is_active() {
+            update_monitor_filter_mode(MonitorFilterMode::ToSync);
+            refresh_views();
+        }
+    });
+
+    filter_box.append(&btn_all);
+    filter_box.append(&btn_dirty);
+    filter_box.append(&btn_to_sync);
 
     let store = gio::ListStore::new::<BoxedAnyObject>();
     let filter = CustomFilter::new(|object| {
@@ -2589,7 +2630,7 @@ extern "C" fn create_repo_monitor_view(
     scroller.set_valign(Align::Fill);
     scroller.set_propagate_natural_height(false);
 
-    content.append(&show_all);
+    content.append(&filter_box);
     content.append(&repo_monitor_header());
     content.append(&scroller);
 
