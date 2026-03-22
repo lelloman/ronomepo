@@ -1849,7 +1849,13 @@ fn matches_filter_mode(item: &RepositoryListItem, mode: MonitorFilterMode) -> bo
 
     match mode {
         MonitorFilterMode::All => true,
-        MonitorFilterMode::Dirty => !matches!(item.status.state, RepositoryState::Clean),
+        MonitorFilterMode::Dirty => {
+            !matches!(item.status.state, RepositoryState::Clean)
+                || !matches!(
+                    item.status.sync,
+                    RepositorySync::UpToDate | RepositorySync::NoUpstream
+                )
+        }
         MonitorFilterMode::ToSync => !matches!(
             item.status.sync,
             RepositorySync::UpToDate | RepositorySync::NoUpstream
