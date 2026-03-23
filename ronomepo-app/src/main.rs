@@ -29,6 +29,7 @@ fn main() {
     product.branding.search_command_id = Some("ronomepo.workspace.filter".to_string());
     product.branding.status_text =
         "Desktop workspace for many sibling Git repositories".to_string();
+    product.include_base_toolbar_items = false;
     product.menu_roots = vec![
         MenuRootSpec {
             id: "file".to_string(),
@@ -50,10 +51,6 @@ fn main() {
             title: "Refresh Workspace".to_string(),
         },
         CommandSpec {
-            id: "ronomepo.workspace.clone_missing".to_string(),
-            title: "Clone Missing".to_string(),
-        },
-        CommandSpec {
             id: "ronomepo.workspace.pull".to_string(),
             title: "Pull".to_string(),
         },
@@ -62,24 +59,8 @@ fn main() {
             title: "Push".to_string(),
         },
         CommandSpec {
-            id: "ronomepo.workspace.push_force".to_string(),
-            title: "Push Force".to_string(),
-        },
-        CommandSpec {
-            id: "ronomepo.workspace.apply_hooks".to_string(),
-            title: "Apply Hooks".to_string(),
-        },
-        CommandSpec {
             id: "ronomepo.workspace.open_overview".to_string(),
             title: "Monorepo Overview".to_string(),
-        },
-        CommandSpec {
-            id: "ronomepo.workspace.check_history".to_string(),
-            title: "Check History".to_string(),
-        },
-        CommandSpec {
-            id: "ronomepo.workspace.line_stats".to_string(),
-            title: "Line Stats".to_string(),
         },
         CommandSpec {
             id: "ronomepo.workspace.filter".to_string(),
@@ -96,14 +77,6 @@ fn main() {
             secondary: false,
         },
         ToolbarItemSpec {
-            id: "clone-missing".to_string(),
-            icon_name: Some("folder-download-symbolic".to_string()),
-            label: Some("Clone Missing".to_string()),
-            command_id: "ronomepo.workspace.clone_missing".to_string(),
-            payload: Vec::new(),
-            secondary: false,
-        },
-        ToolbarItemSpec {
             id: "pull".to_string(),
             icon_name: Some("go-down-symbolic".to_string()),
             label: Some("Pull".to_string()),
@@ -116,14 +89,6 @@ fn main() {
             icon_name: Some("go-up-symbolic".to_string()),
             label: Some("Push".to_string()),
             command_id: "ronomepo.workspace.push".to_string(),
-            payload: Vec::new(),
-            secondary: false,
-        },
-        ToolbarItemSpec {
-            id: "apply-hooks".to_string(),
-            icon_name: Some("emblem-synchronizing-symbolic".to_string()),
-            label: Some("Apply Hooks".to_string()),
-            command_id: "ronomepo.workspace.apply_hooks".to_string(),
             payload: Vec::new(),
             secondary: false,
         },
@@ -210,6 +175,30 @@ fn reset_stale_persisted_layout() {
         || raw.contains("\"plugin_view_id\": \"maruzzella.base.delivery\"")
         || raw.contains("\"id\": \"selection-inspector\"")
         || raw.contains("\"id\": \"delivery-checklist\"")
+        || raw.contains("\"id\": \"ronomepo-clone-missing\"")
+        || raw.contains("\"id\": \"ronomepo-push-force\"")
+        || raw.contains("\"id\": \"ronomepo-hooks\"")
+        || raw.contains("\"id\": \"ronomepo-check-history\"")
+        || raw.contains("\"id\": \"ronomepo-line-stats\"")
+        || raw.contains("\"id\": \"palette\"")
+        || raw.contains("\"id\": \"theme\"")
+        || raw.contains("\"id\": \"views\"")
+        || raw.contains("\"id\": \"about\"")
+        || raw.contains("\"id\": \"settings\"")
+        || raw.contains("\"id\": \"new-buffer\"")
+        || raw.contains("\"id\": \"save-buffer\"")
+        || raw.contains("\"command_id\": \"ronomepo.workspace.clone_missing\"")
+        || raw.contains("\"command_id\": \"ronomepo.workspace.push_force\"")
+        || raw.contains("\"command_id\": \"ronomepo.workspace.apply_hooks\"")
+        || raw.contains("\"command_id\": \"ronomepo.workspace.check_history\"")
+        || raw.contains("\"command_id\": \"ronomepo.workspace.line_stats\"")
+        || raw.contains("\"command_id\": \"shell.open_command_palette\"")
+        || raw.contains("\"command_id\": \"shell.reload_theme\"")
+        || raw.contains("\"command_id\": \"shell.browse_views\"")
+        || raw.contains("\"command_id\": \"shell.about\"")
+        || raw.contains("\"command_id\": \"shell.settings\"")
+        || raw.contains("\"command_id\": \"shell.new_buffer\"")
+        || raw.contains("\"command_id\": \"shell.save_buffer\"")
         || raw.contains(
             "\"placeholder\": \"Workspace path, filters, and import guidance will live here.\"",
         );

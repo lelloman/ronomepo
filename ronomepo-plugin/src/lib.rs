@@ -660,42 +660,14 @@ impl Plugin for RonomepoPlugin {
                 .with_handler(command_refresh_workspace),
         )?;
         host.register_command(
-            CommandSpec::new(PLUGIN_ID, CMD_IMPORT, "Import repos.txt")
-                .with_handler(command_import_repos_txt),
-        )?;
-        host.register_command(
-            CommandSpec::new(PLUGIN_ID, CMD_SETTINGS, "Workspace Settings")
-                .with_handler(command_open_settings),
-        )?;
-        host.register_command(
-            CommandSpec::new(PLUGIN_ID, CMD_CLONE_MISSING, "Clone Missing")
-                .with_handler(command_clone_missing),
-        )?;
-        host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_PULL, "Pull").with_handler(command_pull),
         )?;
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_PUSH, "Push").with_handler(command_push),
         )?;
         host.register_command(
-            CommandSpec::new(PLUGIN_ID, CMD_PUSH_FORCE, "Push Force")
-                .with_handler(command_push_force),
-        )?;
-        host.register_command(
-            CommandSpec::new(PLUGIN_ID, CMD_APPLY_HOOKS, "Apply Hooks")
-                .with_handler(command_apply_hooks),
-        )?;
-        host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_OPEN_OVERVIEW, "Monorepo Overview")
                 .with_handler(command_open_overview),
-        )?;
-        host.register_command(
-            CommandSpec::new(PLUGIN_ID, CMD_CHECK_HISTORY, "Check History")
-                .with_handler(command_check_history),
-        )?;
-        host.register_command(
-            CommandSpec::new(PLUGIN_ID, CMD_LINE_STATS, "Line Stats")
-                .with_handler(command_line_stats),
         )?;
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_FILTER, "Filter Repositories")
@@ -708,27 +680,6 @@ impl Plugin for RonomepoPlugin {
             MzMenuSurface::FileItems,
             "Refresh Workspace",
             CMD_REFRESH,
-        ))?;
-        host.register_menu_item(MenuItemSpec::new(
-            PLUGIN_ID,
-            "ronomepo-import",
-            MzMenuSurface::FileItems,
-            "Import repos.txt",
-            CMD_IMPORT,
-        ))?;
-        host.register_menu_item(MenuItemSpec::new(
-            PLUGIN_ID,
-            "ronomepo-settings",
-            MzMenuSurface::FileItems,
-            "Workspace Settings",
-            CMD_SETTINGS,
-        ))?;
-        host.register_menu_item(MenuItemSpec::new(
-            PLUGIN_ID,
-            "ronomepo-clone-missing",
-            MzMenuSurface::FileItems,
-            "Clone Missing",
-            CMD_CLONE_MISSING,
         ))?;
         host.register_menu_item(MenuItemSpec::new(
             PLUGIN_ID,
@@ -746,38 +697,10 @@ impl Plugin for RonomepoPlugin {
         ))?;
         host.register_menu_item(MenuItemSpec::new(
             PLUGIN_ID,
-            "ronomepo-push-force",
-            MzMenuSurface::FileItems,
-            "Push Force",
-            CMD_PUSH_FORCE,
-        ))?;
-        host.register_menu_item(MenuItemSpec::new(
-            PLUGIN_ID,
-            "ronomepo-hooks",
-            MzMenuSurface::FileItems,
-            "Apply Hooks",
-            CMD_APPLY_HOOKS,
-        ))?;
-        host.register_menu_item(MenuItemSpec::new(
-            PLUGIN_ID,
             "ronomepo-overview",
             MzMenuSurface::ViewItems,
             "Monorepo Overview",
             CMD_OPEN_OVERVIEW,
-        ))?;
-        host.register_menu_item(MenuItemSpec::new(
-            PLUGIN_ID,
-            "ronomepo-check-history",
-            MzMenuSurface::ViewItems,
-            "Check History",
-            CMD_CHECK_HISTORY,
-        ))?;
-        host.register_menu_item(MenuItemSpec::new(
-            PLUGIN_ID,
-            "ronomepo-line-stats",
-            MzMenuSurface::ViewItems,
-            "Line Stats",
-            CMD_LINE_STATS,
         ))?;
 
         host.register_surface_contribution(SurfaceContributionSpec::about_section(
@@ -3759,14 +3682,12 @@ fn overview_actions() -> GtkBox {
             "Refresh",
             command_refresh_workspace as extern "C" fn(_) -> _,
         ),
-        (
-            "Clone Missing",
-            command_clone_missing as extern "C" fn(_) -> _,
-        ),
         ("Pull", command_pull as extern "C" fn(_) -> _),
         ("Push", command_push as extern "C" fn(_) -> _),
-        ("Push Force", command_push_force as extern "C" fn(_) -> _),
-        ("Apply Hooks", command_apply_hooks as extern "C" fn(_) -> _),
+        (
+            "Monorepo Overview",
+            command_open_overview as extern "C" fn(_) -> _,
+        ),
     ] {
         let button = Button::with_label(label);
         button.connect_clicked(move |_| {
