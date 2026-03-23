@@ -328,6 +328,14 @@ fn install_app_css(theme: &ThemeSpec) {
             color: {error};
         }}
 
+        .topbar-masthead {{
+            background: {menu_strip};
+        }}
+
+        .topbar-masthead .menu-bar {{
+            background: transparent;
+        }}
+
         .studio-toolbar button,
         .studio-toolbar .toolbar-button,
         .studio-toolbar .toolbar-icon-button,
@@ -370,6 +378,7 @@ fn install_app_css(theme: &ThemeSpec) {
         success = "#7fdc8a",
         warning = theme.palette.accent_strong,
         error = "#ff6b6b",
+        menu_strip = "#161b22",
     );
 
     let provider = CssProvider::new();
