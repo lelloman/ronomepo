@@ -1354,12 +1354,7 @@ fn refresh_repository_views(snapshot: &StateSnapshot) {
             let Some(scroller) = handle.scroller.upgrade() else {
                 return false;
             };
-            refresh_repository_view_handle(
-                handle,
-                &list,
-                &scroller,
-                &snapshot,
-            );
+            refresh_repository_view_handle(handle, &list, &scroller, &snapshot);
             true
         });
     });
@@ -2669,7 +2664,6 @@ fn state_color(state: &ronomepo_core::RepositoryState) -> &'static str {
     }
 }
 
-
 extern "C" fn create_monorepo_overview_view(
     host: *const maruzzella_sdk::ffi::MzHostApi,
     _request: *const maruzzella_sdk::ffi::MzViewRequest,
@@ -3039,9 +3033,6 @@ fn render_workspace_settings_into(
     for repo in &manifest.repos {
         append_repo_editor_row(&repo_rows_box, &repo_rows, Some(repo));
     }
-    if manifest.repos.is_empty() {
-        append_repo_editor_row(&repo_rows_box, &repo_rows, None);
-    }
 
     let repo_scroller = ScrolledWindow::builder()
         .hexpand(true)
@@ -3067,10 +3058,23 @@ fn render_workspace_settings_into(
     let edit_manifest = Button::with_label("Edit Manifest File");
 
     add_repo.connect_clicked({
-        let repo_rows_box = repo_rows_box.clone();
+        let root = root.clone();
         let repo_rows = repo_rows.clone();
+        let status = status.clone();
+        let name_entry = name_entry.clone();
+        let root_entry = root_entry.clone();
+        let hooks_entry = hooks_entry.clone();
         move |_| {
-            append_repo_editor_row(&repo_rows_box, &repo_rows, None);
+            open_add_repository_dialog(
+                root.root()
+                    .and_then(|widget| widget.downcast::<Window>().ok()),
+                host_ptr,
+                &name_entry,
+                &root_entry,
+                &hooks_entry,
+                repo_rows.clone(),
+                &status,
+            );
         }
     });
 
@@ -3218,6 +3222,131 @@ fn append_repo_editor_row(
     });
 }
 
+fn open_add_repository_dialog(
+    parent: Option<Window>,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    workspace_name: &Entry,
+    workspace_root: &Entry,
+    shared_hooks_path: &Entry,
+    repo_rows: Rc<RefCell<Vec<RepoEditorRowHandle>>>,
+    status: &Label,
+) {
+    let dialog = Dialog::builder()
+        .modal(true)
+        .title("Add Repository")
+        .build();
+    if let Some(parent) = parent.as_ref() {
+        dialog.set_transient_for(Some(parent));
+    }
+    dialog.add_button("Cancel", ResponseType::Cancel);
+    dialog.add_button("Add Repository", ResponseType::Accept);
+    dialog.set_default_response(ResponseType::Accept);
+
+    let content = dialog.content_area();
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    content.set_spacing(12);
+
+    let body = GtkBox::new(Orientation::Vertical, 8);
+
+    let remote_url = Entry::new();
+    remote_url.set_hexpand(true);
+    remote_url.set_placeholder_text(Some("git@github.com:org/repo.git"));
+
+    let dir_name = Entry::new();
+    dir_name.set_hexpand(true);
+    dir_name.set_placeholder_text(Some("repo-dir"));
+
+    let clone_now = CheckButton::with_label("Clone now");
+
+    let error = Label::new(None);
+    error.set_xalign(0.0);
+    error.set_wrap(true);
+    error.add_css_class("error");
+
+    body.append(&labeled_field("Git Remote URL", &remote_url));
+    body.append(&labeled_field("Directory Name", &dir_name));
+    body.append(&clone_now);
+    body.append(&error);
+    content.append(&body);
+
+    dialog.connect_response({
+        let dialog = dialog.clone();
+        let error = error.clone();
+        let remote_url = remote_url.clone();
+        let dir_name = dir_name.clone();
+        let clone_now = clone_now.clone();
+        let workspace_name = workspace_name.clone();
+        let workspace_root = workspace_root.clone();
+        let shared_hooks_path = shared_hooks_path.clone();
+        let repo_rows = repo_rows.clone();
+        let status = status.clone();
+        move |_, response| {
+            if response != ResponseType::Accept {
+                dialog.close();
+                return;
+            }
+
+            let mut repo_inputs = build_repo_editor_row_inputs(&repo_rows.borrow());
+            let (_, manifest) = match build_workspace_manifest_from_inputs(
+                workspace_name.text().as_str(),
+                workspace_root.text().as_str(),
+                shared_hooks_path.text().as_str(),
+                &repo_inputs,
+            ) {
+                Ok(result) => result,
+                Err(message) => {
+                    error.set_text(&message);
+                    return;
+                }
+            };
+
+            let new_repo = match validate_new_repository_entry(
+                &manifest,
+                remote_url.text().as_str(),
+                dir_name.text().as_str(),
+            ) {
+                Ok(repo) => repo,
+                Err(message) => {
+                    error.set_text(&message);
+                    return;
+                }
+            };
+
+            repo_inputs.push(RepoEditorRowInput {
+                enabled: true,
+                name: new_repo.name.clone(),
+                dir_name: new_repo.dir_name.clone(),
+                remote_url: new_repo.remote_url.clone(),
+            });
+
+            status.set_text("Saving manifest...");
+            if let Err(message) = queue_save_workspace_manifest(
+                host_ptr,
+                workspace_name.text().as_str(),
+                workspace_root.text().as_str(),
+                shared_hooks_path.text().as_str(),
+                repo_inputs,
+                Some(new_repo.id.clone()),
+                clone_now.is_active(),
+                &status,
+            ) {
+                error.set_text(&message);
+                status.set_text(&message);
+                append_log(message);
+                refresh_views();
+                return;
+            }
+
+            dialog.close();
+        }
+    });
+
+    dialog.present();
+}
+
 fn persist_last_workspace_path(
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
     workspace_root: &Path,
@@ -3319,17 +3448,8 @@ fn status_text_sender(status: &Label) -> mpsc::Sender<String> {
     sender
 }
 
-fn queue_save_workspace_manifest_from_editor(
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-    workspace_name: &str,
-    workspace_root: &str,
-    shared_hooks_path: &str,
-    repo_rows: &[RepoEditorRowHandle],
-    selected_repo_id: Option<String>,
-    clone_after_save: bool,
-    status: &Label,
-) -> Result<(), String> {
-    let repo_rows = repo_rows
+fn build_repo_editor_row_inputs(repo_rows: &[RepoEditorRowHandle]) -> Vec<RepoEditorRowInput> {
+    repo_rows
         .iter()
         .map(|handle| RepoEditorRowInput {
             enabled: handle.enabled.is_active(),
@@ -3337,7 +3457,122 @@ fn queue_save_workspace_manifest_from_editor(
             dir_name: handle.dir_name.text().trim().to_string(),
             remote_url: handle.remote_url.text().trim().to_string(),
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn build_workspace_manifest_from_inputs(
+    workspace_name: &str,
+    workspace_root: &str,
+    shared_hooks_path: &str,
+    repo_rows: &[RepoEditorRowInput],
+) -> Result<(PathBuf, WorkspaceManifest), String> {
+    let workspace_root = normalize_workspace_root(workspace_root.trim());
+    if workspace_root.as_os_str().is_empty() {
+        return Err("Workspace root cannot be empty.".to_string());
+    }
+
+    let mut repos = Vec::new();
+    for row in repo_rows {
+        let remote_url = row.remote_url.trim().to_string();
+        let mut dir_name = row.dir_name.trim().to_string();
+        let mut name = row.name.trim().to_string();
+
+        if remote_url.is_empty() && dir_name.is_empty() && name.is_empty() {
+            continue;
+        }
+        if remote_url.is_empty() {
+            return Err("Each non-empty repository row needs a remote URL.".to_string());
+        }
+        if dir_name.is_empty() {
+            dir_name = derive_dir_name(&remote_url).map_err(|error| error.to_string())?;
+        }
+        if name.is_empty() {
+            name = dir_name.clone();
+        }
+
+        repos.push(RepositoryEntry {
+            id: dir_name.clone(),
+            name,
+            dir_name,
+            remote_url,
+            enabled: row.enabled,
+        });
+    }
+
+    let manifest = WorkspaceManifest {
+        name: if workspace_name.trim().is_empty() {
+            workspace_name_from_root(&workspace_root)
+        } else {
+            workspace_name.trim().to_string()
+        },
+        root: workspace_root.clone(),
+        repos,
+        shared_hooks_path: if shared_hooks_path.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(shared_hooks_path.trim()))
+        },
+    };
+
+    Ok((workspace_root.clone(), manifest))
+}
+
+fn validate_new_repository_entry(
+    manifest: &WorkspaceManifest,
+    remote_url: &str,
+    dir_name: &str,
+) -> Result<RepositoryEntry, String> {
+    let remote_url = remote_url.trim();
+    let dir_name = dir_name.trim();
+
+    if remote_url.is_empty() {
+        return Err("Remote URL is required.".to_string());
+    }
+    if dir_name.is_empty() {
+        return Err("Directory name is required.".to_string());
+    }
+    if manifest
+        .repos
+        .iter()
+        .any(|repo| repo.remote_url == remote_url)
+    {
+        return Err(format!(
+            "A repository with remote URL {remote_url} already exists in the manifest."
+        ));
+    }
+    if manifest.repos.iter().any(|repo| repo.dir_name == dir_name) {
+        return Err(format!(
+            "A repository with directory name {dir_name} already exists in the manifest."
+        ));
+    }
+
+    let repo_path = manifest.root.join(dir_name);
+    if repo_path.exists() {
+        return Err(format!(
+            "Cannot add {dir_name} because {} already exists locally.",
+            repo_path.display()
+        ));
+    }
+
+    Ok(RepositoryEntry {
+        id: dir_name.to_string(),
+        name: dir_name.to_string(),
+        dir_name: dir_name.to_string(),
+        remote_url: remote_url.to_string(),
+        enabled: true,
+    })
+}
+
+fn queue_save_workspace_manifest(
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    workspace_name: &str,
+    workspace_root: &str,
+    shared_hooks_path: &str,
+    repo_rows: Vec<RepoEditorRowInput>,
+    selected_repo_id: Option<String>,
+    clone_after_save: bool,
+    status: &Label,
+) -> Result<(), String> {
     submit_job(WorkerJob::SaveManifestFromEditor {
         host_ptr: host_ptr as usize,
         workspace_name: workspace_name.to_string(),
@@ -3348,6 +3583,28 @@ fn queue_save_workspace_manifest_from_editor(
         clone_after_save,
         status_sender: status_text_sender(status),
     })
+}
+
+fn queue_save_workspace_manifest_from_editor(
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    workspace_name: &str,
+    workspace_root: &str,
+    shared_hooks_path: &str,
+    repo_rows: &[RepoEditorRowHandle],
+    selected_repo_id: Option<String>,
+    clone_after_save: bool,
+    status: &Label,
+) -> Result<(), String> {
+    queue_save_workspace_manifest(
+        host_ptr,
+        workspace_name,
+        workspace_root,
+        shared_hooks_path,
+        build_repo_editor_row_inputs(repo_rows),
+        selected_repo_id,
+        clone_after_save,
+        status,
+    )
 }
 
 fn load_workspace_manifest(workspace_root: &Path) -> Result<RefreshWorkspaceResult, String> {
@@ -3473,56 +3730,15 @@ fn save_workspace_manifest_from_inputs(
     selected_repo_id: Option<String>,
     clone_after_save: bool,
 ) -> Result<SaveManifestResult, String> {
-    let workspace_root = normalize_workspace_root(workspace_root.trim());
-    if workspace_root.as_os_str().is_empty() {
-        return Err("Workspace root cannot be empty.".to_string());
-    }
-
-    let mut repos = Vec::new();
-    for row in repo_rows {
-        let remote_url = row.remote_url.trim().to_string();
-        let mut dir_name = row.dir_name.trim().to_string();
-        let mut name = row.name.trim().to_string();
-
-        if remote_url.is_empty() && dir_name.is_empty() && name.is_empty() {
-            continue;
-        }
-        if remote_url.is_empty() {
-            return Err("Each non-empty repository row needs a remote URL.".to_string());
-        }
-        if dir_name.is_empty() {
-            dir_name = derive_dir_name(&remote_url).map_err(|error| error.to_string())?;
-        }
-        if name.is_empty() {
-            name = dir_name.clone();
-        }
-
-        repos.push(RepositoryEntry {
-            id: dir_name.clone(),
-            name,
-            dir_name,
-            remote_url,
-            enabled: row.enabled,
-        });
-    }
-
-    let manifest = WorkspaceManifest {
-        name: if workspace_name.trim().is_empty() {
-            workspace_name_from_root(&workspace_root)
-        } else {
-            workspace_name.trim().to_string()
-        },
-        root: workspace_root.clone(),
-        repos,
-        shared_hooks_path: if shared_hooks_path.trim().is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(shared_hooks_path.trim()))
-        },
-    };
-
+    let (workspace_root, manifest) = build_workspace_manifest_from_inputs(
+        workspace_name,
+        workspace_root,
+        shared_hooks_path,
+        repo_rows,
+    )?;
     let manifest_path = default_manifest_path(&workspace_root);
     save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
+    let repo_count = manifest.repos.len();
 
     Ok(SaveManifestResult {
         host_ptr,
@@ -3534,7 +3750,7 @@ fn save_workspace_manifest_from_inputs(
         message: format!(
             "Saved {} with {} repositories.",
             manifest_path.display(),
-            manifest.repos.len()
+            repo_count
         ),
     })
 }
@@ -4788,7 +5004,18 @@ fn workspace_name_from_root(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::UNIX_EPOCH;
+
+    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("ronomepo-plugin-{label}-{id}"));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn descriptor_uses_expected_plugin_id() {
@@ -4822,6 +5049,76 @@ mod tests {
         assert!(!watch_path_is_relevant(Path::new("src/lib.rs.swp")));
         assert!(watch_path_is_relevant(Path::new(".git/HEAD")));
         assert!(watch_path_is_relevant(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn validate_new_repository_entry_rejects_manifest_duplicates() {
+        let workspace_root = temp_test_dir("manifest-duplicates");
+        let manifest = WorkspaceManifest {
+            name: "Workspace".to_string(),
+            root: workspace_root,
+            repos: vec![RepositoryEntry {
+                id: "alpha".to_string(),
+                name: "alpha".to_string(),
+                dir_name: "alpha".to_string(),
+                remote_url: "git@example.com:org/alpha.git".to_string(),
+                enabled: true,
+            }],
+            shared_hooks_path: None,
+        };
+
+        let remote_error =
+            validate_new_repository_entry(&manifest, "git@example.com:org/alpha.git", "beta")
+                .unwrap_err();
+        assert!(remote_error.contains("already exists in the manifest"));
+
+        let dir_error =
+            validate_new_repository_entry(&manifest, "git@example.com:org/beta.git", "alpha")
+                .unwrap_err();
+        assert!(dir_error.contains("already exists in the manifest"));
+    }
+
+    #[test]
+    fn validate_new_repository_entry_rejects_existing_local_directory() {
+        let workspace_root = temp_test_dir("existing-dir");
+        fs::create_dir_all(workspace_root.join("alpha")).unwrap();
+        let manifest = WorkspaceManifest {
+            name: "Workspace".to_string(),
+            root: workspace_root,
+            repos: Vec::new(),
+            shared_hooks_path: None,
+        };
+
+        let error =
+            validate_new_repository_entry(&manifest, "git@example.com:org/alpha.git", "alpha")
+                .unwrap_err();
+        assert!(error.contains("already exists locally"));
+    }
+
+    #[test]
+    fn save_workspace_manifest_preserves_add_dialog_selection_and_clone_flags() {
+        let workspace_root = temp_test_dir("save-manifest");
+        let result = save_workspace_manifest_from_inputs(
+            7,
+            "Workspace",
+            workspace_root.to_str().unwrap(),
+            "",
+            &[RepoEditorRowInput {
+                enabled: true,
+                name: "alpha".to_string(),
+                dir_name: "alpha".to_string(),
+                remote_url: "git@example.com:org/alpha.git".to_string(),
+            }],
+            Some("alpha".to_string()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result.selected_repo_id.as_deref(), Some("alpha"));
+        assert!(result.clone_after_save);
+        assert_eq!(result.manifest.repos.len(), 1);
+        assert_eq!(result.manifest.repos[0].id, "alpha");
+        assert_eq!(result.manifest.repos[0].name, "alpha");
     }
 }
 
