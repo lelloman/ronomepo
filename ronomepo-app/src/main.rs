@@ -393,10 +393,7 @@ fn app_theme() -> ThemeSpec {
         .with_override("color_notebook_tab_active_border", "#546378")
         .with_override("notebook_tab_active_border_width", "2px")
         .with_override("color_tab_strip_scroller_bg", "#0f1318")
-        .with_override(
-            "tab_strip_scroller_border",
-            "1px solid alpha(#293241, 0.4)",
-        )
+        .with_override("tab_strip_scroller_border", "1px solid alpha(#293241, 0.4)")
         // Tighter button dimensions
         .with_override("control_height_button", "30px")
         .with_override("space_button_inline", "12px")
