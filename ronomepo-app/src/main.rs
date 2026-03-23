@@ -10,8 +10,8 @@ use gtk::{
 };
 use maruzzella::{
     build_application, default_product_spec, load_static_plugin, plugin_tab, BottomPanelLayout,
-    CommandSpec, MaruzzellaConfig, MenuRootSpec, TabGroupSpec, ThemeSpec, ToolbarItemSpec,
-    WorkbenchNodeSpec,
+    CommandSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, TabGroupSpec, ThemeSpec,
+    ToolbarItemSpec, WorkbenchNodeSpec,
 };
 use ronomepo_core::normalize_workspace_root;
 
@@ -40,11 +40,104 @@ fn main() {
             label: "View".to_string(),
         },
         MenuRootSpec {
+            id: "monorepo".to_string(),
+            label: "Monorepo".to_string(),
+        },
+        MenuRootSpec {
+            id: "settings".to_string(),
+            label: "Settings".to_string(),
+        },
+        MenuRootSpec {
             id: "help".to_string(),
             label: "Help".to_string(),
         },
     ];
-    product.menu_items.clear();
+    product.menu_items = vec![
+        MenuItemSpec {
+            id: "file-new".to_string(),
+            root_id: "file".to_string(),
+            label: "New".to_string(),
+            command_id: "shell.new_buffer".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "file-open".to_string(),
+            root_id: "file".to_string(),
+            label: "Open".to_string(),
+            command_id: "shell.open_file_editor".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "file-separator-1".to_string(),
+            root_id: "file".to_string(),
+            label: String::new(),
+            command_id: String::new(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "file-exit".to_string(),
+            root_id: "file".to_string(),
+            label: "Exit".to_string(),
+            command_id: "ronomepo.workspace.exit".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "view-overview".to_string(),
+            root_id: "view".to_string(),
+            label: "Overview".to_string(),
+            command_id: "ronomepo.workspace.open_overview".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "monorepo-pull".to_string(),
+            root_id: "monorepo".to_string(),
+            label: "Pull".to_string(),
+            command_id: "ronomepo.workspace.pull".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "monorepo-push".to_string(),
+            root_id: "monorepo".to_string(),
+            label: "Push".to_string(),
+            command_id: "ronomepo.workspace.push".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "monorepo-refresh".to_string(),
+            root_id: "monorepo".to_string(),
+            label: "Refresh".to_string(),
+            command_id: "ronomepo.workspace.refresh".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "monorepo-add-repo".to_string(),
+            root_id: "monorepo".to_string(),
+            label: "Add repo".to_string(),
+            command_id: "ronomepo.workspace.add_repo".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "settings-theme".to_string(),
+            root_id: "settings".to_string(),
+            label: "Theme".to_string(),
+            command_id: "shell.settings".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "settings-plugins".to_string(),
+            root_id: "settings".to_string(),
+            label: "Plugins".to_string(),
+            command_id: "shell.plugins".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "help-about".to_string(),
+            root_id: "help".to_string(),
+            label: "About".to_string(),
+            command_id: "shell.about".to_string(),
+            payload: Vec::new(),
+        },
+    ];
     product.commands = vec![
         CommandSpec {
             id: "ronomepo.workspace.refresh".to_string(),
@@ -65,6 +158,14 @@ fn main() {
         CommandSpec {
             id: "ronomepo.workspace.filter".to_string(),
             title: "Filter Repositories".to_string(),
+        },
+        CommandSpec {
+            id: "ronomepo.workspace.add_repo".to_string(),
+            title: "Add Repo".to_string(),
+        },
+        CommandSpec {
+            id: "ronomepo.workspace.exit".to_string(),
+            title: "Exit".to_string(),
         },
     ];
     product.toolbar_items = vec![

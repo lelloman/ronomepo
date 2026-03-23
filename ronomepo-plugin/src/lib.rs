@@ -18,15 +18,15 @@ use gtk::glib::{self, translate::IntoGlibPtr, BoxedAnyObject};
 use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
-    Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, Entry, FilterChange,
-    GestureClick, Label, ListBox, ListBoxRow, Orientation, PolicyType, Popover, PositionType,
-    ScrolledWindow, SelectionMode, Separator, SortListModel, SorterChange, TextBuffer, TextView,
-    ToggleButton, WrapMode,
+    Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, Dialog, Entry,
+    FilterChange, GestureClick, Label, ListBox, ListBoxRow, Orientation, PolicyType, Popover,
+    PositionType, ResponseType, ScrolledWindow, SelectionMode, Separator, SortListModel,
+    SorterChange, TextBuffer, TextView, ToggleButton, Window, WrapMode,
 };
 use maruzzella_sdk::{
-    export_plugin, CommandSpec, HostApi, MenuItemSpec, MzLogLevel, MzMenuSurface, MzStatusCode,
-    MzViewOpenDisposition, MzViewPlacement, OpenViewRequest, Plugin, PluginDependency,
-    PluginDescriptor, SurfaceContributionSpec, Version, ViewFactorySpec,
+    export_plugin, CommandSpec, HostApi, MzLogLevel, MzStatusCode, MzViewOpenDisposition,
+    MzViewPlacement, OpenViewRequest, Plugin, PluginDependency, PluginDescriptor,
+    SurfaceContributionSpec, Version, ViewFactorySpec,
 };
 use notify::{Config as NotifyConfig, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use ronomepo_core::{
@@ -52,6 +52,8 @@ const CMD_PULL: &str = "ronomepo.workspace.pull";
 const CMD_PUSH: &str = "ronomepo.workspace.push";
 const CMD_OPEN_OVERVIEW: &str = "ronomepo.workspace.open_overview";
 const CMD_FILTER: &str = "ronomepo.workspace.filter";
+const CMD_ADD_REPO: &str = "ronomepo.workspace.add_repo";
+const CMD_EXIT: &str = "ronomepo.workspace.exit";
 const MONITOR_NAME_COL_CHARS: i32 = 28;
 const MONITOR_BRANCH_COL_CHARS: i32 = 14;
 const MONITOR_STATE_COL_CHARS: i32 = 12;
@@ -250,6 +252,8 @@ enum WorkerJob {
         workspace_root: String,
         shared_hooks_path: String,
         repo_rows: Vec<RepoEditorRowInput>,
+        selected_repo_id: Option<String>,
+        clone_after_save: bool,
         status_sender: mpsc::Sender<String>,
     },
     EditorLoad {
@@ -332,6 +336,8 @@ struct SaveManifestResult {
     workspace_root: PathBuf,
     manifest_path: PathBuf,
     manifest: WorkspaceManifest,
+    selected_repo_id: Option<String>,
+    clone_after_save: bool,
     message: String,
 }
 
@@ -548,6 +554,8 @@ fn run_worker_job(queued_job: QueuedJob) {
             workspace_root,
             shared_hooks_path,
             repo_rows,
+            selected_repo_id,
+            clone_after_save,
             status_sender,
         } => {
             let result = save_workspace_manifest_from_inputs(
@@ -556,6 +564,8 @@ fn run_worker_job(queued_job: QueuedJob) {
                 &workspace_root,
                 &shared_hooks_path,
                 &repo_rows,
+                selected_repo_id,
+                clone_after_save,
             );
             dispatch_worker_result(WorkerResult::SaveManifestCompleted {
                 result,
@@ -670,35 +680,12 @@ impl Plugin for RonomepoPlugin {
             CommandSpec::new(PLUGIN_ID, CMD_FILTER, "Filter Repositories")
                 .with_handler(command_filter),
         )?;
-
-        host.register_menu_item(MenuItemSpec::new(
-            PLUGIN_ID,
-            "ronomepo-refresh",
-            MzMenuSurface::FileItems,
-            "Refresh Workspace",
-            CMD_REFRESH,
-        ))?;
-        host.register_menu_item(MenuItemSpec::new(
-            PLUGIN_ID,
-            "ronomepo-pull",
-            MzMenuSurface::FileItems,
-            "Pull",
-            CMD_PULL,
-        ))?;
-        host.register_menu_item(MenuItemSpec::new(
-            PLUGIN_ID,
-            "ronomepo-push",
-            MzMenuSurface::FileItems,
-            "Push",
-            CMD_PUSH,
-        ))?;
-        host.register_menu_item(MenuItemSpec::new(
-            PLUGIN_ID,
-            "ronomepo-overview",
-            MzMenuSurface::ViewItems,
-            "Monorepo Overview",
-            CMD_OPEN_OVERVIEW,
-        ))?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_ADD_REPO, "Add Repo").with_handler(command_add_repo),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_EXIT, "Exit").with_handler(command_exit),
+        )?;
 
         host.register_surface_contribution(SurfaceContributionSpec::about_section(
             PLUGIN_ID,
@@ -891,6 +878,35 @@ extern "C" fn command_open_overview(
             refresh_views();
             maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
         }
+    }
+}
+
+extern "C" fn command_add_repo(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    match open_workspace_settings_tab() {
+        Ok(()) => {
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::OK
+        }
+        Err(message) => {
+            append_log(message);
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
+        }
+    }
+}
+
+extern "C" fn command_exit(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    if let Some(application) = gio::Application::default() {
+        application.quit();
+        maruzzella_sdk::ffi::MzStatus::OK
+    } else {
+        append_log("Cannot exit because no GTK application is active.".to_string());
+        refresh_views();
+        maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
     }
 }
 
@@ -1278,12 +1294,20 @@ fn handle_worker_result(result: WorkerResult) {
         } => {
             let message = match result {
                 Ok(result) => {
+                    let selected_repo_id = result.selected_repo_id.clone();
+                    let clone_after_save = result.clone_after_save;
                     apply_saved_manifest(
                         result.host_ptr,
                         result.workspace_root,
                         result.manifest_path,
                         result.manifest,
                     );
+                    if let Some(repo_id) = selected_repo_id {
+                        update_selected_repo_ids(vec![repo_id]);
+                    }
+                    if clone_after_save {
+                        launch_operation(OperationKind::CloneMissing);
+                    }
                     result.message
                 }
                 Err(message) => message,
@@ -3064,6 +3088,8 @@ fn render_workspace_settings_into(
                 root_entry.text().as_str(),
                 hooks_entry.text().as_str(),
                 &repo_rows.borrow(),
+                None,
+                false,
                 &status,
             ) {
                 status.set_text(&message);
@@ -3299,6 +3325,8 @@ fn queue_save_workspace_manifest_from_editor(
     workspace_root: &str,
     shared_hooks_path: &str,
     repo_rows: &[RepoEditorRowHandle],
+    selected_repo_id: Option<String>,
+    clone_after_save: bool,
     status: &Label,
 ) -> Result<(), String> {
     let repo_rows = repo_rows
@@ -3316,6 +3344,8 @@ fn queue_save_workspace_manifest_from_editor(
         workspace_root: workspace_root.to_string(),
         shared_hooks_path: shared_hooks_path.to_string(),
         repo_rows,
+        selected_repo_id,
+        clone_after_save,
         status_sender: status_text_sender(status),
     })
 }
@@ -3440,6 +3470,8 @@ fn save_workspace_manifest_from_inputs(
     workspace_root: &str,
     shared_hooks_path: &str,
     repo_rows: &[RepoEditorRowInput],
+    selected_repo_id: Option<String>,
+    clone_after_save: bool,
 ) -> Result<SaveManifestResult, String> {
     let workspace_root = normalize_workspace_root(workspace_root.trim());
     if workspace_root.as_os_str().is_empty() {
@@ -3496,12 +3528,14 @@ fn save_workspace_manifest_from_inputs(
         host_ptr,
         workspace_root,
         manifest_path: manifest_path.clone(),
+        manifest,
+        selected_repo_id,
+        clone_after_save,
         message: format!(
             "Saved {} with {} repositories.",
             manifest_path.display(),
             manifest.repos.len()
         ),
-        manifest,
     })
 }
 
