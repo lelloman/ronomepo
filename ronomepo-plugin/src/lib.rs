@@ -38,6 +38,7 @@ use ronomepo_core::{
     MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const PLUGIN_ID: &str = "com.lelloman.ronomepo";
 const VIEW_REPO_MONITOR: &str = "com.lelloman.ronomepo.repo_monitor";
@@ -72,9 +73,12 @@ pub struct RonomepoPlugin;
 struct RonomepoPluginConfig {
     last_workspace_path: Option<String>,
     import_banner_dismissed: bool,
+    #[serde(default)]
+    monitor_filter_mode: MonitorFilterMode,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum MonitorFilterMode {
     #[default]
     All,
@@ -790,6 +794,7 @@ fn initialize_state(config: &RonomepoPluginConfig) {
     app_state.repository_items_refresh_pending = false;
     app_state.repo_details_cache.clear();
     app_state.repo_details_loading.clear();
+    app_state.monitor_filter_mode = config.monitor_filter_mode;
     sync_repo_runtime_state(&mut app_state);
     if app_state.logs.is_empty() {
         app_state.logs.push(format!(
@@ -1804,8 +1809,11 @@ extern "C" fn command_filter(
 }
 
 fn update_monitor_filter_mode(mode: MonitorFilterMode) {
-    let mut app_state = state().lock().expect("state mutex poisoned");
-    app_state.monitor_filter_mode = mode;
+    {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        app_state.monitor_filter_mode = mode;
+    }
+    persist_monitor_filter_mode(mode);
 }
 
 fn update_line_stats_since(value: String) {
@@ -3199,6 +3207,76 @@ fn persist_last_workspace_path(
     if let Ok(payload) = serde_json::to_vec(&config) {
         let _ = host.write_config(&payload);
     }
+}
+
+fn persist_monitor_filter_mode(mode: MonitorFilterMode) {
+    persist_plugin_config_direct(|config| {
+        config.monitor_filter_mode = mode;
+    });
+}
+
+fn persist_plugin_config_direct(update: impl FnOnce(&mut RonomepoPluginConfig)) {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StoredPluginConfigEntry {
+        Legacy(Vec<u8>),
+        Versioned {
+            #[allow(dead_code)]
+            schema_version: Option<u32>,
+            payload: Vec<u8>,
+        },
+    }
+
+    let path = persisted_plugin_configs_path("ronomepo");
+    let mut document = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<std::collections::HashMap<String, Value>>(&raw).ok())
+        .unwrap_or_default();
+
+    let mut config = document
+        .get(PLUGIN_ID)
+        .cloned()
+        .and_then(|value| serde_json::from_value::<StoredPluginConfigEntry>(value).ok())
+        .and_then(|entry| match entry {
+            StoredPluginConfigEntry::Legacy(payload) => serde_json::from_slice(&payload).ok(),
+            StoredPluginConfigEntry::Versioned { payload, .. } => {
+                serde_json::from_slice(&payload).ok()
+            }
+        })
+        .unwrap_or_default();
+
+    update(&mut config);
+
+    let Ok(payload) = serde_json::to_vec(&config) else {
+        return;
+    };
+    document.insert(
+        PLUGIN_ID.to_string(),
+        serde_json::json!({
+            "schema_version": Value::Null,
+            "payload": payload,
+        }),
+    );
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(raw) = serde_json::to_string_pretty(&document) {
+        let _ = fs::write(path, raw);
+    }
+}
+
+fn persisted_plugin_configs_path(persistence_id: &str) -> PathBuf {
+    let mut path = if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(dir)
+    } else if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home).join(".config")
+    } else {
+        PathBuf::from(".")
+    };
+    path.push(persistence_id);
+    path.push("plugins.json");
+    path
 }
 
 fn status_text_sender(status: &Label) -> mpsc::Sender<String> {
