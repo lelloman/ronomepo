@@ -47,16 +47,9 @@ const VIEW_WORKSPACE_SETTINGS: &str = "com.lelloman.ronomepo.workspace_settings"
 const VIEW_TEXT_EDITOR: &str = "com.lelloman.ronomepo.text_editor";
 const VIEW_OPERATIONS: &str = "com.lelloman.ronomepo.operations";
 const CMD_REFRESH: &str = "ronomepo.workspace.refresh";
-const CMD_IMPORT: &str = "ronomepo.workspace.import_repos_txt";
-const CMD_SETTINGS: &str = "ronomepo.workspace.open_settings";
-const CMD_CLONE_MISSING: &str = "ronomepo.workspace.clone_missing";
 const CMD_PULL: &str = "ronomepo.workspace.pull";
 const CMD_PUSH: &str = "ronomepo.workspace.push";
-const CMD_PUSH_FORCE: &str = "ronomepo.workspace.push_force";
-const CMD_APPLY_HOOKS: &str = "ronomepo.workspace.apply_hooks";
 const CMD_OPEN_OVERVIEW: &str = "ronomepo.workspace.open_overview";
-const CMD_CHECK_HISTORY: &str = "ronomepo.workspace.check_history";
-const CMD_LINE_STATS: &str = "ronomepo.workspace.line_stats";
 const CMD_FILTER: &str = "ronomepo.workspace.filter";
 const MONITOR_NAME_COL_CHARS: i32 = 28;
 const MONITOR_BRANCH_COL_CHARS: i32 = 14;
@@ -822,32 +815,6 @@ extern "C" fn command_refresh_workspace(
     }
 }
 
-extern "C" fn command_import_repos_txt(
-    _payload: maruzzella_sdk::ffi::MzBytes,
-) -> maruzzella_sdk::ffi::MzStatus {
-    match queue_import_workspace_from_repos_txt(None) {
-        Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
-        Err(message) => {
-            append_log(format!("Import failed: {message}"));
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
-        }
-    }
-}
-
-extern "C" fn command_open_settings(
-    _payload: maruzzella_sdk::ffi::MzBytes,
-) -> maruzzella_sdk::ffi::MzStatus {
-    match open_workspace_settings_tab() {
-        Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
-        Err(message) => {
-            append_log(message);
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
-        }
-    }
-}
-
 extern "C" fn command_clone_missing(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
@@ -1486,7 +1453,6 @@ struct StateSnapshot {
     manifest: Option<WorkspaceManifest>,
     workspace_status: RepositoryStatus,
     repository_items: Vec<RepositoryListItem>,
-    repository_items_loading: bool,
     repo_details_cache: HashMap<String, RepositoryDetails>,
     repo_details_loading: HashSet<String>,
     monitor_filter: String,
@@ -1509,7 +1475,6 @@ fn snapshot() -> StateSnapshot {
         manifest: app_state.manifest.clone(),
         workspace_status: app_state.workspace_status.clone(),
         repository_items: app_state.repository_items.clone(),
-        repository_items_loading: app_state.repository_items_loading,
         repo_details_cache: app_state.repo_details_cache.clone(),
         repo_details_loading: app_state.repo_details_loading.clone(),
         monitor_filter: app_state.monitor_filter.clone(),
