@@ -86,6 +86,7 @@ enum MonitorFilterMode {
     All,
     Dirty,
     ToSync,
+    Issues,
 }
 
 #[derive(Clone, Debug)]
@@ -1768,6 +1769,15 @@ fn matches_filter_mode(item: &RepositoryListItem, mode: MonitorFilterMode) -> bo
             item.status.sync,
             RepositorySync::UpToDate | RepositorySync::NoUpstream
         ),
+        MonitorFilterMode::Issues => matches!(
+            item.status.state,
+            RepositoryState::Missing | RepositoryState::Unknown
+        ) || matches!(
+            item.status.sync,
+            RepositorySync::Diverged { .. }
+                | RepositorySync::NoUpstream
+                | RepositorySync::Unknown
+        ),
     }
 }
 
@@ -2450,13 +2460,16 @@ extern "C" fn create_repo_monitor_view(
     let btn_all = ToggleButton::with_label("All");
     let btn_dirty = ToggleButton::with_label("Dirty");
     let btn_to_sync = ToggleButton::with_label("To sync");
+    let btn_issues = ToggleButton::with_label("Issues");
     btn_dirty.set_group(Some(&btn_all));
     btn_to_sync.set_group(Some(&btn_all));
+    btn_issues.set_group(Some(&btn_all));
 
     match snapshot().monitor_filter_mode {
         MonitorFilterMode::All => btn_all.set_active(true),
         MonitorFilterMode::Dirty => btn_dirty.set_active(true),
         MonitorFilterMode::ToSync => btn_to_sync.set_active(true),
+        MonitorFilterMode::Issues => btn_issues.set_active(true),
     }
 
     btn_all.connect_toggled(|button| {
@@ -2477,10 +2490,17 @@ extern "C" fn create_repo_monitor_view(
             refresh_views();
         }
     });
+    btn_issues.connect_toggled(|button| {
+        if button.is_active() {
+            update_monitor_filter_mode(MonitorFilterMode::Issues);
+            refresh_views();
+        }
+    });
 
     filter_box.append(&btn_all);
     filter_box.append(&btn_dirty);
     filter_box.append(&btn_to_sync);
+    filter_box.append(&btn_issues);
 
     let store = gio::ListStore::new::<BoxedAnyObject>();
     let filter = CustomFilter::new(|object| {
