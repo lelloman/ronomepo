@@ -307,7 +307,7 @@ pub fn collect_repository_status(repo_path: &Path) -> RepositoryStatus {
 pub fn format_sync_label(sync: &RepositorySync) -> String {
     match sync {
         RepositorySync::Unknown => "?".to_string(),
-        RepositorySync::NoUpstream => "-".to_string(),
+        RepositorySync::NoUpstream => "no upstream".to_string(),
         RepositorySync::UpToDate => "up-to-date".to_string(),
         RepositorySync::Ahead(ahead) => format!("+{ahead}"),
         RepositorySync::Behind(behind) => format!("-{behind}"),
