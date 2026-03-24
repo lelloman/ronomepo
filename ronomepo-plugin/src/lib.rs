@@ -390,6 +390,7 @@ static WATCH_MANAGER: OnceLock<Mutex<Option<WatchManager>>> = OnceLock::new();
 static LAST_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
 static BACKGROUND_LOOPS_STARTED: AtomicUsize = AtomicUsize::new(0);
 static LOG_REFRESH_SCHEDULED: AtomicUsize = AtomicUsize::new(0);
+static WATCH_MANAGER_SYNC_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn state() -> &'static Mutex<AppState> {
     STATE.get_or_init(|| Mutex::new(AppState::default()))
@@ -2176,19 +2177,52 @@ fn sync_watch_manager_from_state() {
         app_state.manifest.clone()
     };
 
-    let mut manager = watch_manager()
-        .lock()
-        .expect("watch manager mutex poisoned");
-    *manager = match manifest {
-        Some(manifest) => match build_watch_manager(&manifest) {
-            Ok(manager) => Some(manager),
-            Err(message) => {
-                append_log(format!("Repository watcher setup failed: {message}"));
-                None
-            }
-        },
-        None => None,
+    let sync_seq = WATCH_MANAGER_SYNC_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    let Some(manifest) = manifest else {
+        let mut manager = watch_manager()
+            .lock()
+            .expect("watch manager mutex poisoned");
+        *manager = None;
+        return;
     };
+
+    let spawn_result = thread::Builder::new()
+        .name(format!("ronomepo-watch-sync-{sync_seq}"))
+        .spawn(move || {
+            let next_manager = build_watch_manager(&manifest);
+            if WATCH_MANAGER_SYNC_SEQ.load(Ordering::SeqCst) != sync_seq {
+                return;
+            }
+
+            match next_manager {
+                Ok(manager) => {
+                    let mut slot = watch_manager()
+                        .lock()
+                        .expect("watch manager mutex poisoned");
+                    if WATCH_MANAGER_SYNC_SEQ.load(Ordering::SeqCst) == sync_seq {
+                        *slot = Some(manager);
+                    }
+                }
+                Err(message) => {
+                    {
+                        let mut slot = watch_manager()
+                            .lock()
+                            .expect("watch manager mutex poisoned");
+                        if WATCH_MANAGER_SYNC_SEQ.load(Ordering::SeqCst) != sync_seq {
+                            return;
+                        }
+                        *slot = None;
+                    }
+                    glib::MainContext::default().invoke(move || {
+                        append_log(format!("Repository watcher setup failed: {message}"));
+                    });
+                }
+            }
+        });
+
+    if let Err(error) = spawn_result {
+        append_log(format!("Repository watcher setup failed to start: {error}"));
+    }
 }
 
 fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, String> {
