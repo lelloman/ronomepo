@@ -44,6 +44,7 @@ const PLUGIN_ID: &str = "com.lelloman.ronomepo";
 const VIEW_REPO_MONITOR: &str = "com.lelloman.ronomepo.repo_monitor";
 const VIEW_MONOREPO_OVERVIEW: &str = "com.lelloman.ronomepo.monorepo_overview";
 const VIEW_REPO_OVERVIEW: &str = "com.lelloman.ronomepo.repo_overview";
+const VIEW_COMMIT_CHECK: &str = "com.lelloman.ronomepo.commit_check";
 const VIEW_WORKSPACE_SETTINGS: &str = "com.lelloman.ronomepo.workspace_settings";
 const VIEW_TEXT_EDITOR: &str = "com.lelloman.ronomepo.text_editor";
 const VIEW_OPERATIONS: &str = "com.lelloman.ronomepo.operations";
@@ -51,6 +52,7 @@ const CMD_REFRESH: &str = "ronomepo.workspace.refresh";
 const CMD_PULL: &str = "ronomepo.workspace.pull";
 const CMD_PUSH: &str = "ronomepo.workspace.push";
 const CMD_OPEN_OVERVIEW: &str = "ronomepo.workspace.open_overview";
+const CMD_OPEN_COMMIT_CHECK: &str = "ronomepo.workspace.open_commit_check";
 const CMD_FILTER: &str = "ronomepo.workspace.filter";
 const CMD_ADD_REPO: &str = "ronomepo.workspace.add_repo";
 const CMD_EXIT: &str = "ronomepo.workspace.exit";
@@ -379,6 +381,7 @@ thread_local! {
     static REPOSITORY_VIEWS: RefCell<Vec<RepositoryViewHandle>> = const { RefCell::new(Vec::new()) };
     static MONOREPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static REPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
+    static COMMIT_CHECK_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static WORKSPACE_SETTINGS_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_BUFFERS: RefCell<Vec<glib::WeakRef<TextBuffer>>> = const { RefCell::new(Vec::new()) };
     static OPERATION_SUMMARIES: RefCell<Vec<glib::WeakRef<Label>>> = const { RefCell::new(Vec::new()) };
@@ -682,6 +685,10 @@ impl Plugin for RonomepoPlugin {
                 .with_handler(command_open_overview),
         )?;
         host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_OPEN_COMMIT_CHECK, "Commit Check")
+                .with_handler(command_open_commit_check),
+        )?;
+        host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_FILTER, "Filter Repositories")
                 .with_handler(command_filter),
         )?;
@@ -719,6 +726,13 @@ impl Plugin for RonomepoPlugin {
             "Repo Overview",
             MzViewPlacement::Workbench,
             create_repo_overview_view,
+        ))?;
+        host.register_view_factory(ViewFactorySpec::new(
+            PLUGIN_ID,
+            VIEW_COMMIT_CHECK,
+            "Commit Check",
+            MzViewPlacement::Workbench,
+            create_commit_check_view,
         ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
@@ -880,6 +894,43 @@ extern "C" fn command_open_overview(
         }
         Err(status) => {
             append_log(format!("Failed to open Monorepo Overview: {status:?}"));
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
+        }
+    }
+}
+
+fn open_commit_check_view() -> Result<MzViewOpenDisposition, String> {
+    let host_ptr = current_host_ptr();
+    if host_ptr.is_null() {
+        return Err(
+            "Cannot focus Commit Check because the Maruzzella host handle is unavailable."
+                .to_string(),
+        );
+    }
+
+    let host = unsafe { HostApi::from_raw(&*host_ptr) };
+    let request = OpenViewRequest::new(PLUGIN_ID, VIEW_COMMIT_CHECK, MzViewPlacement::Workbench);
+    host.open_view(&request)
+        .map_err(|status| format!("Failed to open Commit Check: {status:?}"))
+}
+
+extern "C" fn command_open_commit_check(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    match open_commit_check_view() {
+        Ok(MzViewOpenDisposition::Opened) => {
+            append_log("Opened Commit Check.".to_string());
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::OK
+        }
+        Ok(MzViewOpenDisposition::FocusedExisting) => {
+            append_log("Focused existing Commit Check.".to_string());
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::OK
+        }
+        Err(message) => {
+            append_log(message);
             refresh_views();
             maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
         }
@@ -1135,12 +1186,19 @@ fn present_operation_failure_dialog(
     operation: &'static str,
     event: &OperationEvent,
 ) {
+    let is_generated_commit_failure = operation == "Push"
+        && event
+            .message
+            .contains("generated-commit markers were found");
     let dialog = Dialog::builder()
         .modal(true)
         .title(format!("{operation} failed"))
         .build();
     if let Some(parent) = active_window().as_ref() {
         dialog.set_transient_for(Some(parent));
+    }
+    if is_generated_commit_failure {
+        dialog.add_button("Open Commit Check", ResponseType::Accept);
     }
     dialog.add_button("Close", ResponseType::Close);
     dialog.set_default_response(ResponseType::Close);
@@ -1179,7 +1237,13 @@ fn present_operation_failure_dialog(
     body.append(&message);
     content.append(&body);
 
-    dialog.connect_response(|dialog, _| dialog.close());
+    dialog.connect_response(move |dialog, response| {
+        if response == ResponseType::Accept {
+            let _ = command_open_commit_check(maruzzella_sdk::ffi::MzBytes::empty());
+            let _ = queue_history_report(25);
+        }
+        dialog.close();
+    });
     dialog.present();
 }
 
@@ -1440,6 +1504,17 @@ fn refresh_overview_views(snapshot: &StateSnapshot) {
         views.retain(|handle| match handle.root.upgrade() {
             Some(root) => {
                 render_monorepo_overview_into(&root, &snapshot, handle.host_ptr as *const _);
+                true
+            }
+            None => false,
+        });
+    });
+
+    COMMIT_CHECK_VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        views.retain(|handle| match handle.root.upgrade() {
+            Some(root) => {
+                render_commit_check_into(&root, &snapshot);
                 true
             }
             None => false,
@@ -2859,6 +2934,52 @@ extern "C" fn create_monorepo_overview_view(
     }
 }
 
+extern "C" fn create_commit_check_view(
+    host: *const maruzzella_sdk::ffi::MzHostApi,
+    _request: *const maruzzella_sdk::ffi::MzViewRequest,
+) -> *mut std::ffi::c_void {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        return std::ptr::null_mut();
+    }
+
+    remember_host_ptr(host);
+
+    let root = GtkBox::new(Orientation::Vertical, 18);
+    root.set_margin_top(24);
+    root.set_margin_bottom(24);
+    root.set_margin_start(24);
+    root.set_margin_end(24);
+
+    let scroller = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(0)
+        .child(&root)
+        .build();
+    scroller.set_valign(Align::Fill);
+    scroller.set_propagate_natural_height(false);
+
+    let snapshot = snapshot();
+    render_commit_check_into(&root, &snapshot);
+
+    let root_ref = glib::WeakRef::new();
+    root_ref.set(Some(&root));
+    COMMIT_CHECK_VIEWS.with(|views| {
+        views.borrow_mut().push(ContainerViewHandle {
+            root: root_ref,
+            instance_key: None,
+            host_ptr: host as usize,
+        });
+    });
+
+    unsafe {
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
+            as *mut std::ffi::c_void
+    }
+}
+
 fn render_monorepo_overview_into(
     root: &GtkBox,
     snapshot: &StateSnapshot,
@@ -3025,6 +3146,66 @@ fn render_monorepo_overview_into(
     root.append(&selection_actions);
     root.append(&report_actions);
     root.append(&file_actions);
+    root.append(&sections);
+}
+
+fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
+    clear_box(root);
+
+    let hero = GtkBox::new(Orientation::Vertical, 4);
+    let title = Label::new(Some("Commit Check"));
+    title.set_xalign(0.0);
+    title.add_css_class("title-2");
+    let subtitle = Label::new(Some(
+        "Scans recent commits for AI-generated or generated-commit markers before push.",
+    ));
+    subtitle.set_xalign(0.0);
+    subtitle.add_css_class("muted");
+    subtitle.set_wrap(true);
+    hero.append(&title);
+    hero.append(&subtitle);
+
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
+    let rerun = Button::with_label("Run Check");
+    rerun.connect_clicked(|_| {
+        let _ = command_check_history(maruzzella_sdk::ffi::MzBytes::empty());
+    });
+    actions.append(&rerun);
+
+    let open_overview = Button::with_label("Open Overview");
+    open_overview.connect_clicked(|_| {
+        let _ = command_open_overview(maruzzella_sdk::ffi::MzBytes::empty());
+    });
+    actions.append(&open_overview);
+
+    let sections = GtkBox::new(Orientation::Vertical, 12);
+    append_overview_section(
+        &sections,
+        "Selection Scope",
+        &if snapshot.selected_repo_ids.is_empty() {
+            "No repos selected. Commit Check scans all eligible repos in the workspace."
+                .to_string()
+        } else {
+            format!(
+                "{} repos selected. Commit Check reports only against the current selection.",
+                snapshot.selected_repo_ids.len()
+            )
+        },
+    );
+    append_lines_section(
+        &sections,
+        "Report",
+        &if snapshot.history_report_loading {
+            vec!["Commit check is running...".to_string()]
+        } else {
+            snapshot.history_report.clone()
+        },
+        "Run Check to surface the same generated-commit matches that block a protected push.",
+    );
+    append_log_section(&sections, "Recent Operations", &snapshot.logs, 8);
+
+    root.append(&hero);
+    root.append(&actions);
     root.append(&sections);
 }
 
@@ -4301,6 +4482,12 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
         let _ = command_check_history(maruzzella_sdk::ffi::MzBytes::empty());
     });
     actions.append(&history);
+
+    let open_commit_check = Button::with_label("Open Commit Check");
+    open_commit_check.connect_clicked(|_| {
+        let _ = command_open_commit_check(maruzzella_sdk::ffi::MzBytes::empty());
+    });
+    actions.append(&open_commit_check);
 
     let since_entry = Entry::new();
     since_entry.set_placeholder_text(Some("Since date YYYY-MM-DD"));

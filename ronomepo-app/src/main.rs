@@ -89,6 +89,13 @@ fn main() {
             payload: Vec::new(),
         },
         MenuItemSpec {
+            id: "view-commit-check".to_string(),
+            root_id: "view".to_string(),
+            label: "Commit Check".to_string(),
+            command_id: "ronomepo.workspace.open_commit_check".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
             id: "monorepo-pull".to_string(),
             root_id: "monorepo".to_string(),
             label: "Pull".to_string(),
@@ -156,6 +163,10 @@ fn main() {
             title: "Monorepo Overview".to_string(),
         },
         CommandSpec {
+            id: "ronomepo.workspace.open_commit_check".to_string(),
+            title: "Commit Check".to_string(),
+        },
+        CommandSpec {
             id: "ronomepo.workspace.filter".to_string(),
             title: "Filter Repositories".to_string(),
         },
@@ -201,6 +212,14 @@ fn main() {
             payload: Vec::new(),
             secondary: true,
         },
+        ToolbarItemSpec {
+            id: "commit-check".to_string(),
+            icon_name: Some("dialog-warning-symbolic".to_string()),
+            label: Some("Commit Check".to_string()),
+            command_id: "ronomepo.workspace.open_commit_check".to_string(),
+            payload: Vec::new(),
+            secondary: true,
+        },
     ];
 
     product.layout.bottom_panel_layout = BottomPanelLayout::CenterOnly;
@@ -234,14 +253,24 @@ fn main() {
     product.layout.workbench = WorkbenchNodeSpec::Group(TabGroupSpec::new(
         "workbench-main",
         Some("monorepo-overview"),
-        vec![plugin_tab(
-            "monorepo-overview",
-            "workbench-main",
-            "Monorepo Overview",
-            "com.lelloman.ronomepo.monorepo_overview",
-            "The Ronomepo monorepo overview could not be created.",
-            false,
-        )],
+        vec![
+            plugin_tab(
+                "monorepo-overview",
+                "workbench-main",
+                "Monorepo Overview",
+                "com.lelloman.ronomepo.monorepo_overview",
+                "The Ronomepo monorepo overview could not be created.",
+                false,
+            ),
+            plugin_tab(
+                "commit-check",
+                "workbench-main",
+                "Commit Check",
+                "com.lelloman.ronomepo.commit_check",
+                "The Ronomepo commit check view could not be created.",
+                false,
+            ),
+        ],
     ));
 
     let theme = app_theme();
