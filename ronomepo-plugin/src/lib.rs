@@ -19,8 +19,8 @@ use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
     Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, Dialog, Entry,
-    FilterChange, GestureClick, Label, ListBox, ListBoxRow, Orientation, PolicyType, Popover,
-    PositionType, ResponseType, ScrolledWindow, SelectionMode, Separator, SortListModel,
+    FilterChange, GestureClick, Image, Label, ListBox, ListBoxRow, Orientation, PolicyType,
+    Popover, PositionType, ResponseType, ScrolledWindow, SelectionMode, Separator, SortListModel,
     SorterChange, TextBuffer, TextView, ToggleButton, Window, WrapMode,
 };
 use maruzzella_sdk::{
@@ -471,10 +471,13 @@ fn run_worker_job(queued_job: QueuedJob) {
             batch_id,
         } => {
             let main_context = glib::MainContext::default();
+            let operation = operation_kind_title(kind);
             run_workspace_operation(&manifest, &selected_repo_ids, kind, |event| {
                 let event = event.clone();
                 let manifest = manifest.clone();
-                main_context.invoke(move || handle_operation_event(batch_id, manifest, event));
+                main_context.invoke(move || {
+                    handle_operation_event(batch_id, operation, manifest, event)
+                });
             });
         }
         WorkerJob::WorkspaceScan {
@@ -1121,7 +1124,76 @@ fn format_operation_event(event: &OperationEvent) -> String {
     }
 }
 
-fn handle_operation_event(batch_id: usize, manifest: WorkspaceManifest, event: OperationEvent) {
+fn active_window() -> Option<Window> {
+    gio::Application::default()
+        .and_then(|app| app.downcast::<gtk::Application>().ok())
+        .and_then(|app| app.active_window())
+}
+
+fn present_operation_failure_dialog(
+    _batch_id: usize,
+    operation: &'static str,
+    event: &OperationEvent,
+) {
+    let dialog = Dialog::builder()
+        .modal(true)
+        .title(format!("{operation} failed"))
+        .build();
+    if let Some(parent) = active_window().as_ref() {
+        dialog.set_transient_for(Some(parent));
+    }
+    dialog.add_button("Close", ResponseType::Close);
+    dialog.set_default_response(ResponseType::Close);
+
+    let content = dialog.content_area();
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    content.set_spacing(12);
+
+    let body = GtkBox::new(Orientation::Vertical, 8);
+
+    let header = GtkBox::new(Orientation::Horizontal, 10);
+    let icon = Image::from_icon_name("dialog-error-symbolic");
+    icon.set_icon_size(gtk::IconSize::Large);
+    icon.add_css_class("error");
+
+    let title_text = event.repository_name.as_deref().map_or_else(
+        || format!("{operation} failed."),
+        |repo_name| format!("{operation} failed for {repo_name}."),
+    );
+    let title = Label::new(Some(&title_text));
+    title.set_xalign(0.0);
+    title.add_css_class("title-4");
+    title.add_css_class("error");
+    title.set_wrap(true);
+
+    let message = Label::new(Some(&event.message));
+    message.set_xalign(0.0);
+    message.set_wrap(true);
+
+    header.append(&icon);
+    header.append(&title);
+    body.append(&header);
+    body.append(&message);
+    content.append(&body);
+
+    dialog.connect_response(|dialog, _| dialog.close());
+    dialog.present();
+}
+
+fn handle_operation_event(
+    batch_id: usize,
+    operation: &'static str,
+    manifest: WorkspaceManifest,
+    event: OperationEvent,
+) {
+    if matches!(event.kind, OperationEventKind::Failed)
+        && matches!(operation, "Push" | "Push Force")
+    {
+        present_operation_failure_dialog(batch_id, operation, &event);
+    }
     append_log(format!(
         "[run {batch_id}] {}",
         format_operation_event(&event)
@@ -2856,7 +2928,6 @@ fn render_monorepo_overview_into(
     subtitle.set_wrap(true);
     hero.append(&title);
     hero.append(&subtitle);
-
     let stats = GtkBox::new(Orientation::Horizontal, 12);
     for (label, value) in [
         ("Attention", attention),
@@ -5041,27 +5112,28 @@ extern "C" fn create_operations_view(
 
 fn operation_summary_text(logs: &[String]) -> String {
     let total = logs.len();
-    let starts = logs
+    let starts = logs.iter().filter(|line| line.contains("[START]")).count();
+    let ok = logs.iter().filter(|line| line.contains("[OK]")).count();
+    let skipped = logs.iter().filter(|line| line.contains("[SKIP]")).count();
+    let failed = logs.iter().filter(|line| line.contains("[FAIL]")).count();
+    let latest_failure = logs
         .iter()
-        .filter(|line| line.starts_with("[START]"))
-        .count();
-    let ok = logs.iter().filter(|line| line.starts_with("[OK]")).count();
-    let skipped = logs
-        .iter()
-        .filter(|line| line.starts_with("[SKIP]"))
-        .count();
-    let failed = logs
-        .iter()
-        .filter(|line| line.starts_with("[FAIL]"))
-        .count();
+        .rev()
+        .find(|line| line.contains("[FAIL]"))
+        .map(String::as_str);
     let latest = logs
         .last()
         .map(String::as_str)
         .unwrap_or("No operations recorded yet.");
 
-    format!(
-        "{total} log lines | {starts} started | {ok} ok | {skipped} skipped | {failed} failed | Latest: {latest}"
-    )
+    match latest_failure {
+        Some(failure) => format!(
+            "{total} log lines | {starts} started | {ok} ok | {skipped} skipped | {failed} failed | Latest failure: {failure} | Latest: {latest}"
+        ),
+        None => format!(
+            "{total} log lines | {starts} started | {ok} ok | {skipped} skipped | {failed} failed | Latest: {latest}"
+        ),
+    }
 }
 
 fn load_manifest_if_present(path: &Path) -> Option<WorkspaceManifest> {
