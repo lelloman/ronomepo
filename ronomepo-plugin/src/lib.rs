@@ -1695,11 +1695,7 @@ fn build_repo_monitor_row(
     let status = monitor_state_cell(&item.status.state);
     status.add_css_class("pill");
 
-    let sync = Label::new(Some(&format_sync_label(&item.status.sync)));
-    sync.set_xalign(0.0);
-    sync.add_css_class("mono");
-    sync.set_hexpand(true);
-    sync.set_ellipsize(EllipsizeMode::End);
+    let sync = monitor_sync_cell(&item.status.sync);
 
     content.append(&name);
     content.append(&branch);
@@ -2661,6 +2657,33 @@ fn state_color(state: &ronomepo_core::RepositoryState) -> &'static str {
         ronomepo_core::RepositoryState::Dirty
         | ronomepo_core::RepositoryState::Untracked
         | ronomepo_core::RepositoryState::Unknown => "#ff8e5f",
+    }
+}
+
+fn monitor_sync_cell(sync: &ronomepo_core::RepositorySync) -> Label {
+    let text = format_sync_label(sync);
+    let label = Label::new(Some(&text));
+    label.set_xalign(0.0);
+    label.add_css_class("mono");
+    label.set_hexpand(true);
+    label.set_ellipsize(EllipsizeMode::End);
+    let escaped = glib::markup_escape_text(&text);
+    label.set_markup(&format!(
+        "<span foreground=\"{}\">{escaped}</span>",
+        sync_color(sync)
+    ));
+    label
+}
+
+fn sync_color(sync: &ronomepo_core::RepositorySync) -> &'static str {
+    match sync {
+        ronomepo_core::RepositorySync::UpToDate => "#7fdc8a",
+        ronomepo_core::RepositorySync::Ahead(_) | ronomepo_core::RepositorySync::Behind(_) => {
+            "#ff8e5f"
+        }
+        ronomepo_core::RepositorySync::Diverged { .. }
+        | ronomepo_core::RepositorySync::Unknown
+        | ronomepo_core::RepositorySync::NoUpstream => "#ff6b6b",
     }
 }
 
