@@ -2643,10 +2643,10 @@ extern "C" fn create_repo_monitor_view(
     content.set_hexpand(true);
     content.set_valign(Align::Fill);
     content.set_vexpand(true);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
+    content.set_margin_top(8);
+    content.set_margin_bottom(8);
+    content.set_margin_start(8);
+    content.set_margin_end(8);
 
     let filter_box = GtkBox::new(Orientation::Horizontal, 0);
     filter_box.add_css_class("linked");

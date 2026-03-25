@@ -11,7 +11,7 @@ use gtk::{
 use maruzzella::{
     build_application, default_product_spec, load_static_plugin, plugin_tab, BottomPanelLayout,
     CommandSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, TabGroupSpec, ThemeSpec,
-    ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec,
+    PanelResizePolicy, ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec,
 };
 use ronomepo_core::normalize_workspace_root;
 
@@ -228,6 +228,8 @@ fn main() {
     ];
 
     product.layout.bottom_panel_layout = BottomPanelLayout::CenterOnly;
+    product.layout.left_panel_resize = PanelResizePolicy::CappedProportional { max_factor: 1.5 };
+    product.layout.bottom_panel_resize = PanelResizePolicy::CappedProportional { max_factor: 1.5 };
     product.layout.left_panel = TabGroupSpec::new(
         "panel-left",
         Some("repositories"),
@@ -426,6 +428,8 @@ fn app_theme() -> ThemeSpec {
     theme.density.space_xl = 8;
     theme.density.panel_header_height = 26;
     theme.density.icon_size = 16;
+    theme.density.min_side_panel_width = 200;
+    theme.density.min_bottom_panel_height = 200;
 
     // Overrides for specific tokens
     theme = theme
