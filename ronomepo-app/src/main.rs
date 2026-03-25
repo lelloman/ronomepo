@@ -11,7 +11,7 @@ use gtk::{
 use maruzzella::{
     build_application, default_product_spec, load_static_plugin, plugin_tab, BottomPanelLayout,
     CommandSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, TabGroupSpec, ThemeSpec,
-    ToolbarItemSpec, WorkbenchNodeSpec,
+    ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec,
 };
 use ronomepo_core::normalize_workspace_root;
 
@@ -187,6 +187,7 @@ fn main() {
             command_id: "ronomepo.workspace.refresh".to_string(),
             payload: Vec::new(),
             secondary: false,
+            display_mode: ToolbarDisplayMode::IconOnly,
         },
         ToolbarItemSpec {
             id: "pull".to_string(),
@@ -195,6 +196,7 @@ fn main() {
             command_id: "ronomepo.workspace.pull".to_string(),
             payload: Vec::new(),
             secondary: false,
+            display_mode: ToolbarDisplayMode::IconOnly,
         },
         ToolbarItemSpec {
             id: "push".to_string(),
@@ -203,6 +205,7 @@ fn main() {
             command_id: "ronomepo.workspace.push".to_string(),
             payload: Vec::new(),
             secondary: false,
+            display_mode: ToolbarDisplayMode::IconOnly,
         },
         ToolbarItemSpec {
             id: "monorepo-overview".to_string(),
@@ -211,6 +214,7 @@ fn main() {
             command_id: "ronomepo.workspace.open_overview".to_string(),
             payload: Vec::new(),
             secondary: true,
+            display_mode: ToolbarDisplayMode::IconOnly,
         },
         ToolbarItemSpec {
             id: "commit-check".to_string(),
@@ -219,6 +223,7 @@ fn main() {
             command_id: "ronomepo.workspace.open_commit_check".to_string(),
             payload: Vec::new(),
             secondary: true,
+            display_mode: ToolbarDisplayMode::IconOnly,
         },
     ];
 
