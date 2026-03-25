@@ -2713,19 +2713,59 @@ extern "C" fn create_repo_monitor_view(
             .unwrap_or_else(|| GtkBox::new(Orientation::Horizontal, 0))
             .upcast()
     });
-    list.connect_selected_rows_changed(|list| {
-        update_selected_repo_ids(selection_ids_from_list(list));
-    });
-    list.connect_row_activated(move |_, row| {
-        if let Some(list) = row.parent().and_downcast::<ListBox>() {
-            let selected_ids = selection_ids_from_list(&list);
-            let row_id = repo_id_from_list_box_row(row).unwrap_or_default();
-            if selected_ids.len() != 1 || selected_ids.first() != Some(&row_id) {
-                list.unselect_all();
-                list.select_row(Some(row));
-                update_selected_repo_ids(selection_ids_from_list(&list));
+    {
+        let click = GestureClick::new();
+        click.set_button(1);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let list_ref = list.clone();
+        click.connect_pressed(move |gesture, _, _x, y| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            let Some(row) = list_ref.row_at_y(y as i32) else {
+                return;
+            };
+            let modifiers = gesture
+                .current_event()
+                .map(|e| e.modifier_state())
+                .unwrap_or_else(gtk::gdk::ModifierType::empty);
+            let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+
+            if ctrl {
+                if row.is_selected() {
+                    list_ref.unselect_row(&row);
+                } else {
+                    list_ref.select_row(Some(&row));
+                }
+            } else if shift {
+                let clicked_index = row.index();
+                let mut anchor = clicked_index;
+                let mut i = 0;
+                while let Some(r) = list_ref.row_at_index(i) {
+                    if r.is_selected() {
+                        anchor = i;
+                        break;
+                    }
+                    i += 1;
+                }
+                let lo = anchor.min(clicked_index);
+                let hi = anchor.max(clicked_index);
+                list_ref.unselect_all();
+                for idx in lo..=hi {
+                    if let Some(r) = list_ref.row_at_index(idx) {
+                        list_ref.select_row(Some(&r));
+                    }
+                }
+            } else if row.is_selected() {
+                list_ref.unselect_row(&row);
+            } else {
+                list_ref.unselect_all();
+                list_ref.select_row(Some(&row));
             }
-        }
+            update_selected_repo_ids(selection_ids_from_list(&list_ref));
+        });
+        list.add_controller(click);
+    }
+    list.connect_row_activated(move |_, row| {
         let repo_id = repo_id_from_list_box_row(row).unwrap_or_default();
         if repo_id.is_empty() {
             return;
