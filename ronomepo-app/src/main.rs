@@ -387,131 +387,149 @@ fn embedded_ronomepo_plugin() -> Result<maruzzella::LoadedPlugin, maruzzella::Pl
 
 fn app_theme() -> ThemeSpec {
     let mut theme = ThemeSpec::default();
-    theme.typography.font_family = "\"Space Grotesk\", \"Noto Sans\", sans-serif".to_string();
-    theme.typography.mono_font_family = "\"JetBrains Mono\", monospace".to_string();
-    theme.palette.bg_0 = "#13161c".to_string();
-    theme.palette.bg_1 = "#1a1f27".to_string();
-    theme.palette.workbench = "#0f1318".to_string();
-    theme.palette.panel_left = "#121821".to_string();
-    theme.palette.panel_right = "#11161e".to_string();
-    theme.palette.panel_bottom = "#0d1117".to_string();
-    theme.palette.border = "#293241".to_string();
-    theme.palette.border_strong = "#415168".to_string();
-    theme.palette.text_0 = "#e7edf7".to_string();
-    theme.palette.text_1 = "#b4c0d0".to_string();
-    theme.palette.text_2 = "#7f8b9e".to_string();
-    theme.palette.accent = "#df6d3d".to_string();
-    theme.palette.accent_strong = "#ff8e5f".to_string();
-    theme.density.radius_medium = 8;
-    theme.density.radius_large = 12;
-    theme.density.toolbar_height = 38;
-    theme.density.tab_height = 28;
 
-    // Toolbar – action buttons match the neutral style, no special fill
+    // Typography – match IntelliJ/AS system font feel
+    theme.typography.font_family = "\"Inter\", \"Noto Sans\", sans-serif".to_string();
+    theme.typography.mono_font_family = "\"JetBrains Mono\", monospace".to_string();
+    theme.typography.font_size_base = 13;
+    theme.typography.font_size_ui = 12;
+    theme.typography.font_size_small = 11;
+    theme.typography.font_size_tiny = 10;
+
+    // Palette – Darcula-inspired warm dark grays
+    theme.palette.bg_0 = "#3c3f41".to_string();
+    theme.palette.bg_1 = "#45494a".to_string();
+    theme.palette.workbench = "#2b2b2b".to_string();
+    theme.palette.panel_left = "#3c3f41".to_string();
+    theme.palette.panel_right = "#3c3f41".to_string();
+    theme.palette.panel_bottom = "#3c3f41".to_string();
+    theme.palette.border = "#323232".to_string();
+    theme.palette.border_strong = "#515151".to_string();
+    theme.palette.text_0 = "#bbbbbb".to_string();
+    theme.palette.text_1 = "#a9b7c6".to_string();
+    theme.palette.text_2 = "#787878".to_string();
+    theme.palette.accent = "#4b6eaf".to_string();
+    theme.palette.accent_strong = "#589df6".to_string();
+
+    // Density – compact like Android Studio
+    theme.density.radius_none = 0;
+    theme.density.radius_small = 2;
+    theme.density.radius_medium = 3;
+    theme.density.radius_large = 4;
+    theme.density.radius_pill = 3;
+    theme.density.toolbar_height = 30;
+    theme.density.tab_height = 26;
+    theme.density.space_xs = 2;
+    theme.density.space_sm = 4;
+    theme.density.space_md = 4;
+    theme.density.space_lg = 6;
+    theme.density.space_xl = 8;
+    theme.density.panel_header_height = 26;
+    theme.density.icon_size = 16;
+
+    // Overrides for specific tokens
     theme = theme
+        // Toolbar
+        .with_override("color_toolbar_bg", "#3c3f41")
+        .with_override("toolbar_bottom_border", "1px solid #323232")
         .with_override("color_accent_action_bg", "transparent")
-        .with_override("color_accent_action_text", "#b4c0d0")
-        .with_override("color_accent_action_hover", "alpha(#b4c0d0, 0.10)")
-        // Tab strip – flat, no rounding, neutral underline for active
+        .with_override("color_accent_action_text", "#a9b7c6")
+        .with_override("color_accent_action_hover", "alpha(#bbbbbb, 0.10)")
+        .with_override("color_button_text", "#a9b7c6")
+        .with_override("color_button_hover", "alpha(#bbbbbb, 0.08)")
+        .with_override("color_button_active", "alpha(#bbbbbb, 0.14)")
+        .with_override("control_height_button", "26px")
+        .with_override("space_button_inline", "6px")
+        .with_override("button_radius", "2px")
+        .with_override("icon_button_width", "24px")
+        .with_override("icon_button_height", "24px")
+        .with_override("icon_button_padding", "2px")
+        .with_override("icon_button_border", "0")
+        .with_override("color_icon_button_hover", "alpha(#bbbbbb, 0.10)")
+        .with_override("color_icon_button_hover_border", "transparent")
+        // Menu bar
+        .with_override("color_menu_bg", "#3c3f41")
+        .with_override("color_menu_text", "#bbbbbb")
+        .with_override("color_menu_hover", "alpha(#bbbbbb, 0.10)")
+        .with_override("menu_bar_height", "24px")
+        .with_override("control_height_small", "22px")
+        .with_override("space_menu_button_inline", "8px")
+        // Top bar
+        .with_override("color_topbar", "#3c3f41")
+        .with_override("topbar_border", "1px solid #323232")
+        .with_override("window_strip_height", "26px")
+        .with_override("window_strip_border", "1px solid #323232")
+        // Search
+        .with_override("search_radius", "2px")
+        .with_override("search_border", "1px solid #515151")
+        .with_override("color_search_bg", "#45494a")
+        .with_override("search_focus_border", "1px solid #589df6")
+        .with_override("color_search_focus_bg", "#45494a")
+        .with_override("color_entry_bg", "#45494a")
+        // Tabs – flat, no rounding
+        .with_override("tab_radius", "0")
         .with_override("color_workbench_tab_bg", "transparent")
-        .with_override("color_workbench_tab_text", "#6b7889")
-        .with_override("color_workbench_tab_hover", "alpha(#b4c0d0, 0.06)")
-        .with_override("color_workbench_tab_hover_text", "#b4c0d0")
+        .with_override("color_workbench_tab_text", "#787878")
+        .with_override("color_workbench_tab_hover", "alpha(#bbbbbb, 0.06)")
+        .with_override("color_workbench_tab_hover_text", "#a9b7c6")
         .with_override("color_workbench_tab_active", "transparent")
         .with_override("workbench_tab_border_width", "2px")
         .with_override("color_notebook_tab_bg", "transparent")
-        .with_override("color_notebook_tab_text", "#6b7889")
-        .with_override("color_notebook_tab_hover", "alpha(#b4c0d0, 0.06)")
-        .with_override("color_notebook_tab_hover_text", "#b4c0d0")
+        .with_override("color_notebook_tab_text", "#787878")
+        .with_override("color_notebook_tab_hover", "alpha(#bbbbbb, 0.06)")
+        .with_override("color_notebook_tab_hover_text", "#a9b7c6")
         .with_override("color_notebook_tab_active", "transparent")
-        .with_override("color_notebook_tab_active_border", "#546378")
+        .with_override("color_notebook_tab_active_border", "#4b6eaf")
         .with_override("notebook_tab_active_border_width", "2px")
-        .with_override("color_tab_strip_scroller_bg", "#0f1318")
-        .with_override("tab_strip_scroller_border", "1px solid alpha(#293241, 0.4)")
-        // Tighter button dimensions
-        .with_override("control_height_button", "30px")
-        .with_override("space_button_inline", "12px")
-        .with_override("button_radius", "2px")
-        .with_override("tab_radius", "0")
-        .with_override("search_radius", "3px")
-        .with_override("search_border", "0")
-        .with_override("color_search_bg", "#1e232b")
-        .with_override("color_entry_bg", "#1e232b");
+        .with_override("color_tab_strip_scroller_bg", "#3c3f41")
+        .with_override("tab_strip_scroller_border", "1px solid #323232")
+        // Popover/menus
+        .with_override("color_popover_bg", "#45494a")
+        .with_override("popover_border", "1px solid #515151")
+        .with_override("color_popover_button_text", "#bbbbbb")
+        .with_override("color_popover_button_hover", "#4b6eaf")
+        .with_override("color_popover_button_hover_text", "#ffffff")
+        // Scrollbar
+        .with_override("color_scrollbar_trough", "transparent")
+        .with_override("color_scrollbar_slider", "alpha(#888888, 0.3)")
+        .with_override("color_scrollbar_slider_hover", "alpha(#888888, 0.5)")
+        // Status bar
+        .with_override("color_status_bar_bg", "#3c3f41")
+        .with_override("color_status_item", "#787878")
+        .with_override("color_status_item_strong", "#a9b7c6")
+        // Separators
+        .with_override("color_separator_fill", "#323232")
+        .with_override("separator_alpha", "1.0")
+        .with_override("separator_size", "1px");
 
     theme
 }
 
-fn install_app_css(theme: &ThemeSpec) {
+fn install_app_css(_theme: &ThemeSpec) {
     let Some(display) = gdk::Display::default() else {
         return;
     };
 
-    let css = format!(
-        "
-        label.repo-state-clean {{
-            color: {success};
-        }}
+    let css = "
+        label.repo-state-clean {
+            color: #6a8759;
+        }
 
-        label.repo-state-warn {{
-            color: {warning};
-        }}
+        label.repo-state-warn {
+            color: #bbb529;
+        }
 
-        label.repo-state-error {{
-            color: {error};
-        }}
-
-        .topbar-masthead {{
-            background: {menu_strip};
-        }}
-
-        .topbar-masthead .menu-bar {{
-            background: transparent;
-        }}
-
-        .studio-toolbar button,
-        .studio-toolbar .toolbar-button,
-        .studio-toolbar .toolbar-icon-button,
-        .toolbar-actions button,
-        .toolbar-utility-group button {{
-            border: 0;
-            background: transparent;
-            box-shadow: none;
-        }}
-
-        .studio-toolbar button:hover,
-        .studio-toolbar .toolbar-button:hover,
-        .studio-toolbar .toolbar-icon-button:hover {{
-            background: alpha(#b4c0d0, 0.10);
-            color: #e7edf7;
-        }}
-
-        .studio-toolbar button:active,
-        .studio-toolbar .toolbar-button:active,
-        .studio-toolbar .toolbar-icon-button:active {{
-            background: alpha(#b4c0d0, 0.16);
-        }}
-
-        .toolbar-actions .toolbar-button-label,
-        .toolbar-actions button .toolbar-button-label {{
-            color: #b4c0d0;
-        }}
-
-        .toolbar-actions button:hover .toolbar-button-label {{
-            color: #e7edf7;
-        }}
+        label.repo-state-error {
+            color: #cc7832;
+        }
 
         .workbench-tab-strip > .tab-header,
         .drag-preview,
-        notebook header tab {{
+        notebook header tab {
             border-radius: 0;
             margin: 0;
-        }}
-        ",
-        success = "#7fdc8a",
-        warning = theme.palette.accent_strong,
-        error = "#ff6b6b",
-        menu_strip = "#161b22",
-    );
+        }
+        ";
 
     let provider = CssProvider::new();
     provider.load_from_data(&css);
