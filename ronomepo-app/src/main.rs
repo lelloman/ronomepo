@@ -6,7 +6,7 @@ use gtk::gdk;
 use gtk::gio::prelude::ApplicationExtManual;
 use gtk::prelude::ApplicationExt;
 use gtk::{
-    style_context_add_provider_for_display, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION,
+    style_context_add_provider_for_display, CssProvider, STYLE_PROVIDER_PRIORITY_USER,
 };
 use maruzzella::{
     build_application, default_product_spec, load_static_plugin, plugin_tab, BottomPanelLayout,
@@ -500,7 +500,11 @@ fn app_theme() -> ThemeSpec {
         // Separators
         .with_override("color_separator_fill", "#323232")
         .with_override("separator_alpha", "1.0")
-        .with_override("separator_size", "1px");
+        .with_override("separator_size", "1px")
+        // List selection – IntelliJ-style muted blue
+        .with_override("dense_row_selected_bg", "#2d5c88")
+        .with_override("dense_row_selected_text", "#ffffff")
+        .with_override("dense_row_hover_bg", "alpha(#2d5c88, 0.3)");
 
     theme
 }
@@ -523,6 +527,53 @@ fn install_app_css(_theme: &ThemeSpec) {
             color: #cc7832;
         }
 
+        row,
+        list row,
+        listview row,
+        .dense-row,
+        .boxed-list row {
+            margin: 0;
+            margin-top: 0;
+            margin-bottom: 0;
+            padding: 0;
+            border: 0;
+            border-top: 0;
+            border-bottom: 0;
+        }
+
+        .boxed-list {
+            border: 0;
+            border-radius: 0;
+            box-shadow: none;
+            background: transparent;
+            border-spacing: 0;
+        }
+
+        list separator {
+            min-height: 0;
+            background: transparent;
+        }
+
+        row.repo-selected {
+            background: #2d5c88;
+        }
+
+        row.repo-selected box,
+        row.repo-selected label {
+            background: transparent;
+            color: #ffffff;
+        }
+
+        row:hover,
+        list row:hover {
+            background: alpha(#2d5c88, 0.3);
+        }
+
+        row:hover box,
+        row:hover label {
+            background: transparent;
+        }
+
         .workbench-tab-strip > .tab-header,
         .drag-preview,
         notebook header tab {
@@ -536,6 +587,6 @@ fn install_app_css(_theme: &ThemeSpec) {
     style_context_add_provider_for_display(
         &display,
         &provider,
-        STYLE_PROVIDER_PRIORITY_APPLICATION,
+        STYLE_PROVIDER_PRIORITY_USER + 1,
     );
 }

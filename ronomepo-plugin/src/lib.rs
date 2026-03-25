@@ -1779,6 +1779,19 @@ fn sync_repository_monitor_selection(list: &ListBox, selected_repo_ids: &[String
         }
         index += 1;
     }
+    sync_selection_css(list);
+}
+
+fn sync_selection_css(list: &ListBox) {
+    let mut index = 0;
+    while let Some(row) = list.row_at_index(index) {
+        if row.is_selected() {
+            row.add_css_class("repo-selected");
+        } else {
+            row.remove_css_class("repo-selected");
+        }
+        index += 1;
+    }
 }
 
 fn repo_id_from_list_box_row(row: &ListBoxRow) -> Option<String> {
@@ -2761,6 +2774,7 @@ extern "C" fn create_repo_monitor_view(
                 list_ref.unselect_all();
                 list_ref.select_row(Some(&row));
             }
+            sync_selection_css(&list_ref);
             update_selected_repo_ids(selection_ids_from_list(&list_ref));
         });
         list.add_controller(click);
