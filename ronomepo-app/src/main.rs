@@ -555,18 +555,27 @@ fn install_app_css(_theme: &ThemeSpec) {
         }
 
         row.repo-selected {
-            background: #2d5c88;
+            background: #515658;
         }
 
         row.repo-selected box,
         row.repo-selected label {
             background: transparent;
+            color: #bbbbbb;
+        }
+
+        .pane-focused row.repo-selected {
+            background: #2d5c88;
+        }
+
+        .pane-focused row.repo-selected box,
+        .pane-focused row.repo-selected label {
             color: #ffffff;
         }
 
         row:hover,
         list row:hover {
-            background: alpha(#2d5c88, 0.3);
+            background: alpha(#bbbbbb, 0.08);
         }
 
         row:hover box,
@@ -574,11 +583,34 @@ fn install_app_css(_theme: &ThemeSpec) {
             background: transparent;
         }
 
+        .pane-focused row:hover,
+        .pane-focused list row:hover {
+            background: alpha(#2d5c88, 0.3);
+        }
+
         .workbench-tab-strip > .tab-header,
         .drag-preview,
         notebook header tab {
             border-radius: 0;
             margin: 0;
+        }
+
+        .workbench-tab-strip > .tab-header.active {
+            border-bottom-color: #515658;
+        }
+
+        .pane-focused .workbench-tab-strip > .tab-header.active {
+            border-bottom-color: #4b6eaf;
+        }
+
+        .linked > button:checked {
+            background: #515658;
+            color: #bbbbbb;
+        }
+
+        .pane-focused .linked > button:checked {
+            background: #2d5c88;
+            color: #ffffff;
         }
         ";
 
