@@ -1254,7 +1254,7 @@ fn handle_operation_event(
     event: OperationEvent,
 ) {
     if matches!(event.kind, OperationEventKind::Failed)
-        && matches!(operation, "Push" | "Push Force")
+        && matches!(operation, "Pull" | "Push" | "Push Force")
     {
         present_operation_failure_dialog(batch_id, operation, &event);
     }
