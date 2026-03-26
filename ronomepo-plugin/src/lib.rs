@@ -642,6 +642,7 @@ fn ensure_background_loops_started() {
     }
 
     glib::timeout_add_seconds_local(LOCAL_RESCAN_INTERVAL_SECS, || {
+        mark_all_repos_stale();
         schedule_pending_local_rescans();
         glib::ControlFlow::Continue
     });
@@ -2122,27 +2123,38 @@ fn mark_repo_stale(app_state: &mut AppState, repo_id: &str) {
 fn schedule_pending_local_rescans() {
     let scheduled = {
         let mut app_state = state().lock().expect("state mutex poisoned");
-        let items = app_state
+        app_state
             .repository_items
             .iter()
-            .map(|item| (item.id.clone(), item.status.repo_path.clone()))
-            .collect::<Vec<_>>();
-        items
-            .into_iter()
-            .filter_map(|(repo_id, repo_path)| {
-                let runtime = app_state.repo_runtime.get_mut(&repo_id)?;
+            .filter_map(|item| {
+                let runtime = app_state.repo_runtime.get(&item.id)?;
                 if runtime.local_refresh_in_flight || !runtime.needs_rescan() {
                     return None;
                 }
-                runtime.local_refresh_in_flight = true;
-                runtime.scheduled_scan_seq = runtime.invalidation_seq;
-                Some((repo_id, repo_path))
+                Some((item.id.clone(), item.status.repo_path.clone()))
             })
             .collect::<Vec<_>>()
     };
 
+    if !scheduled.is_empty() {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        for (repo_id, _) in &scheduled {
+            if let Some(runtime) = app_state.repo_runtime.get_mut(repo_id) {
+                runtime.local_refresh_in_flight = true;
+                runtime.scheduled_scan_seq = runtime.invalidation_seq;
+            }
+        }
+    }
+
     for (repo_id, repo_path) in scheduled {
         schedule_repository_status_refresh(&repo_id, repo_path);
+    }
+}
+
+fn mark_all_repos_stale() {
+    let mut app_state = state().lock().expect("state mutex poisoned");
+    for runtime in app_state.repo_runtime.values_mut() {
+        runtime.invalidation_seq = runtime.invalidation_seq.saturating_add(1);
     }
 }
 
