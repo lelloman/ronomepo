@@ -2445,20 +2445,27 @@ fn dispatch_watch_event_result(event: notify::Result<notify::Event>) {
 }
 
 fn handle_watch_paths(paths: Vec<PathBuf>) {
-    let mut touched = HashSet::new();
-    let mut app_state = state().lock().expect("state mutex poisoned");
-    let Some(manifest) = app_state.manifest.clone() else {
-        return;
+    let any_marked = {
+        let mut touched = HashSet::new();
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        let Some(manifest) = app_state.manifest.clone() else {
+            return;
+        };
+
+        for path in paths {
+            if let Some(repo_id) = repo_id_for_watch_path(&manifest, &path) {
+                touched.insert(repo_id);
+            }
+        }
+
+        for repo_id in &touched {
+            mark_repo_stale(&mut app_state, repo_id);
+        }
+        !touched.is_empty()
     };
 
-    for path in paths {
-        if let Some(repo_id) = repo_id_for_watch_path(&manifest, &path) {
-            touched.insert(repo_id);
-        }
-    }
-
-    for repo_id in touched {
-        mark_repo_stale(&mut app_state, &repo_id);
+    if any_marked {
+        schedule_pending_local_rescans();
     }
 }
 
