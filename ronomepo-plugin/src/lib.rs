@@ -2787,14 +2787,20 @@ extern "C" fn create_repo_monitor_view(
                         list_ref.select_row(Some(&r));
                     }
                 }
-            } else if row.is_selected() {
-                list_ref.unselect_row(&row);
             } else {
                 list_ref.unselect_all();
                 list_ref.select_row(Some(&row));
             }
             sync_selection_css(&list_ref);
             update_selected_repo_ids(selection_ids_from_list(&list_ref));
+            if !ctrl && !shift {
+                let repo_id = repo_id_from_list_box_row(&row).unwrap_or_default();
+                if repo_id == MONOREPO_ROW_ID {
+                    let _ = command_open_overview(maruzzella_sdk::ffi::MzBytes::empty());
+                } else if !repo_id.is_empty() {
+                    open_repo_overviews(host, std::slice::from_ref(&repo_id));
+                }
+            }
         });
         list.add_controller(click);
     }

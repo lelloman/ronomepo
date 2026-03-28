@@ -2,16 +2,13 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use gtk::gdk;
 use gtk::gio::prelude::ApplicationExtManual;
-use gtk::prelude::ApplicationExt;
-use gtk::{
-    style_context_add_provider_for_display, CssProvider, STYLE_PROVIDER_PRIORITY_USER,
-};
 use maruzzella::{
     build_application, default_product_spec, load_static_plugin, plugin_tab, BottomPanelLayout,
-    CommandSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, TabGroupSpec, ThemeSpec,
-    PanelResizePolicy, ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec,
+    ButtonAppearance, ButtonStyle, CommandSpec, InputAppearance, MaruzzellaConfig, MenuItemSpec,
+    MenuRootSpec, PanelResizePolicy, SurfaceAppearance, SurfaceLevel, TabGroupSpec,
+    TabStripAppearance, TabStripStyle, TextAppearance, TextRole, ThemeSpec, Tone,
+    ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec,
 };
 use ronomepo_core::normalize_workspace_root;
 
@@ -188,6 +185,7 @@ fn main() {
             payload: Vec::new(),
             secondary: false,
             display_mode: ToolbarDisplayMode::IconOnly,
+            appearance_id: "ronomepo-toolbar-primary".to_string(),
         },
         ToolbarItemSpec {
             id: "pull".to_string(),
@@ -197,6 +195,7 @@ fn main() {
             payload: Vec::new(),
             secondary: false,
             display_mode: ToolbarDisplayMode::IconOnly,
+            appearance_id: "ronomepo-toolbar-primary".to_string(),
         },
         ToolbarItemSpec {
             id: "push".to_string(),
@@ -206,6 +205,7 @@ fn main() {
             payload: Vec::new(),
             secondary: false,
             display_mode: ToolbarDisplayMode::IconOnly,
+            appearance_id: "ronomepo-toolbar-primary".to_string(),
         },
         ToolbarItemSpec {
             id: "monorepo-overview".to_string(),
@@ -215,6 +215,7 @@ fn main() {
             payload: Vec::new(),
             secondary: true,
             display_mode: ToolbarDisplayMode::IconOnly,
+            appearance_id: "ronomepo-toolbar-ghost".to_string(),
         },
         ToolbarItemSpec {
             id: "commit-check".to_string(),
@@ -224,6 +225,7 @@ fn main() {
             payload: Vec::new(),
             secondary: true,
             display_mode: ToolbarDisplayMode::IconOnly,
+            appearance_id: "ronomepo-toolbar-ghost".to_string(),
         },
     ];
 
@@ -242,8 +244,16 @@ fn main() {
             false,
         )],
     )
-    .with_tab_strip_hidden();
-    product.layout.right_panel = TabGroupSpec::new("panel-right", None, Vec::new());
+    .with_tab_strip_hidden()
+    .with_panel_appearance("ronomepo-side-panel")
+    .with_panel_header_appearance("ronomepo-panel-header")
+    .with_tab_strip_appearance("ronomepo-side-tabs")
+    .with_text_appearance("body");
+    product.layout.right_panel = TabGroupSpec::new("panel-right", None, Vec::new())
+        .with_panel_appearance("ronomepo-side-panel")
+        .with_panel_header_appearance("ronomepo-panel-header")
+        .with_tab_strip_appearance("ronomepo-side-tabs")
+        .with_text_appearance("body");
     product.layout.bottom_panel = TabGroupSpec::new(
         "panel-bottom",
         Some("operations"),
@@ -256,41 +266,47 @@ fn main() {
             false,
         )],
     )
-    .with_tab_strip_hidden();
-    product.layout.workbench = WorkbenchNodeSpec::Group(TabGroupSpec::new(
-        "workbench-main",
-        Some("monorepo-overview"),
-        vec![
-            plugin_tab(
-                "monorepo-overview",
-                "workbench-main",
-                "Monorepo Overview",
-                "com.lelloman.ronomepo.monorepo_overview",
-                "The Ronomepo monorepo overview could not be created.",
-                false,
-            ),
-            plugin_tab(
-                "commit-check",
-                "workbench-main",
-                "Commit Check",
-                "com.lelloman.ronomepo.commit_check",
-                "The Ronomepo commit check view could not be created.",
-                false,
-            ),
-        ],
-    ));
+    .with_tab_strip_hidden()
+    .with_panel_appearance("ronomepo-bottom-panel")
+    .with_panel_header_appearance("ronomepo-panel-header")
+    .with_tab_strip_appearance("ronomepo-console-tabs")
+    .with_text_appearance("body");
+    product.layout.workbench = WorkbenchNodeSpec::Group(
+        TabGroupSpec::new(
+            "workbench-main",
+            Some("monorepo-overview"),
+            vec![
+                plugin_tab(
+                    "monorepo-overview",
+                    "workbench-main",
+                    "Monorepo Overview",
+                    "com.lelloman.ronomepo.monorepo_overview",
+                    "The Ronomepo monorepo overview could not be created.",
+                    false,
+                ),
+                plugin_tab(
+                    "commit-check",
+                    "workbench-main",
+                    "Commit Check",
+                    "com.lelloman.ronomepo.commit_check",
+                    "The Ronomepo commit check view could not be created.",
+                    false,
+                ),
+            ],
+        )
+        .with_panel_appearance("ronomepo-workbench")
+        .with_panel_header_appearance("ronomepo-workbench-header")
+        .with_tab_strip_appearance("ronomepo-editor-tabs")
+        .with_text_appearance("body"),
+    );
 
-    let theme = app_theme();
     let config = MaruzzellaConfig::new("com.lelloman.ronomepo")
         .with_persistence_id("ronomepo")
-        .with_theme(theme.clone())
+        .with_theme(app_theme())
         .with_product(product)
         .with_builtin_plugin(embedded_ronomepo_plugin);
 
     let application = build_application(config);
-    application.connect_startup(move |_| {
-        install_app_css(&theme);
-    });
     let argv0 = env::args()
         .next()
         .unwrap_or_else(|| "ronomepo-app".to_string());
@@ -417,198 +433,128 @@ fn app_theme() -> ThemeSpec {
     theme.density.min_side_panel_width = 200;
     theme.density.min_bottom_panel_height = 200;
 
-    // Overrides for specific tokens
     theme = theme
-        // Toolbar
-        .with_override("color_toolbar_bg", "#3c3f41")
-        .with_override("toolbar_bottom_border", "1px solid #323232")
-        .with_override("color_accent_action_bg", "transparent")
-        .with_override("color_accent_action_text", "#a9b7c6")
-        .with_override("color_accent_action_hover", "alpha(#bbbbbb, 0.10)")
-        .with_override("color_button_text", "#a9b7c6")
-        .with_override("color_button_hover", "alpha(#bbbbbb, 0.08)")
-        .with_override("color_button_active", "alpha(#bbbbbb, 0.14)")
-        .with_override("control_height_button", "26px")
-        .with_override("space_button_inline", "6px")
-        .with_override("button_radius", "2px")
-        .with_override("icon_button_width", "24px")
-        .with_override("icon_button_height", "24px")
-        .with_override("icon_button_padding", "2px")
-        .with_override("icon_button_border", "0")
-        .with_override("color_icon_button_hover", "alpha(#bbbbbb, 0.10)")
-        .with_override("color_icon_button_hover_border", "transparent")
-        // Menu bar
-        .with_override("color_menu_bg", "#3c3f41")
-        .with_override("color_menu_text", "#bbbbbb")
-        .with_override("color_menu_hover", "alpha(#bbbbbb, 0.10)")
-        .with_override("menu_bar_height", "24px")
-        .with_override("control_height_small", "22px")
-        .with_override("space_menu_button_inline", "8px")
-        // Top bar
-        .with_override("color_topbar", "#3c3f41")
-        .with_override("topbar_border", "1px solid #323232")
-        .with_override("window_strip_height", "26px")
-        .with_override("window_strip_border", "1px solid #323232")
-        // Search
-        .with_override("search_radius", "2px")
-        .with_override("search_border", "1px solid #515151")
-        .with_override("color_search_bg", "#45494a")
-        .with_override("search_focus_border", "1px solid #589df6")
-        .with_override("color_search_focus_bg", "#45494a")
-        .with_override("color_entry_bg", "#45494a")
-        // Tabs – flat, no rounding
-        .with_override("tab_radius", "0")
-        .with_override("color_workbench_tab_bg", "transparent")
-        .with_override("color_workbench_tab_text", "#787878")
-        .with_override("color_workbench_tab_hover", "alpha(#bbbbbb, 0.06)")
-        .with_override("color_workbench_tab_hover_text", "#a9b7c6")
-        .with_override("color_workbench_tab_active", "transparent")
-        .with_override("workbench_tab_border_width", "2px")
-        .with_override("color_notebook_tab_bg", "transparent")
-        .with_override("color_notebook_tab_text", "#787878")
-        .with_override("color_notebook_tab_hover", "alpha(#bbbbbb, 0.06)")
-        .with_override("color_notebook_tab_hover_text", "#a9b7c6")
-        .with_override("color_notebook_tab_active", "transparent")
-        .with_override("color_notebook_tab_active_border", "#4b6eaf")
-        .with_override("notebook_tab_active_border_width", "2px")
-        .with_override("color_tab_strip_scroller_bg", "#3c3f41")
-        .with_override("tab_strip_scroller_border", "1px solid #323232")
-        // Popover/menus
-        .with_override("color_popover_bg", "#45494a")
-        .with_override("popover_border", "1px solid #515151")
-        .with_override("color_popover_button_text", "#bbbbbb")
-        .with_override("color_popover_button_hover", "#4b6eaf")
-        .with_override("color_popover_button_hover_text", "#ffffff")
-        // Scrollbar
-        .with_override("color_scrollbar_trough", "transparent")
-        .with_override("color_scrollbar_slider", "alpha(#888888, 0.3)")
-        .with_override("color_scrollbar_slider_hover", "alpha(#888888, 0.5)")
-        // Status bar
-        .with_override("color_status_bar_bg", "#3c3f41")
-        .with_override("color_status_item", "#787878")
-        .with_override("color_status_item_strong", "#a9b7c6")
-        // Separators
+        .with_surface_appearance(
+            "app-shell",
+            SurfaceAppearance::new(Tone::Neutral, SurfaceLevel::Sunken, TextRole::Body)
+                .borderless(),
+        )
+        .with_surface_appearance(
+            "topbar",
+            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Raised, TextRole::BodyStrong),
+        )
+        .with_surface_appearance(
+            "menu",
+            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Flat, TextRole::BodyStrong)
+                .borderless(),
+        )
+        .with_surface_appearance(
+            "toolbar",
+            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Flat, TextRole::Body),
+        )
+        .with_surface_appearance(
+            "status",
+            SurfaceAppearance::new(Tone::Secondary, SurfaceLevel::Raised, TextRole::Meta),
+        )
+        .with_surface_appearance(
+            "ronomepo-side-panel",
+            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Raised, TextRole::Body),
+        )
+        .with_surface_appearance(
+            "ronomepo-panel-header",
+            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Flat, TextRole::SectionLabel),
+        )
+        .with_surface_appearance(
+            "ronomepo-bottom-panel",
+            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Raised, TextRole::Body),
+        )
+        .with_surface_appearance(
+            "ronomepo-workbench",
+            SurfaceAppearance::new(Tone::Neutral, SurfaceLevel::Sunken, TextRole::Body)
+                .borderless(),
+        )
+        .with_surface_appearance(
+            "ronomepo-workbench-header",
+            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Flat, TextRole::TabLabel),
+        )
+        .with_button_appearance(
+            "primary",
+            ButtonAppearance::new(Tone::Accent, ButtonStyle::Solid, TextRole::BodyStrong),
+        )
+        .with_button_appearance(
+            "secondary",
+            ButtonAppearance::new(Tone::Primary, ButtonStyle::Soft, TextRole::Body),
+        )
+        .with_button_appearance(
+            "ghost",
+            ButtonAppearance::new(Tone::Neutral, ButtonStyle::Ghost, TextRole::Body),
+        )
+        .with_button_appearance(
+            "ronomepo-toolbar-primary",
+            ButtonAppearance::new(Tone::Accent, ButtonStyle::Ghost, TextRole::BodyStrong),
+        )
+        .with_button_appearance(
+            "ronomepo-toolbar-ghost",
+            ButtonAppearance::new(Tone::Neutral, ButtonStyle::Ghost, TextRole::Body),
+        )
+        .with_text_appearance(
+            "title",
+            TextAppearance {
+                role: TextRole::Title,
+                tone: Tone::Primary,
+            },
+        )
+        .with_text_appearance(
+            "subtitle",
+            TextAppearance {
+                role: TextRole::Subtitle,
+                tone: Tone::Secondary,
+            },
+        )
+        .with_text_appearance(
+            "body",
+            TextAppearance {
+                role: TextRole::Body,
+                tone: Tone::Primary,
+            },
+        )
+        .with_text_appearance(
+            "meta",
+            TextAppearance {
+                role: TextRole::Meta,
+                tone: Tone::Neutral,
+            },
+        )
+        .with_text_appearance(
+            "code",
+            TextAppearance {
+                role: TextRole::Code,
+                tone: Tone::Primary,
+            },
+        )
+        .with_input_appearance(
+            "search",
+            InputAppearance::new(Tone::Secondary, SurfaceLevel::Sunken, TextRole::Body),
+        )
+        .with_tab_strip_appearance(
+            "ronomepo-side-tabs",
+            TabStripAppearance::new(Tone::Primary, TabStripStyle::Utility, TextRole::TabLabel),
+        )
+        .with_tab_strip_appearance(
+            "ronomepo-editor-tabs",
+            TabStripAppearance::new(Tone::Neutral, TabStripStyle::Editor, TextRole::TabLabel),
+        )
+        .with_tab_strip_appearance(
+            "ronomepo-console-tabs",
+            TabStripAppearance::new(Tone::Primary, TabStripStyle::Console, TextRole::TabLabel),
+        )
+        // Keep token overrides for stateful shell details not fully expressed by appearance ids.
         .with_override("color_separator_fill", "#323232")
         .with_override("separator_alpha", "1.0")
         .with_override("separator_size", "1px")
-        // List selection – IntelliJ-style muted blue
         .with_override("dense_row_selected_bg", "#2d5c88")
         .with_override("dense_row_selected_text", "#ffffff")
         .with_override("dense_row_hover_bg", "alpha(#2d5c88, 0.3)");
 
     theme
-}
-
-fn install_app_css(_theme: &ThemeSpec) {
-    let Some(display) = gdk::Display::default() else {
-        return;
-    };
-
-    let css = "
-        label.repo-state-clean {
-            color: #6a8759;
-        }
-
-        label.repo-state-warn {
-            color: #bbb529;
-        }
-
-        label.repo-state-error {
-            color: #cc7832;
-        }
-
-        row,
-        list row,
-        listview row,
-        .dense-row,
-        .boxed-list row {
-            margin: 0;
-            margin-top: 0;
-            margin-bottom: 0;
-            padding: 0;
-            border: 0;
-            border-top: 0;
-            border-bottom: 0;
-        }
-
-        .boxed-list {
-            border: 0;
-            border-radius: 0;
-            box-shadow: none;
-            background: transparent;
-            border-spacing: 0;
-        }
-
-        list separator {
-            min-height: 0;
-            background: transparent;
-        }
-
-        row.repo-selected {
-            background: #515658;
-        }
-
-        row.repo-selected box,
-        row.repo-selected label {
-            background: transparent;
-            color: #bbbbbb;
-        }
-
-        .pane-focused row.repo-selected {
-            background: #2d5c88;
-        }
-
-        .pane-focused row.repo-selected box,
-        .pane-focused row.repo-selected label {
-            color: #ffffff;
-        }
-
-        row:hover,
-        list row:hover {
-            background: alpha(#bbbbbb, 0.08);
-        }
-
-        row:hover box,
-        row:hover label {
-            background: transparent;
-        }
-
-        .pane-focused row:hover,
-        .pane-focused list row:hover {
-            background: alpha(#2d5c88, 0.3);
-        }
-
-        .workbench-tab-strip > .tab-header,
-        .drag-preview,
-        notebook header tab {
-            border-radius: 0;
-            margin: 0;
-        }
-
-        .workbench-tab-strip > .tab-header.active {
-            border-bottom-color: #515658;
-        }
-
-        .pane-focused .workbench-tab-strip > .tab-header.active {
-            border-bottom-color: #4b6eaf;
-        }
-
-        .linked > button:checked {
-            background: #515658;
-            color: #bbbbbb;
-        }
-
-        .pane-focused .linked > button:checked {
-            background: #2d5c88;
-            color: #ffffff;
-        }
-        ";
-
-    let provider = CssProvider::new();
-    provider.load_from_data(&css);
-    style_context_add_provider_for_display(
-        &display,
-        &provider,
-        STYLE_PROVIDER_PRIORITY_USER + 1,
-    );
 }
