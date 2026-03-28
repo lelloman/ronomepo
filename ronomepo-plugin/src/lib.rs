@@ -1856,7 +1856,6 @@ fn build_repo_monitor_row(
         false,
     );
     let status = monitor_state_cell(&item.status.state);
-    status.add_css_class("pill");
 
     let sync = monitor_sync_cell(&item.status.sync);
 

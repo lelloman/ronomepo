@@ -2,7 +2,10 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+use gtk::gdk;
 use gtk::gio::prelude::ApplicationExtManual;
+use gtk::prelude::ApplicationExt;
+use gtk::{style_context_add_provider_for_display, CssProvider, STYLE_PROVIDER_PRIORITY_USER};
 use maruzzella::{
     build_application, default_product_spec, load_static_plugin, plugin_tab, BottomPanelLayout,
     ButtonAppearance, ButtonStyle, CommandSpec, InputAppearance, MaruzzellaConfig, MenuItemSpec,
@@ -300,13 +303,17 @@ fn main() {
         .with_text_appearance("body"),
     );
 
+    let theme = app_theme();
     let config = MaruzzellaConfig::new("com.lelloman.ronomepo")
         .with_persistence_id("ronomepo")
-        .with_theme(app_theme())
+        .with_theme(theme.clone())
         .with_product(product)
         .with_builtin_plugin(embedded_ronomepo_plugin);
 
     let application = build_application(config);
+    application.connect_startup(move |_| {
+        install_selection_css(&theme);
+    });
     let argv0 = env::args()
         .next()
         .unwrap_or_else(|| "ronomepo-app".to_string());
@@ -557,4 +564,37 @@ fn app_theme() -> ThemeSpec {
         .with_override("dense_row_hover_bg", "alpha(#2d5c88, 0.3)");
 
     theme
+}
+
+fn install_selection_css(_theme: &ThemeSpec) {
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
+
+    let css = "
+        row.repo-selected box,
+        row.repo-selected label {
+            background: transparent;
+        }
+
+        row.repo-selected:hover,
+        list row.repo-selected:hover,
+        .pane-focused row.repo-selected:hover,
+        .pane-focused list row.repo-selected:hover {
+            background: #2d5c88;
+        }
+
+        .pane-focused row.repo-selected box,
+        .pane-focused row.repo-selected label {
+            color: #ffffff;
+        }
+        ";
+
+    let provider = CssProvider::new();
+    provider.load_from_data(css);
+    style_context_add_provider_for_display(
+        &display,
+        &provider,
+        STYLE_PROVIDER_PRIORITY_USER + 1,
+    );
 }
