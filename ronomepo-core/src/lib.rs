@@ -705,12 +705,7 @@ fn push_workspace_root(manifest: &WorkspaceManifest) -> OperationEvent {
         };
     }
 
-    match Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .arg("push")
-        .output()
-    {
+    match Command::new("git").arg("-C").arg(root).arg("push").output() {
         Ok(output) if output.status.success() => OperationEvent {
             kind: OperationEventKind::Success,
             repository_id: None,
