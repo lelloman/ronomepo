@@ -4145,6 +4145,7 @@ fn save_workspace_manifest_from_inputs(
     )?;
     let manifest_path = default_manifest_path(&workspace_root);
     save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
+    sync_workspace_gitignore(&workspace_root, &manifest.repos).map_err(|error| error.to_string())?;
     let repo_count = manifest.repos.len();
 
     Ok(SaveManifestResult {
@@ -4160,6 +4161,53 @@ fn save_workspace_manifest_from_inputs(
             repo_count
         ),
     })
+}
+
+fn sync_workspace_gitignore(
+    workspace_root: &Path,
+    repos: &[RepositoryEntry],
+) -> Result<(), std::io::Error> {
+    let gitignore_path = workspace_root.join(".gitignore");
+    let mut content = match fs::read_to_string(&gitignore_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+
+    let mut additions = Vec::new();
+    for repo in repos {
+        if !gitignore_contains_repo_dir(&content, &repo.dir_name) {
+            additions.push(format!("/{}/", repo.dir_name.trim_matches('/')));
+        }
+    }
+
+    if additions.is_empty() {
+        return Ok(());
+    }
+
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+
+    for entry in additions {
+        content.push_str(&entry);
+        content.push('\n');
+    }
+
+    fs::write(gitignore_path, content)
+}
+
+fn gitignore_contains_repo_dir(content: &str, dir_name: &str) -> bool {
+    let normalized = dir_name.trim().trim_matches('/');
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .any(|line| {
+            let line = line.trim_end_matches('/');
+            let line = line.strip_prefix('/').unwrap_or(line);
+            line == normalized
+        })
 }
 
 fn apply_loaded_manifest(
@@ -5533,6 +5581,65 @@ mod tests {
         assert_eq!(result.manifest.repos.len(), 1);
         assert_eq!(result.manifest.repos[0].id, "alpha");
         assert_eq!(result.manifest.repos[0].name, "alpha");
+    }
+
+    #[test]
+    fn save_workspace_manifest_adds_repo_directories_to_gitignore() {
+        let workspace_root = temp_test_dir("save-manifest-gitignore");
+        fs::write(workspace_root.join(".gitignore"), "hooks/\n/alpha/\n").unwrap();
+
+        save_workspace_manifest_from_inputs(
+            7,
+            "Workspace",
+            workspace_root.to_str().unwrap(),
+            "",
+            &[
+                RepoEditorRowInput {
+                    enabled: true,
+                    name: "alpha".to_string(),
+                    dir_name: "alpha".to_string(),
+                    remote_url: "git@example.com:org/alpha.git".to_string(),
+                },
+                RepoEditorRowInput {
+                    enabled: true,
+                    name: "beta".to_string(),
+                    dir_name: "beta".to_string(),
+                    remote_url: "git@example.com:org/beta.git".to_string(),
+                },
+            ],
+            None,
+            false,
+        )
+        .unwrap();
+
+        let gitignore = fs::read_to_string(workspace_root.join(".gitignore")).unwrap();
+        assert!(gitignore.contains("hooks/\n"));
+        assert_eq!(gitignore.matches("/alpha/\n").count(), 1);
+        assert_eq!(gitignore.matches("/beta/\n").count(), 1);
+    }
+
+    #[test]
+    fn save_workspace_manifest_creates_gitignore_when_missing() {
+        let workspace_root = temp_test_dir("save-manifest-gitignore-create");
+
+        save_workspace_manifest_from_inputs(
+            7,
+            "Workspace",
+            workspace_root.to_str().unwrap(),
+            "",
+            &[RepoEditorRowInput {
+                enabled: true,
+                name: "alpha".to_string(),
+                dir_name: "alpha".to_string(),
+                remote_url: "git@example.com:org/alpha.git".to_string(),
+            }],
+            None,
+            false,
+        )
+        .unwrap();
+
+        let gitignore = fs::read_to_string(workspace_root.join(".gitignore")).unwrap();
+        assert_eq!(gitignore, "/alpha/\n");
     }
 }
 
