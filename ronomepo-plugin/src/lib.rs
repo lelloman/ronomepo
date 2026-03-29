@@ -478,9 +478,8 @@ fn run_worker_job(queued_job: QueuedJob) {
             run_workspace_operation(&manifest, &selected_repo_ids, kind, |event| {
                 let event = event.clone();
                 let manifest = manifest.clone();
-                main_context.invoke(move || {
-                    handle_operation_event(batch_id, operation, manifest, event)
-                });
+                main_context
+                    .invoke(move || handle_operation_event(batch_id, operation, manifest, event));
             });
         }
         WorkerJob::WorkspaceScan {
@@ -1305,9 +1304,9 @@ fn handle_worker_result(result: WorkerResult) {
             refresh_views();
         }
         WorkerResult::RepositoryStatusRefreshed { repo_id, status } => {
-            {
+            let follow_up_refresh = {
                 let mut app_state = state().lock().expect("state mutex poisoned");
-                mark_repo_scan_completed(&mut app_state, &repo_id);
+                let follow_up_refresh = finalize_repo_status_refresh(&mut app_state, &repo_id);
                 if let Some(item) = app_state
                     .repository_items
                     .iter_mut()
@@ -1315,6 +1314,10 @@ fn handle_worker_result(result: WorkerResult) {
                 {
                     item.status = status;
                 }
+                follow_up_refresh
+            };
+            if let Some(repo_path) = follow_up_refresh {
+                schedule_repository_status_refresh(&repo_id, repo_path);
             }
             refresh_views();
         }
@@ -1930,15 +1933,17 @@ fn matches_filter_mode(item: &RepositoryListItem, mode: MonitorFilterMode) -> bo
             item.status.sync,
             RepositorySync::UpToDate | RepositorySync::NoUpstream
         ),
-        MonitorFilterMode::Issues => matches!(
-            item.status.state,
-            RepositoryState::Missing | RepositoryState::Unknown
-        ) || matches!(
-            item.status.sync,
-            RepositorySync::Diverged { .. }
-                | RepositorySync::NoUpstream
-                | RepositorySync::Unknown
-        ),
+        MonitorFilterMode::Issues => {
+            matches!(
+                item.status.state,
+                RepositoryState::Missing | RepositoryState::Unknown
+            ) || matches!(
+                item.status.sync,
+                RepositorySync::Diverged { .. }
+                    | RepositorySync::NoUpstream
+                    | RepositorySync::Unknown
+            )
+        }
     }
 }
 
@@ -2095,6 +2100,31 @@ fn mark_repo_scan_completed(app_state: &mut AppState, repo_id: &str) {
     runtime.last_local_scan_at = Some(now);
 }
 
+fn finalize_repo_status_refresh(app_state: &mut AppState, repo_id: &str) -> Option<PathBuf> {
+    mark_repo_scan_completed(app_state, repo_id);
+
+    let needs_follow_up = app_state
+        .repo_runtime
+        .get(repo_id)
+        .is_some_and(RepoRuntimeState::needs_rescan);
+    if !needs_follow_up {
+        return None;
+    }
+
+    let repo_path = app_state
+        .repository_items
+        .iter()
+        .find(|item| item.id == repo_id)
+        .map(|item| item.status.repo_path.clone())?;
+
+    if let Some(runtime) = app_state.repo_runtime.get_mut(repo_id) {
+        runtime.local_refresh_in_flight = true;
+        runtime.scheduled_scan_seq = runtime.invalidation_seq;
+    }
+
+    Some(repo_path)
+}
+
 fn mark_remote_fetch_completed(app_state: &mut AppState, repo_id: &str, success: bool) {
     let now = SystemTime::now();
     let runtime = app_state
@@ -2121,7 +2151,7 @@ fn mark_repo_stale(app_state: &mut AppState, repo_id: &str) {
 
 fn schedule_pending_local_rescans() {
     let scheduled = {
-        let mut app_state = state().lock().expect("state mutex poisoned");
+        let app_state = state().lock().expect("state mutex poisoned");
         app_state
             .repository_items
             .iter()
@@ -3261,8 +3291,7 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
         &sections,
         "Selection Scope",
         &if snapshot.selected_repo_ids.is_empty() {
-            "No repos selected. Commit Check scans all eligible repos in the workspace."
-                .to_string()
+            "No repos selected. Commit Check scans all eligible repos in the workspace.".to_string()
         } else {
             format!(
                 "{} repos selected. Commit Check reports only against the current selection.",
@@ -4145,7 +4174,8 @@ fn save_workspace_manifest_from_inputs(
     )?;
     let manifest_path = default_manifest_path(&workspace_root);
     save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
-    sync_workspace_gitignore(&workspace_root, &manifest.repos).map_err(|error| error.to_string())?;
+    sync_workspace_gitignore(&workspace_root, &manifest.repos)
+        .map_err(|error| error.to_string())?;
     let repo_count = manifest.repos.len();
 
     Ok(SaveManifestResult {
@@ -5466,6 +5496,7 @@ fn workspace_name_from_root(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ronomepo_core::{RepositoryState, RepositorySync};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::UNIX_EPOCH;
 
@@ -5511,6 +5542,47 @@ mod tests {
         assert!(!watch_path_is_relevant(Path::new("src/lib.rs.swp")));
         assert!(watch_path_is_relevant(Path::new(".git/HEAD")));
         assert!(watch_path_is_relevant(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn repo_refresh_completion_requeues_if_new_changes_arrived_mid_scan() {
+        let repo_path = temp_test_dir("refresh-race");
+        let repo_id = "alpha";
+        let mut app_state = AppState::default();
+        app_state.repository_items.push(RepositoryListItem {
+            id: repo_id.to_string(),
+            name: "alpha".to_string(),
+            dir_name: "alpha".to_string(),
+            remote_url: "git@example.com:org/alpha.git".to_string(),
+            status: RepositoryStatus {
+                state: RepositoryState::Clean,
+                branch: Some("main".to_string()),
+                sync: RepositorySync::UpToDate,
+                repo_path: repo_path.clone(),
+            },
+        });
+        app_state.repo_runtime.insert(
+            repo_id.to_string(),
+            RepoRuntimeState {
+                invalidation_seq: 2,
+                scheduled_scan_seq: 1,
+                last_scanned_seq: 0,
+                local_refresh_in_flight: true,
+                remote_fetch_in_flight: false,
+                last_local_scan_at: None,
+                last_fetch_at: None,
+                next_fetch_due_at: UNIX_EPOCH,
+            },
+        );
+
+        let follow_up = finalize_repo_status_refresh(&mut app_state, repo_id);
+        let runtime = app_state.repo_runtime.get(repo_id).unwrap();
+
+        assert_eq!(follow_up, Some(repo_path));
+        assert!(runtime.local_refresh_in_flight);
+        assert_eq!(runtime.last_scanned_seq, 1);
+        assert_eq!(runtime.scheduled_scan_seq, 2);
+        assert!(runtime.needs_rescan());
     }
 
     #[test]
