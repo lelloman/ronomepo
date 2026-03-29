@@ -2457,6 +2457,13 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
             .watch(path, RecursiveMode::Recursive)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         watched_any = true;
+
+        let repo_git_dir = path.join(".git");
+        if repo_git_dir.exists() {
+            watch_backend_mut(&mut backend)
+                .watch(&repo_git_dir, RecursiveMode::Recursive)
+                .map_err(|error| format!("{}: {error}", repo_git_dir.display()))?;
+        }
     }
 
     if !watched_any {
