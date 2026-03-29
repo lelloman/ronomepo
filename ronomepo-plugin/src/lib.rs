@@ -2434,15 +2434,33 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
         .filter(|(_, path)| path.exists())
         .collect::<Vec<_>>();
 
-    if repos.is_empty() {
-        return Err("no local repositories are available to watch".to_string());
+    let mut backend = create_watch_backend()?;
+    let workspace_root = &manifest.root;
+    let workspace_git_dir = workspace_root.join(".git");
+    let mut watched_any = false;
+
+    if workspace_root.exists() {
+        watch_backend_mut(&mut backend)
+            .watch(workspace_root, RecursiveMode::NonRecursive)
+            .map_err(|error| format!("{}: {error}", workspace_root.display()))?;
+        watched_any = true;
+    }
+    if workspace_git_dir.exists() {
+        watch_backend_mut(&mut backend)
+            .watch(&workspace_git_dir, RecursiveMode::Recursive)
+            .map_err(|error| format!("{}: {error}", workspace_git_dir.display()))?;
+        watched_any = true;
     }
 
-    let mut backend = create_watch_backend()?;
     for (_, path) in &repos {
         watch_backend_mut(&mut backend)
             .watch(path, RecursiveMode::Recursive)
             .map_err(|error| format!("{}: {error}", path.display()))?;
+        watched_any = true;
+    }
+
+    if !watched_any {
+        return Err("no local repositories are available to watch".to_string());
     }
 
     Ok(WatchManager { _backend: backend })
@@ -2486,14 +2504,18 @@ fn dispatch_watch_event_result(event: notify::Result<notify::Event>) {
 }
 
 fn handle_watch_paths(paths: Vec<PathBuf>) {
-    let any_marked = {
+    let (workspace_touched, any_marked) = {
         let mut touched = HashSet::new();
         let mut app_state = state().lock().expect("state mutex poisoned");
         let Some(manifest) = app_state.manifest.clone() else {
             return;
         };
+        let mut workspace_touched = false;
 
         for path in paths {
+            if workspace_watch_path_matches(&manifest, &path) {
+                workspace_touched = true;
+            }
             if let Some(repo_id) = repo_id_for_watch_path(&manifest, &path) {
                 touched.insert(repo_id);
             }
@@ -2502,12 +2524,39 @@ fn handle_watch_paths(paths: Vec<PathBuf>) {
         for repo_id in &touched {
             mark_repo_stale(&mut app_state, repo_id);
         }
-        !touched.is_empty()
+        (workspace_touched, !touched.is_empty())
     };
 
+    if workspace_touched {
+        let workspace_root = {
+            let app_state = state().lock().expect("state mutex poisoned");
+            app_state.workspace_root.clone()
+        };
+        schedule_workspace_root_status_refresh(workspace_root);
+    }
     if any_marked {
         schedule_pending_local_rescans();
     }
+}
+
+fn workspace_watch_path_matches(manifest: &WorkspaceManifest, path: &Path) -> bool {
+    if let Ok(relative) = path.strip_prefix(&manifest.root) {
+        if relative.components().count() == 0 {
+            return false;
+        }
+        if relative
+            .iter()
+            .next()
+            .is_some_and(|component| component == ".git")
+        {
+            return watch_path_is_relevant(relative);
+        }
+        return relative.components().count() == 1 && watch_path_is_relevant(relative);
+    }
+
+    path.strip_prefix(manifest.root.join(".git"))
+        .ok()
+        .is_some_and(watch_path_is_relevant)
 }
 
 fn repo_id_for_watch_path(manifest: &WorkspaceManifest, path: &Path) -> Option<String> {
@@ -5542,6 +5591,56 @@ mod tests {
         assert!(!watch_path_is_relevant(Path::new("src/lib.rs.swp")));
         assert!(watch_path_is_relevant(Path::new(".git/HEAD")));
         assert!(watch_path_is_relevant(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn workspace_watch_matches_root_git_events() {
+        let workspace_root = temp_test_dir("workspace-watch-root-git");
+        let manifest = WorkspaceManifest {
+            name: "Workspace".to_string(),
+            root: workspace_root.clone(),
+            repos: Vec::new(),
+            shared_hooks_path: None,
+        };
+
+        assert!(workspace_watch_path_matches(
+            &manifest,
+            &workspace_root.join(".git/refs/heads/main")
+        ));
+        assert!(workspace_watch_path_matches(
+            &manifest,
+            &workspace_root.join(".git/HEAD")
+        ));
+        assert!(!workspace_watch_path_matches(
+            &manifest,
+            &workspace_root.join(".git/objects/ab/cd")
+        ));
+    }
+
+    #[test]
+    fn workspace_watch_matches_top_level_workspace_files_only() {
+        let workspace_root = temp_test_dir("workspace-watch-root-files");
+        let manifest = WorkspaceManifest {
+            name: "Workspace".to_string(),
+            root: workspace_root.clone(),
+            repos: vec![RepositoryEntry {
+                id: "alpha".to_string(),
+                name: "alpha".to_string(),
+                dir_name: "alpha".to_string(),
+                remote_url: "git@example.com:org/alpha.git".to_string(),
+                enabled: true,
+            }],
+            shared_hooks_path: None,
+        };
+
+        assert!(workspace_watch_path_matches(
+            &manifest,
+            &workspace_root.join("Cargo.toml")
+        ));
+        assert!(!workspace_watch_path_matches(
+            &manifest,
+            &workspace_root.join("alpha/src/lib.rs")
+        ));
     }
 
     #[test]
