@@ -13,13 +13,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use gtk::gdk::RGBA;
 use gtk::gio;
 use gtk::glib::{self, translate::IntoGlibPtr, BoxedAnyObject};
 use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
     Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, Dialog, Entry,
-    FilterChange, GestureClick, Image, Label, ListBox, ListBoxRow, Orientation, PolicyType,
+    FilterChange, GestureClick, Image, Label, ListBox, ListBoxRow, Orientation, Paned, PolicyType,
     Popover, PositionType, ResponseType, ScrolledWindow, SelectionMode, Separator, SortListModel,
     SorterChange, TextBuffer, TextView, ToggleButton, Window, WrapMode,
 };
@@ -39,6 +40,8 @@ use ronomepo_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(feature = "embedded-terminal")]
+use vte4::prelude::*;
 
 const PLUGIN_ID: &str = "com.lelloman.ronomepo";
 const VIEW_REPO_MONITOR: &str = "com.lelloman.ronomepo.repo_monitor";
@@ -380,6 +383,7 @@ struct RepositoryViewHandle {
 #[derive(Default)]
 struct ContainerViewHandle {
     root: glib::WeakRef<GtkBox>,
+    auxiliary_root: glib::WeakRef<GtkBox>,
     instance_key: Option<String>,
     host_ptr: usize,
 }
@@ -1512,6 +1516,8 @@ fn refresh_views() {
 fn refresh_views_now() {
     let snapshot = snapshot();
     refresh_repository_views(&snapshot);
+    refresh_overview_views(&snapshot);
+    refresh_workspace_settings_views(&snapshot);
     refresh_operation_views(&snapshot);
 }
 
@@ -1564,6 +1570,9 @@ fn refresh_overview_views(snapshot: &StateSnapshot) {
                     handle.instance_key.as_deref(),
                     handle.host_ptr as *const _,
                 );
+                if let Some(panel) = handle.auxiliary_root.upgrade() {
+                    sync_repo_terminal_panel(&panel, &snapshot, handle.instance_key.as_deref());
+                }
                 true
             }
             None => false,
@@ -3149,6 +3158,7 @@ extern "C" fn create_monorepo_overview_view(
     MONOREPO_OVERVIEWS.with(|views| {
         views.borrow_mut().push(ContainerViewHandle {
             root: root_ref,
+            auxiliary_root: glib::WeakRef::new(),
             instance_key: None,
             host_ptr: host as usize,
         });
@@ -3195,6 +3205,7 @@ extern "C" fn create_commit_check_view(
     COMMIT_CHECK_VIEWS.with(|views| {
         views.borrow_mut().push(ContainerViewHandle {
             root: root_ref,
+            auxiliary_root: glib::WeakRef::new(),
             instance_key: None,
             host_ptr: host as usize,
         });
@@ -3466,18 +3477,38 @@ extern "C" fn create_repo_overview_view(
     let snapshot = snapshot();
     render_repo_overview_into(&root, &snapshot, instance_key.as_deref(), host);
 
+    let terminal_panel = GtkBox::new(Orientation::Vertical, 0);
+    terminal_panel.set_hexpand(true);
+    terminal_panel.set_vexpand(true);
+    terminal_panel.append(&build_repo_terminal_panel(
+        &snapshot,
+        instance_key.as_deref(),
+    ));
+    let split = Paned::new(Orientation::Vertical);
+    split.set_wide_handle(true);
+    split.set_resize_start_child(true);
+    split.set_shrink_start_child(false);
+    split.set_resize_end_child(true);
+    split.set_shrink_end_child(false);
+    split.set_position(520);
+    split.set_start_child(Some(&scroller));
+    split.set_end_child(Some(&terminal_panel));
+
     let root_ref = glib::WeakRef::new();
     root_ref.set(Some(&root));
+    let terminal_panel_ref = glib::WeakRef::new();
+    terminal_panel_ref.set(Some(&terminal_panel));
     REPO_OVERVIEWS.with(|views| {
         views.borrow_mut().push(ContainerViewHandle {
             root: root_ref,
+            auxiliary_root: terminal_panel_ref,
             instance_key,
             host_ptr: host as usize,
         });
     });
 
     unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(split.upcast())
             as *mut std::ffi::c_void
     }
 }
@@ -3514,6 +3545,7 @@ extern "C" fn create_workspace_settings_view(
     WORKSPACE_SETTINGS_VIEWS.with(|views| {
         views.borrow_mut().push(ContainerViewHandle {
             root: root_ref,
+            auxiliary_root: glib::WeakRef::new(),
             instance_key: None,
             host_ptr: host as usize,
         });
@@ -4574,6 +4606,206 @@ fn render_repo_overview_into(
     root.append(&sections);
 }
 
+fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str>) -> GtkBox {
+    let panel = GtkBox::new(Orientation::Vertical, 10);
+    panel.set_hexpand(true);
+    panel.set_vexpand(true);
+
+    let title_row = GtkBox::new(Orientation::Horizontal, 8);
+    let title = Label::new(Some("Embedded Terminal"));
+    title.set_xalign(0.0);
+    title.add_css_class("title-4");
+    title.set_hexpand(true);
+    title_row.append(&title);
+    panel.append(&title_row);
+
+    let target_repo_id = instance_key.or(snapshot.active_repo_id.as_deref());
+    let Some(item) = target_repo_id.and_then(|repo_id| repo_item_by_id(snapshot, repo_id)) else {
+        panel.add_css_class("repo-terminal-empty");
+        let body = Label::new(Some(
+            "No repository target is attached to this tab, so no terminal session can be started.",
+        ));
+        body.set_xalign(0.0);
+        body.set_wrap(true);
+        body.add_css_class("muted");
+        panel.append(&body);
+        return panel;
+    };
+
+    let external = Button::with_label("Open External Terminal");
+    let repo_path = item.status.repo_path.clone();
+    let repo_name = item.name.clone();
+    external.connect_clicked(move |_| {
+        open_path_in_terminal(&repo_path, &repo_name);
+    });
+    title_row.append(&external);
+
+    let subtitle = Label::new(Some(&format!(
+        "Shell working directory: {}",
+        item.status.repo_path.display()
+    )));
+    subtitle.set_xalign(0.0);
+    subtitle.set_wrap(true);
+    subtitle.add_css_class("muted");
+    panel.append(&subtitle);
+
+    #[cfg(feature = "embedded-terminal")]
+    {
+        panel.append(&build_vte_terminal_widget(
+            &item.status.repo_path,
+            &item.name,
+        ));
+    }
+
+    #[cfg(not(feature = "embedded-terminal"))]
+    {
+        let disabled = Label::new(Some(
+            "This build was compiled without the `embedded-terminal` feature. Enable that feature and install the VTE development package to render an interactive shell here.",
+        ));
+        disabled.set_xalign(0.0);
+        disabled.set_wrap(true);
+        disabled.add_css_class("muted");
+        panel.append(&disabled);
+    }
+
+    panel
+}
+
+fn sync_repo_terminal_panel(panel: &GtkBox, snapshot: &StateSnapshot, instance_key: Option<&str>) {
+    let target_repo_id = instance_key.or(snapshot.active_repo_id.as_deref());
+    let has_target = target_repo_id
+        .and_then(|repo_id| repo_item_by_id(snapshot, repo_id))
+        .is_some();
+    let current = panel.first_child();
+
+    if current.is_none() {
+        panel.append(&build_repo_terminal_panel(snapshot, instance_key));
+        return;
+    }
+
+    let Some(current) = current else {
+        return;
+    };
+    let is_empty = current.has_css_class("repo-terminal-empty");
+    if is_empty && has_target {
+        clear_box(panel);
+        panel.append(&build_repo_terminal_panel(snapshot, instance_key));
+    }
+}
+
+fn repo_item_by_id<'a>(
+    snapshot: &'a StateSnapshot,
+    repo_id: &str,
+) -> Option<&'a RepositoryListItem> {
+    snapshot
+        .repository_items
+        .iter()
+        .find(|item| item.id == repo_id)
+}
+
+#[cfg(feature = "embedded-terminal")]
+fn build_vte_terminal_widget(path: &Path, label: &str) -> GtkBox {
+    let panel = GtkBox::new(Orientation::Vertical, 8);
+    panel.set_hexpand(true);
+    panel.set_vexpand(true);
+
+    let terminal = vte4::Terminal::new();
+    terminal.set_hexpand(true);
+    terminal.set_vexpand(true);
+    terminal.set_scrollback_lines(10_000);
+    terminal.set_scroll_on_output(false);
+    terminal.set_scroll_on_keystroke(true);
+    terminal.set_mouse_autohide(true);
+    terminal.add_css_class("mono");
+    style_embedded_terminal_palette(&terminal);
+
+    let shell = preferred_embedded_shell();
+    spawn_shell_in_terminal(&terminal, path, label, &shell);
+
+    let action_row = GtkBox::new(Orientation::Horizontal, 8);
+    let restart = Button::with_label("Restart Shell");
+    {
+        let terminal = terminal.clone();
+        let shell = shell.clone();
+        let path = path.to_path_buf();
+        let label = label.to_string();
+        restart.connect_clicked(move |_| {
+            spawn_shell_in_terminal(&terminal, &path, &label, &shell);
+        });
+    }
+    action_row.append(&restart);
+    panel.append(&action_row);
+    panel.append(&terminal);
+
+    panel
+}
+
+#[cfg(feature = "embedded-terminal")]
+fn preferred_embedded_shell() -> String {
+    env::var("SHELL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/bin/bash".to_string())
+}
+
+#[cfg(feature = "embedded-terminal")]
+fn style_embedded_terminal_palette(terminal: &vte4::Terminal) {
+    let palette = [
+        rgba("#171717"),
+        rgba("#d16969"),
+        rgba("#7fb069"),
+        rgba("#d7ba7d"),
+        rgba("#6cb6ff"),
+        rgba("#c586c0"),
+        rgba("#4ec9b0"),
+        rgba("#d4d4d4"),
+        rgba("#6a6a6a"),
+        rgba("#f48771"),
+        rgba("#8ec07c"),
+        rgba("#e5c07b"),
+        rgba("#9cdcfe"),
+        rgba("#d7a6ff"),
+        rgba("#7fe4d2"),
+        rgba("#f0f0f0"),
+    ];
+    let palette_refs = palette.iter().collect::<Vec<_>>();
+    terminal.set_colors(None, None, &palette_refs);
+}
+
+#[cfg(feature = "embedded-terminal")]
+fn rgba(hex: &str) -> RGBA {
+    RGBA::parse(hex).expect("invalid hard-coded terminal color")
+}
+
+#[cfg(feature = "embedded-terminal")]
+fn spawn_shell_in_terminal(terminal: &vte4::Terminal, path: &Path, label: &str, shell: &str) {
+    if !path.exists() {
+        terminal.feed(b"Working directory does not exist.\r\n");
+        return;
+    }
+
+    let argv = [shell];
+    let cwd = path.to_string_lossy().to_string();
+    let repo_label = label.to_string();
+    terminal.spawn_async(
+        vte4::PtyFlags::DEFAULT,
+        Some(cwd.as_str()),
+        &argv,
+        &[],
+        glib::SpawnFlags::SEARCH_PATH,
+        || {},
+        -1,
+        None::<&gio::Cancellable>,
+        move |result| {
+            if let Err(error) = result {
+                append_log(format!(
+                    "Failed to start embedded terminal for {repo_label}: {error}"
+                ));
+            }
+        },
+    );
+}
+
 fn overview_actions() -> GtkBox {
     let actions = GtkBox::new(Orientation::Horizontal, 8);
     for (label, handler) in [
@@ -5466,7 +5698,10 @@ fn queue_editor_save(status: &Label, title: &Label, path: &Path, content: String
                     }
                 }
                 Err(error) => {
-                    status.set_text(&format!("Failed to save {}: {error}", message.path.display()));
+                    status.set_text(&format!(
+                        "Failed to save {}: {error}",
+                        message.path.display()
+                    ));
                 }
             }
         });
@@ -5776,8 +6011,7 @@ mod tests {
             shared_hooks_path: None,
         };
 
-        let repo_event_path = cwd
-            .join("../maruzzella/.git/refs/heads/main");
+        let repo_event_path = cwd.join("../maruzzella/.git/refs/heads/main");
         assert_eq!(
             repo_id_for_watch_path(&manifest, &repo_event_path).as_deref(),
             Some("maruzzella")

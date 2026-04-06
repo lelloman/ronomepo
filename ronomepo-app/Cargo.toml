@@ -3,8 +3,12 @@ name = "ronomepo-app"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["embedded-terminal"]
+embedded-terminal = ["ronomepo-plugin/embedded-terminal"]
+
 [dependencies]
 gtk = { package = "gtk4", version = "0.9" }
 maruzzella = { path = "../../maruzzella" }
 ronomepo-core = { path = "../ronomepo-core" }
-ronomepo-plugin = { path = "../ronomepo-plugin" }
+ronomepo-plugin = { path = "../ronomepo-plugin", default-features = false }
