@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use gtk::gdk::RGBA;
+use gtk::gdk::{RGBA, Rectangle};
 use gtk::gio;
 use gtk::glib::{self, translate::IntoGlibPtr, BoxedAnyObject};
 use gtk::pango::EllipsizeMode;
@@ -2723,14 +2723,16 @@ fn attach_repo_monitor_context_menu(
     gesture.connect_pressed({
         let relative_to = relative_to.clone();
         let popover = popover.clone();
-        move |_, _, _, _| {
+        move |_, _, x, y| {
             if let Some(row) = relative_to.parent().and_downcast::<ListBoxRow>() {
                 if let Some(list) = row.parent().and_downcast::<ListBox>() {
                     list.unselect_all();
                     list.select_row(Some(&row));
+                    sync_selection_css(&list);
                     update_selected_repo_ids(selection_ids_from_list(&list));
                 }
             }
+            popover.set_pointing_to(Some(&Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.popup();
         }
     });
@@ -2743,15 +2745,15 @@ fn build_repo_context_menu(
 ) -> Popover {
     let popover = Popover::new();
     popover.set_autohide(true);
-    popover.set_has_arrow(true);
+    popover.set_has_arrow(false);
     popover.set_position(PositionType::Bottom);
     popover.set_parent(relative_to);
 
     let menu = GtkBox::new(Orientation::Vertical, 4);
-    menu.set_margin_top(8);
-    menu.set_margin_bottom(8);
-    menu.set_margin_start(8);
-    menu.set_margin_end(8);
+    menu.set_margin_top(4);
+    menu.set_margin_bottom(4);
+    menu.set_margin_start(4);
+    menu.set_margin_end(4);
 
     append_context_button(&menu, &popover, "Open Overview", move || {
         let repo_ids = {
