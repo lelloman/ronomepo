@@ -184,6 +184,12 @@ struct WatchManager {
     _backend: WatchBackend,
 }
 
+#[derive(Default)]
+struct PendingWatchEvents {
+    paths: Vec<PathBuf>,
+    flush_scheduled: bool,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum JobKey {
     WorkspaceScan,
@@ -390,6 +396,7 @@ thread_local! {
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
 static EXECUTOR: OnceLock<ExecutorState> = OnceLock::new();
 static WATCH_MANAGER: OnceLock<Mutex<Option<WatchManager>>> = OnceLock::new();
+static PENDING_WATCH_EVENTS: OnceLock<Mutex<PendingWatchEvents>> = OnceLock::new();
 static LAST_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
 static BACKGROUND_LOOPS_STARTED: AtomicUsize = AtomicUsize::new(0);
 static LOG_REFRESH_SCHEDULED: AtomicUsize = AtomicUsize::new(0);
@@ -419,6 +426,10 @@ fn executor() -> &'static ExecutorState {
 
 fn watch_manager() -> &'static Mutex<Option<WatchManager>> {
     WATCH_MANAGER.get_or_init(|| Mutex::new(None))
+}
+
+fn pending_watch_events() -> &'static Mutex<PendingWatchEvents> {
+    PENDING_WATCH_EVENTS.get_or_init(|| Mutex::new(PendingWatchEvents::default()))
 }
 
 fn submit_job(job: WorkerJob) -> Result<(), String> {
@@ -2457,13 +2468,6 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
             .watch(path, RecursiveMode::Recursive)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         watched_any = true;
-
-        let repo_git_dir = path.join(".git");
-        if repo_git_dir.exists() {
-            watch_backend_mut(&mut backend)
-                .watch(&repo_git_dir, RecursiveMode::Recursive)
-                .map_err(|error| format!("{}: {error}", repo_git_dir.display()))?;
-        }
     }
 
     if !watched_any {
@@ -2500,14 +2504,50 @@ fn dispatch_watch_event_result(event: notify::Result<notify::Event>) {
             if event.paths.is_empty() {
                 return;
             }
-            let paths = event.paths;
-            main_context.invoke(move || handle_watch_paths(paths));
+            let should_schedule = {
+                let mut pending = pending_watch_events()
+                    .lock()
+                    .expect("pending watch events mutex poisoned");
+                pending.paths.extend(event.paths);
+                if pending.flush_scheduled {
+                    false
+                } else {
+                    pending.flush_scheduled = true;
+                    true
+                }
+            };
+            if should_schedule {
+                main_context.invoke(schedule_watch_event_flush);
+            }
         }
         Err(error) => {
             let message = error.to_string();
             main_context.invoke(move || append_log(format!("Repository watcher error: {message}")));
         }
     }
+}
+
+fn schedule_watch_event_flush() {
+    glib::timeout_add_local(Duration::from_millis(UI_REFRESH_DEBOUNCE_MILLIS), || {
+        flush_pending_watch_events();
+        glib::ControlFlow::Break
+    });
+}
+
+fn flush_pending_watch_events() {
+    let paths = {
+        let mut pending = pending_watch_events()
+            .lock()
+            .expect("pending watch events mutex poisoned");
+        pending.flush_scheduled = false;
+        std::mem::take(&mut pending.paths)
+    };
+
+    if paths.is_empty() {
+        return;
+    }
+
+    handle_watch_paths(paths);
 }
 
 fn handle_watch_paths(paths: Vec<PathBuf>) {
