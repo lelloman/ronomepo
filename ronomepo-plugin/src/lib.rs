@@ -3990,14 +3990,17 @@ fn persisted_plugin_configs_path(persistence_id: &str) -> PathBuf {
 
 fn status_text_sender(status: &Label) -> mpsc::Sender<String> {
     let (sender, receiver) = mpsc::channel::<String>();
-    let status = status.clone();
-    glib::idle_add_local(move || match receiver.try_recv() {
-        Ok(message) => {
-            status.set_text(&message);
-            glib::ControlFlow::Break
-        }
-        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+    let status = glib::SendWeakRef::from(status.downgrade());
+    let main_context = glib::MainContext::default();
+    thread::spawn(move || {
+        let Ok(message) = receiver.recv() else {
+            return;
+        };
+        main_context.invoke(move || {
+            if let Some(status) = status.upgrade() {
+                status.set_text(&message);
+            }
+        });
     });
     sender
 }
@@ -5369,15 +5372,31 @@ fn queue_editor_load(
 ) {
     status.set_text(&format!("Loading {}...", path.display()));
     let (sender, receiver) = mpsc::channel::<EditorLoadMessage>();
-    let buffer = buffer.clone();
-    let status = status.clone();
-    let title = title.clone();
-    let path_entry = path_entry.clone();
+    let buffer = glib::SendWeakRef::from(buffer.downgrade());
+    let status = glib::SendWeakRef::from(status.downgrade());
+    let title = glib::SendWeakRef::from(title.downgrade());
+    let path_entry = glib::SendWeakRef::from(path_entry.downgrade());
     let queue_error_buffer = buffer.clone();
     let queue_error_status = status.clone();
-    glib::idle_add_local(move || match receiver.try_recv() {
-        Ok(message) => {
+    let main_context = glib::MainContext::default();
+    thread::spawn(move || {
+        let Ok(message) = receiver.recv() else {
+            return;
+        };
+        main_context.invoke(move || {
+            let Some(path_entry) = path_entry.upgrade() else {
+                return;
+            };
             if resolve_editor_path(path_entry.text().as_str()) == message.path {
+                let Some(buffer) = buffer.upgrade() else {
+                    return;
+                };
+                let Some(status) = status.upgrade() else {
+                    return;
+                };
+                let Some(title) = title.upgrade() else {
+                    return;
+                };
                 match message.result {
                     Ok(content) => {
                         buffer.set_text(&content);
@@ -5393,33 +5412,44 @@ fn queue_editor_load(
                     }
                 }
             }
-            glib::ControlFlow::Break
-        }
-        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        });
     });
 
     if let Err(message) = submit_job(WorkerJob::EditorLoad {
         path: path.to_path_buf(),
         reply: sender,
     }) {
-        queue_error_buffer.set_text("");
-        queue_error_status.set_text(&format!(
-            "Failed to queue load for {}: {message}",
-            path.display()
-        ));
+        if let Some(buffer) = queue_error_buffer.upgrade() {
+            buffer.set_text("");
+        }
+        if let Some(status) = queue_error_status.upgrade() {
+            status.set_text(&format!(
+                "Failed to queue load for {}: {message}",
+                path.display()
+            ));
+        }
     }
 }
 
 fn queue_editor_save(status: &Label, title: &Label, path: &Path, content: String, host_ptr: usize) {
     status.set_text(&format!("Saving {}...", path.display()));
     let (sender, receiver) = mpsc::channel::<EditorSaveMessage>();
-    let status = status.clone();
-    let title = title.clone();
+    let status = glib::SendWeakRef::from(status.downgrade());
+    let title = glib::SendWeakRef::from(title.downgrade());
     let path = path.to_path_buf();
     let queue_error_status = status.clone();
-    glib::idle_add_local(move || match receiver.try_recv() {
-        Ok(message) => {
+    let main_context = glib::MainContext::default();
+    thread::spawn(move || {
+        let Ok(message) = receiver.recv() else {
+            return;
+        };
+        main_context.invoke(move || {
+            let Some(status) = status.upgrade() else {
+                return;
+            };
+            let Some(title) = title.upgrade() else {
+                return;
+            };
             match message.result {
                 Ok(()) => {
                     status.set_text(&format!("Saved {}", message.path.display()));
@@ -5436,16 +5466,10 @@ fn queue_editor_save(status: &Label, title: &Label, path: &Path, content: String
                     }
                 }
                 Err(error) => {
-                    status.set_text(&format!(
-                        "Failed to save {}: {error}",
-                        message.path.display()
-                    ));
+                    status.set_text(&format!("Failed to save {}: {error}", message.path.display()));
                 }
             }
-            glib::ControlFlow::Break
-        }
-        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        });
     });
 
     if let Err(message) = submit_job(WorkerJob::EditorSave {
@@ -5453,10 +5477,12 @@ fn queue_editor_save(status: &Label, title: &Label, path: &Path, content: String
         content,
         reply: sender,
     }) {
-        queue_error_status.set_text(&format!(
-            "Failed to queue save for {}: {message}",
-            path.display()
-        ));
+        if let Some(status) = queue_error_status.upgrade() {
+            status.set_text(&format!(
+                "Failed to queue save for {}: {message}",
+                path.display()
+            ));
+        }
     }
 }
 
