@@ -1592,7 +1592,6 @@ fn refresh_operation_views(snapshot: &StateSnapshot) {
 
 fn refresh_log_surfaces() {
     let snapshot = snapshot();
-    refresh_overview_views(&snapshot);
     refresh_operation_views(&snapshot);
 }
 
