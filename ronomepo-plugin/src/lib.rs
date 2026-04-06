@@ -70,6 +70,7 @@ const REMOTE_FETCH_JITTER_SECS: u64 = 30 * 60;
 const REMOTE_FETCH_CONCURRENCY: usize = 1;
 const WATCH_POLL_FALLBACK_SECS: u64 = 15;
 const UI_REFRESH_DEBOUNCE_MILLIS: u64 = 75;
+const MAX_LOG_ENTRIES: usize = 500;
 
 pub struct RonomepoPlugin;
 
@@ -400,6 +401,7 @@ static PENDING_WATCH_EVENTS: OnceLock<Mutex<PendingWatchEvents>> = OnceLock::new
 static LAST_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
 static BACKGROUND_LOOPS_STARTED: AtomicUsize = AtomicUsize::new(0);
 static LOG_REFRESH_SCHEDULED: AtomicUsize = AtomicUsize::new(0);
+static VIEW_REFRESH_SCHEDULED: AtomicUsize = AtomicUsize::new(0);
 static WATCH_MANAGER_SYNC_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn state() -> &'static Mutex<AppState> {
@@ -1107,6 +1109,10 @@ fn queue_line_stats_report_from_state() -> Result<(), String> {
 fn append_log(message: String) {
     let mut app_state = state().lock().expect("state mutex poisoned");
     app_state.logs.push(message);
+    if app_state.logs.len() > MAX_LOG_ENTRIES {
+        let excess = app_state.logs.len() - MAX_LOG_ENTRIES;
+        app_state.logs.drain(0..excess);
+    }
     drop(app_state);
     schedule_log_surface_refresh();
 }
@@ -1490,10 +1496,22 @@ fn schedule_refresh_for_operation_event(manifest: &WorkspaceManifest, event: &Op
 }
 
 fn refresh_views() {
+    if VIEW_REFRESH_SCHEDULED
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    glib::timeout_add_local(Duration::from_millis(UI_REFRESH_DEBOUNCE_MILLIS), || {
+        VIEW_REFRESH_SCHEDULED.store(0, Ordering::SeqCst);
+        refresh_views_now();
+        glib::ControlFlow::Break
+    });
+}
+
+fn refresh_views_now() {
     let snapshot = snapshot();
     refresh_repository_views(&snapshot);
-    refresh_overview_views(&snapshot);
-    refresh_workspace_settings_views(&snapshot);
     refresh_operation_views(&snapshot);
 }
 
