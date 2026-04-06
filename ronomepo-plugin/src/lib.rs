@@ -2427,21 +2427,21 @@ fn sync_watch_manager_from_state() {
 }
 
 fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, String> {
+    let workspace_root = normalized_watch_path(&manifest.root);
     let repos = manifest
         .repos
         .iter()
-        .map(|repo| (repo.id.clone(), manifest.root.join(&repo.dir_name)))
+        .map(|repo| (repo.id.clone(), workspace_root.join(&repo.dir_name)))
         .filter(|(_, path)| path.exists())
         .collect::<Vec<_>>();
 
     let mut backend = create_watch_backend()?;
-    let workspace_root = &manifest.root;
     let workspace_git_dir = workspace_root.join(".git");
     let mut watched_any = false;
 
     if workspace_root.exists() {
         watch_backend_mut(&mut backend)
-            .watch(workspace_root, RecursiveMode::NonRecursive)
+            .watch(&workspace_root, RecursiveMode::NonRecursive)
             .map_err(|error| format!("{}: {error}", workspace_root.display()))?;
         watched_any = true;
     }
@@ -2547,7 +2547,10 @@ fn handle_watch_paths(paths: Vec<PathBuf>) {
 }
 
 fn workspace_watch_path_matches(manifest: &WorkspaceManifest, path: &Path) -> bool {
-    if let Ok(relative) = path.strip_prefix(&manifest.root) {
+    let workspace_root = normalized_watch_path(&manifest.root);
+    let path = normalized_watch_path(path);
+
+    if let Ok(relative) = path.strip_prefix(&workspace_root) {
         if relative.components().count() == 0 {
             return false;
         }
@@ -2561,17 +2564,19 @@ fn workspace_watch_path_matches(manifest: &WorkspaceManifest, path: &Path) -> bo
         return relative.components().count() == 1 && watch_path_is_relevant(relative);
     }
 
-    path.strip_prefix(manifest.root.join(".git"))
+    path.strip_prefix(workspace_root.join(".git"))
         .ok()
         .is_some_and(watch_path_is_relevant)
 }
 
 fn repo_id_for_watch_path(manifest: &WorkspaceManifest, path: &Path) -> Option<String> {
+    let workspace_root = normalized_watch_path(&manifest.root);
+    let path = normalized_watch_path(path);
     let mut matches = manifest
         .repos
         .iter()
         .filter_map(|repo| {
-            let repo_root = manifest.root.join(&repo.dir_name);
+            let repo_root = workspace_root.join(&repo.dir_name);
             let relative = path.strip_prefix(&repo_root).ok()?;
             if !watch_path_is_relevant(relative) {
                 return None;
@@ -5542,6 +5547,28 @@ fn load_manifest_if_present(path: &Path) -> Option<WorkspaceManifest> {
     load_manifest(path).ok()
 }
 
+fn normalized_watch_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 fn workspace_name_from_root(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -5648,6 +5675,30 @@ mod tests {
             &manifest,
             &workspace_root.join("alpha/src/lib.rs")
         ));
+    }
+
+    #[test]
+    fn relative_manifest_root_still_matches_absolute_watch_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let manifest = WorkspaceManifest {
+            name: "Workspace".to_string(),
+            root: PathBuf::from("../"),
+            repos: vec![RepositoryEntry {
+                id: "maruzzella".to_string(),
+                name: "maruzzella".to_string(),
+                dir_name: "maruzzella".to_string(),
+                remote_url: "git@example.com:org/maruzzella.git".to_string(),
+                enabled: true,
+            }],
+            shared_hooks_path: None,
+        };
+
+        let repo_event_path = cwd
+            .join("../maruzzella/.git/refs/heads/main");
+        assert_eq!(
+            repo_id_for_watch_path(&manifest, &repo_event_path).as_deref(),
+            Some("maruzzella")
+        );
     }
 
     #[test]
