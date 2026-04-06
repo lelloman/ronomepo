@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use gtk::gdk::{RGBA, Rectangle};
 use gtk::gio;
-use gtk::glib::{self, translate::IntoGlibPtr, BoxedAnyObject};
+use gtk::glib::{self, translate::{FromGlibPtrFull, IntoGlibPtr}, BoxedAnyObject};
 use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
@@ -26,8 +26,8 @@ use gtk::{
 };
 use maruzzella_sdk::{
     export_plugin, CommandSpec, HostApi, MzLogLevel, MzStatusCode, MzViewOpenDisposition,
-    MzViewPlacement, OpenViewRequest, Plugin, PluginDependency, PluginDescriptor,
-    SurfaceContributionSpec, Version, ViewFactorySpec,
+    MzToolbarDisplayMode, MzViewPlacement, OpenViewRequest, Plugin, PluginDependency,
+    PluginDescriptor, SurfaceContributionSpec, ToolbarWidgetSpec, Version, ViewFactorySpec,
 };
 use notify::{Config as NotifyConfig, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use ronomepo_core::{
@@ -59,6 +59,8 @@ const CMD_OPEN_COMMIT_CHECK: &str = "ronomepo.workspace.open_commit_check";
 const CMD_FILTER: &str = "ronomepo.workspace.filter";
 const CMD_ADD_REPO: &str = "ronomepo.workspace.add_repo";
 const CMD_EXIT: &str = "ronomepo.workspace.exit";
+const CMD_REFRESH_LOGS: &str = "ronomepo.logs.refresh";
+const CMD_CLEAR_LOGS: &str = "ronomepo.logs.clear";
 const MONITOR_NAME_COL_CHARS: i32 = 28;
 const MONITOR_BRANCH_COL_CHARS: i32 = 14;
 const MONITOR_STATE_COL_CHARS: i32 = 12;
@@ -715,6 +717,14 @@ impl Plugin for RonomepoPlugin {
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_EXIT, "Exit").with_handler(command_exit),
         )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_REFRESH_LOGS, "Refresh Logs")
+                .with_handler(command_refresh_logs),
+        )?;
+        host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_CLEAR_LOGS, "Clear Logs")
+                .with_handler(command_clear_logs),
+        )?;
 
         host.register_surface_contribution(SurfaceContributionSpec::about_section(
             PLUGIN_ID,
@@ -1007,6 +1017,25 @@ extern "C" fn command_line_stats(
             maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
         }
     }
+}
+
+extern "C" fn command_refresh_logs(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    refresh_log_surfaces();
+    maruzzella_sdk::ffi::MzStatus::OK
+}
+
+extern "C" fn command_clear_logs(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        app_state.logs.clear();
+        app_state.logs.push("Operations log cleared.".to_string());
+    }
+    refresh_views();
+    maruzzella_sdk::ffi::MzStatus::OK
 }
 
 fn queue_refresh_workspace(status_sender: Option<mpsc::Sender<String>>) -> Result<(), String> {
@@ -5731,6 +5760,25 @@ fn editor_title_for_path(path: &Path) -> String {
         .to_string()
 }
 
+fn host_toolbar_button(
+    host: &HostApi<'_>,
+    command_id: &str,
+    icon_name: &str,
+    label: &str,
+) -> Option<Button> {
+    let spec = ToolbarWidgetSpec {
+        icon_name: Some(icon_name),
+        label: Some(label),
+        command_id,
+        payload: &[],
+        display_mode: MzToolbarDisplayMode::IconOnly,
+        appearance_id: Some("ronomepo-toolbar-ghost"),
+    };
+    let widget_ptr = host.create_toolbar_widget(&spec).ok()?;
+    let widget = unsafe { gtk::Widget::from_glib_full(widget_ptr as *mut gtk::ffi::GtkWidget) };
+    widget.downcast::<Button>().ok()
+}
+
 fn decode_mzstr(value: maruzzella_sdk::ffi::MzStr) -> Option<String> {
     if value.ptr.is_null() {
         return None;
@@ -5756,19 +5804,28 @@ extern "C" fn create_operations_view(
     root.set_margin_start(18);
     root.set_margin_end(18);
 
-    let header = GtkBox::new(Orientation::Horizontal, 8);
-    header.set_halign(Align::Fill);
-    header.set_hexpand(true);
-
     let summary = Label::new(Some(&operation_summary_text(&snapshot().logs)));
     summary.set_xalign(0.0);
     summary.add_css_class("muted");
     summary.set_wrap(true);
     summary.set_hexpand(true);
 
-    let refresh = Button::with_label("Refresh Logs");
-    let clear = Button::with_label("Clear");
-    refresh.set_halign(Align::End);
+    let summary_row = GtkBox::new(Orientation::Horizontal, 8);
+    summary_row.set_halign(Align::Fill);
+    summary_row.set_hexpand(true);
+    summary_row.set_valign(Align::Center);
+
+    let view_host = unsafe { host.as_ref() }.map(HostApi::from_raw);
+    let refresh = view_host
+        .as_ref()
+        .and_then(|host| {
+            host_toolbar_button(host, CMD_REFRESH_LOGS, "view-refresh-symbolic", "Refresh")
+        })
+        .unwrap_or_else(|| Button::with_label("Refresh"));
+    let clear = view_host
+        .as_ref()
+        .and_then(|host| host_toolbar_button(host, CMD_CLEAR_LOGS, "user-trash-symbolic", "Clear"))
+        .unwrap_or_else(|| Button::with_label("Clear"));
 
     let buffer = TextBuffer::new(None);
     buffer.set_text(&snapshot().logs.join("\n"));
@@ -5783,30 +5840,32 @@ extern "C" fn create_operations_view(
         labels.borrow_mut().push(summary_ref);
     });
 
-    refresh.connect_clicked({
-        let buffer = buffer.clone();
-        let summary = summary.clone();
-        move |_| {
-            let snapshot = snapshot();
-            buffer.set_text(&snapshot.logs.join("\n"));
-            summary.set_text(&operation_summary_text(&snapshot.logs));
-        }
-    });
-    clear.connect_clicked({
-        let buffer = buffer.clone();
-        let summary = summary.clone();
-        move |_| {
-            {
-                let mut app_state = state().lock().expect("state mutex poisoned");
-                app_state.logs.clear();
-                app_state.logs.push("Operations log cleared.".to_string());
+    if view_host.is_none() {
+        refresh.connect_clicked({
+            let buffer = buffer.clone();
+            let summary = summary.clone();
+            move |_| {
+                let snapshot = snapshot();
+                buffer.set_text(&snapshot.logs.join("\n"));
+                summary.set_text(&operation_summary_text(&snapshot.logs));
             }
-            let snapshot = snapshot();
-            buffer.set_text(&snapshot.logs.join("\n"));
-            summary.set_text(&operation_summary_text(&snapshot.logs));
-            refresh_views();
-        }
-    });
+        });
+        clear.connect_clicked({
+            let buffer = buffer.clone();
+            let summary = summary.clone();
+            move |_| {
+                {
+                    let mut app_state = state().lock().expect("state mutex poisoned");
+                    app_state.logs.clear();
+                    app_state.logs.push("Operations log cleared.".to_string());
+                }
+                let snapshot = snapshot();
+                buffer.set_text(&snapshot.logs.join("\n"));
+                summary.set_text(&operation_summary_text(&snapshot.logs));
+                refresh_views();
+            }
+        });
+    }
 
     let text = TextView::with_buffer(&buffer);
     text.set_editable(false);
@@ -5822,10 +5881,10 @@ extern "C" fn create_operations_view(
         .child(&text)
         .build();
 
-    header.append(&clear);
-    header.append(&refresh);
-    root.append(&header);
-    root.append(&summary);
+    summary_row.append(&summary);
+    summary_row.append(&refresh);
+    summary_row.append(&clear);
+    root.append(&summary_row);
     root.append(&scroller);
 
     unsafe {

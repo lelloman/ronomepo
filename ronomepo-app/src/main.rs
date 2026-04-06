@@ -215,7 +215,7 @@ fn main() {
             payload: Vec::new(),
             secondary: true,
             display_mode: ToolbarDisplayMode::IconOnly,
-            appearance_id: "ronomepo-toolbar-ghost".to_string(),
+            appearance_id: "ronomepo-toolbar-primary".to_string(),
         },
         ToolbarItemSpec {
             id: "commit-check".to_string(),
@@ -225,7 +225,7 @@ fn main() {
             payload: Vec::new(),
             secondary: true,
             display_mode: ToolbarDisplayMode::IconOnly,
-            appearance_id: "ronomepo-toolbar-ghost".to_string(),
+            appearance_id: "ronomepo-toolbar-primary".to_string(),
         },
     ];
 
@@ -495,7 +495,7 @@ fn app_theme() -> ThemeSpec {
         )
         .with_button_appearance(
             "ronomepo-toolbar-ghost",
-            ButtonAppearance::new(Tone::Neutral, ButtonStyle::Ghost, TextRole::Body),
+            ButtonAppearance::new(Tone::Primary, ButtonStyle::Ghost, TextRole::Body),
         )
         .with_text_appearance(
             "title",
