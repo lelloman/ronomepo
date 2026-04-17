@@ -77,7 +77,7 @@ The current `mono` script already defines the minimum viable feature set:
 
 - `clone`: clone all repositories listed in `repos.txt`
 - `pull`: pull clean repositories, skip dirty ones
-- `push`: push repositories that are ahead, with protection around generated commits
+- `push`: push repositories that are ahead, with protection around commit check rules
 - `status`: compute branch, cleanliness, and ahead/behind state
 - `setup-hooks`: apply shared hooks through `core.hooksPath`
 

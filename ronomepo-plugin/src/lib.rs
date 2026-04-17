@@ -13,9 +13,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use gtk::gdk::{RGBA, Rectangle};
+use gtk::gdk::{Rectangle, RGBA};
 use gtk::gio;
-use gtk::glib::{self, translate::{FromGlibPtrFull, IntoGlibPtr}, BoxedAnyObject};
+use gtk::glib::{
+    self,
+    translate::{FromGlibPtrFull, IntoGlibPtr},
+    BoxedAnyObject,
+};
 use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
@@ -25,18 +29,19 @@ use gtk::{
     SorterChange, TextBuffer, TextView, ToggleButton, Window, WrapMode,
 };
 use maruzzella_sdk::{
-    export_plugin, CommandSpec, HostApi, MzLogLevel, MzStatusCode, MzViewOpenDisposition,
-    MzToolbarDisplayMode, MzViewPlacement, OpenViewRequest, Plugin, PluginDependency,
+    export_plugin, CommandSpec, HostApi, MzLogLevel, MzStatusCode, MzToolbarDisplayMode,
+    MzViewOpenDisposition, MzViewPlacement, OpenViewRequest, Plugin, PluginDependency,
     PluginDescriptor, SurfaceContributionSpec, ToolbarWidgetSpec, Version, ViewFactorySpec,
 };
 use notify::{Config as NotifyConfig, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use ronomepo_core::{
-    build_repository_list, collect_generated_history_matches, collect_repository_details,
-    collect_workspace_line_stats, default_manifest_path, derive_dir_name, format_sync_label,
-    import_repos_txt, load_manifest, normalize_workspace_root, run_workspace_operation,
-    save_manifest, workspace_summary, OperationEvent, OperationEventKind, OperationKind,
-    RepositoryDetails, RepositoryEntry, RepositoryListItem, RepositoryStatus, WorkspaceManifest,
-    MANIFEST_FILE_NAME,
+    build_repository_list, collect_commit_check_report, collect_repository_details,
+    collect_workspace_line_stats, default_commit_check_rules, default_manifest_path,
+    derive_dir_name, ensure_commit_check_rules_initialized, format_sync_label, import_repos_txt,
+    load_manifest, normalize_workspace_root, run_workspace_operation, save_manifest,
+    workspace_summary, CommitCheckRule, CommitCheckRuleEffect, CommitCheckRuleMatcher,
+    CommitCheckRuleScope, OperationEvent, OperationEventKind, OperationKind, RepositoryDetails,
+    RepositoryEntry, RepositoryListItem, RepositoryStatus, WorkspaceManifest, MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -362,6 +367,18 @@ struct RepoEditorRowInput {
     name: String,
     dir_name: String,
     remote_url: String,
+}
+
+#[derive(Clone)]
+struct CommitCheckRuleRowHandle {
+    enabled: CheckButton,
+    allow: CheckButton,
+    hash_matcher: CheckButton,
+    name: Entry,
+    priority: Entry,
+    value: Entry,
+    repository_ids: Entry,
+    rule_id: String,
 }
 
 struct EditorLoadMessage {
@@ -1236,10 +1253,8 @@ fn present_operation_failure_dialog(
     operation: &'static str,
     event: &OperationEvent,
 ) {
-    let is_generated_commit_failure = operation == "Push"
-        && event
-            .message
-            .contains("generated-commit markers were found");
+    let is_generated_commit_failure =
+        operation == "Push" && event.message.contains("commit check rules blocked commits");
     let dialog = Dialog::builder()
         .modal(true)
         .title(format!("{operation} failed"))
@@ -3394,7 +3409,7 @@ fn render_monorepo_overview_into(
         } else {
             snapshot.history_report.clone()
         },
-        "Run Check History to scan recent commits for generated markers.",
+        "Run Check History to scan recent commits with workspace commit check rules.",
     );
     append_lines_section(
         &sections,
@@ -3425,7 +3440,7 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
     title.set_xalign(0.0);
     title.add_css_class("title-2");
     let subtitle = Label::new(Some(
-        "Scans recent commits for AI-generated or generated-commit markers before push.",
+        "Scans recent commits with workspace rules before push.",
     ));
     subtitle.set_xalign(0.0);
     subtitle.add_css_class("muted");
@@ -3445,6 +3460,86 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
         let _ = command_open_overview(maruzzella_sdk::ffi::MzBytes::empty());
     });
     actions.append(&open_overview);
+
+    let rules_header = Label::new(Some("Rules"));
+    rules_header.set_xalign(0.0);
+    rules_header.add_css_class("title-4");
+
+    let rules_help = Label::new(Some(
+        "Rules run from the lowest priority to the highest. Later allow rules can unblock commits matched by earlier block rules.",
+    ));
+    rules_help.set_xalign(0.0);
+    rules_help.set_wrap(true);
+    rules_help.add_css_class("muted");
+
+    let rules_box = GtkBox::new(Orientation::Vertical, 8);
+    let rule_rows = Rc::new(RefCell::new(Vec::<CommitCheckRuleRowHandle>::new()));
+    let manifest_rules = snapshot
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.commit_check_rules.clone())
+        .unwrap_or_default();
+    for rule in &manifest_rules {
+        append_commit_check_rule_row(&rules_box, &rule_rows, Some(rule));
+    }
+
+    let rules_scroller = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(false)
+        .min_content_height(260)
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .child(&rules_box)
+        .build();
+
+    let rule_status = Label::new(Some(
+        "Use Save Rules to persist changes to the workspace manifest.",
+    ));
+    rule_status.set_xalign(0.0);
+    rule_status.set_wrap(true);
+    rule_status.add_css_class("muted");
+
+    let rule_actions = GtkBox::new(Orientation::Horizontal, 8);
+    let add_rule = Button::with_label("Add Rule");
+    add_rule.connect_clicked({
+        let rules_box = rules_box.clone();
+        let rule_rows = rule_rows.clone();
+        move |_| {
+            append_commit_check_rule_row(&rules_box, &rule_rows, None);
+        }
+    });
+    let save_rules = Button::with_label("Save Rules");
+    save_rules.connect_clicked({
+        let rule_rows = rule_rows.clone();
+        let rule_status = rule_status.clone();
+        move |_| match build_commit_check_rules_from_rows(&rule_rows.borrow()) {
+            Ok(rules) => {
+                rule_status.set_text("Saving commit check rules...");
+                match save_commit_check_rules(rules) {
+                    Ok(message) => {
+                        rule_status.set_text(&message);
+                        append_log(message);
+                        refresh_views();
+                    }
+                    Err(message) => {
+                        rule_status.set_text(&message);
+                        append_log(message);
+                        refresh_views();
+                    }
+                }
+            }
+            Err(message) => {
+                rule_status.set_text(&message);
+            }
+        }
+    });
+    let discard_changes = Button::with_label("Discard Changes");
+    discard_changes.connect_clicked(|_| {
+        refresh_views();
+    });
+    for button in [add_rule, save_rules, discard_changes] {
+        rule_actions.append(&button);
+    }
 
     let sections = GtkBox::new(Orientation::Vertical, 12);
     append_overview_section(
@@ -3467,13 +3562,232 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
         } else {
             snapshot.history_report.clone()
         },
-        "Run Check to surface the same generated-commit matches that block a protected push.",
+        "Run Check to surface the same rule matches that block a protected push.",
     );
     append_log_section(&sections, "Recent Operations", &snapshot.logs, 8);
 
     root.append(&hero);
     root.append(&actions);
+    root.append(&rules_header);
+    root.append(&rules_help);
+    root.append(&rule_actions);
+    root.append(&rules_scroller);
+    root.append(&rule_status);
     root.append(&sections);
+}
+
+fn append_commit_check_rule_row(
+    rules_box: &GtkBox,
+    rule_rows: &Rc<RefCell<Vec<CommitCheckRuleRowHandle>>>,
+    rule: Option<&CommitCheckRule>,
+) {
+    let row = GtkBox::new(Orientation::Vertical, 8);
+    row.add_css_class("boxed-list");
+
+    let enabled = CheckButton::with_label("Enabled");
+    enabled.set_active(rule.map(|rule| rule.enabled).unwrap_or(true));
+
+    let allow = CheckButton::with_label("Allow");
+    allow.set_active(
+        rule.map(|rule| matches!(rule.effect, CommitCheckRuleEffect::Allow))
+            .unwrap_or(false),
+    );
+
+    let hash_matcher = CheckButton::with_label("Hash");
+    hash_matcher.set_active(
+        rule.map(|rule| matches!(rule.matcher, CommitCheckRuleMatcher::CommitHash { .. }))
+            .unwrap_or(false),
+    );
+
+    let name = Entry::new();
+    name.set_placeholder_text(Some("Rule name"));
+    name.set_hexpand(true);
+    name.set_text(rule.map(|rule| rule.name.as_str()).unwrap_or(""));
+
+    let priority = Entry::new();
+    priority.set_placeholder_text(Some("Priority"));
+    priority.set_width_chars(8);
+    priority.set_text(
+        &rule
+            .map(|rule| rule.priority.to_string())
+            .unwrap_or_else(|| "100".to_string()),
+    );
+
+    let value = Entry::new();
+    value.set_placeholder_text(Some("Regex pattern or commit hash"));
+    value.set_hexpand(true);
+    value.set_text(
+        &rule
+            .map(commit_check_rule_value)
+            .unwrap_or_else(String::new),
+    );
+
+    let repository_ids = Entry::new();
+    repository_ids.set_placeholder_text(Some("Repo IDs, comma-separated; empty means all"));
+    repository_ids.set_hexpand(true);
+    repository_ids.set_text(
+        &rule
+            .map(commit_check_rule_scope_value)
+            .unwrap_or_else(String::new),
+    );
+
+    let remove = Button::with_label("Remove");
+    let rule_id = rule
+        .map(|rule| rule.id.clone())
+        .unwrap_or_else(new_commit_check_rule_id);
+    remove.connect_clicked({
+        let rules_box = rules_box.clone();
+        let rule_rows = rule_rows.clone();
+        let row = row.clone();
+        let rule_id = rule_id.clone();
+        move |_| {
+            rules_box.remove(&row);
+            rule_rows
+                .borrow_mut()
+                .retain(|handle| handle.rule_id != rule_id);
+        }
+    });
+
+    let top = GtkBox::new(Orientation::Horizontal, 8);
+    top.append(&enabled);
+    top.append(&allow);
+    top.append(&hash_matcher);
+    top.append(&name);
+    top.append(&priority);
+    top.append(&remove);
+
+    let bottom = GtkBox::new(Orientation::Horizontal, 8);
+    bottom.append(&value);
+    bottom.append(&repository_ids);
+
+    row.append(&top);
+    row.append(&bottom);
+    rules_box.append(&row);
+
+    rule_rows.borrow_mut().push(CommitCheckRuleRowHandle {
+        enabled,
+        allow,
+        hash_matcher,
+        name,
+        priority,
+        value,
+        repository_ids,
+        rule_id,
+    });
+}
+
+fn commit_check_rule_value(rule: &CommitCheckRule) -> String {
+    match &rule.matcher {
+        CommitCheckRuleMatcher::Regex { pattern } => pattern.clone(),
+        CommitCheckRuleMatcher::CommitHash { hash } => hash.clone(),
+    }
+}
+
+fn commit_check_rule_scope_value(rule: &CommitCheckRule) -> String {
+    match &rule.scope {
+        CommitCheckRuleScope::All => String::new(),
+        CommitCheckRuleScope::Repositories { repository_ids } => repository_ids.join(", "),
+    }
+}
+
+fn build_commit_check_rules_from_rows(
+    rows: &[CommitCheckRuleRowHandle],
+) -> Result<Vec<CommitCheckRule>, String> {
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let name = row.name.text().trim().to_string();
+            let value = row.value.text().trim().to_string();
+            if name.is_empty() && value.is_empty() {
+                return Err(format!(
+                    "Rule {} needs a name and a pattern or hash.",
+                    index + 1
+                ));
+            }
+            if name.is_empty() {
+                return Err(format!("Rule {} needs a name.", index + 1));
+            }
+            if value.is_empty() {
+                return Err(format!("Rule {name} needs a regex pattern or commit hash."));
+            }
+            let priority = row
+                .priority
+                .text()
+                .trim()
+                .parse::<i32>()
+                .map_err(|_| format!("Rule {name} priority must be an integer."))?;
+
+            let repository_ids = row
+                .repository_ids
+                .text()
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+
+            Ok(CommitCheckRule {
+                id: row.rule_id.clone(),
+                name,
+                enabled: row.enabled.is_active(),
+                priority,
+                effect: if row.allow.is_active() {
+                    CommitCheckRuleEffect::Allow
+                } else {
+                    CommitCheckRuleEffect::Block
+                },
+                scope: if repository_ids.is_empty() {
+                    CommitCheckRuleScope::All
+                } else {
+                    CommitCheckRuleScope::Repositories { repository_ids }
+                },
+                matcher: if row.hash_matcher.is_active() {
+                    CommitCheckRuleMatcher::CommitHash { hash: value }
+                } else {
+                    CommitCheckRuleMatcher::Regex { pattern: value }
+                },
+            })
+        })
+        .collect()
+}
+
+fn new_commit_check_rule_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("rule-{millis}")
+}
+
+fn save_commit_check_rules(rules: Vec<CommitCheckRule>) -> Result<String, String> {
+    let (manifest_path, mut manifest) = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        let Some(manifest) = app_state.manifest.clone() else {
+            return Err(format!(
+                "Cannot save commit check rules because no {} is loaded.",
+                MANIFEST_FILE_NAME
+            ));
+        };
+        let manifest_path = app_state
+            .manifest_path
+            .clone()
+            .unwrap_or_else(|| default_manifest_path(&manifest.root));
+        (manifest_path, manifest)
+    };
+
+    manifest.commit_check_rules = Some(rules);
+    save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
+
+    {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        app_state.manifest_path = Some(manifest_path.clone());
+        app_state.manifest = Some(manifest);
+    }
+
+    Ok(format!(
+        "Saved commit check rules to {}.",
+        manifest_path.display()
+    ))
 }
 
 extern "C" fn create_repo_overview_view(
@@ -3603,6 +3917,7 @@ fn render_workspace_settings_into(
             root: snapshot.workspace_root.clone(),
             repos: Vec::new(),
             shared_hooks_path: Some(snapshot.workspace_root.join("hooks")),
+            commit_check_rules: Some(default_commit_check_rules()),
         });
 
     let title = Label::new(Some("Workspace Settings"));
@@ -4132,6 +4447,7 @@ fn build_workspace_manifest_from_inputs(
         } else {
             Some(PathBuf::from(shared_hooks_path.trim()))
         },
+        commit_check_rules: None,
     };
 
     Ok((workspace_root.clone(), manifest))
@@ -4254,12 +4570,13 @@ fn import_workspace_manifest_from_repos_txt(
 ) -> Result<ImportWorkspaceResult, String> {
     let repos_path = workspace_root.join("repos.txt");
     let manifest_path = default_manifest_path(workspace_root);
-    let manifest = import_repos_txt(
+    let mut manifest = import_repos_txt(
         &repos_path,
         workspace_root,
         &workspace_name_from_root(workspace_root),
     )
     .map_err(|error| error.to_string())?;
+    ensure_commit_check_rules_initialized(&mut manifest);
     let repo_count = manifest.repos.len();
     save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
     Ok(ImportWorkspaceResult {
@@ -4278,27 +4595,33 @@ fn build_history_report(
     selected_repo_ids: &[String],
     num_commits: usize,
 ) -> Result<HistoryReportResult, String> {
-    let matches = collect_generated_history_matches(manifest, selected_repo_ids, num_commits);
-    let lines = if matches.is_empty() {
-        vec![format!(
-            "No generated-commit markers found in the last {num_commits} commits."
-        )]
+    let report = collect_commit_check_report(manifest, selected_repo_ids, num_commits);
+    let mut lines = Vec::new();
+    for invalid in &report.invalid_rules {
+        lines.push(format!(
+            "Invalid rule | {} | {} | {}",
+            invalid.rule_id, invalid.rule_name, invalid.message
+        ));
+    }
+    if report.matches.is_empty() {
+        lines.push(format!(
+            "No commit check rule blocks found in the last {num_commits} commits."
+        ));
     } else {
-        matches
-            .into_iter()
-            .map(|entry| {
-                let markers = entry.matching_lines.join(" | ");
-                format!(
-                    "{} | HEAD~{} | {} | {} | {}",
-                    entry.repository_name,
-                    entry.head_offset,
-                    entry.commit_hash,
-                    entry.subject,
-                    markers
-                )
-            })
-            .collect()
-    };
+        lines.extend(report.matches.into_iter().map(|entry| {
+            let markers = entry.matching_lines.join(" | ");
+            format!(
+                "{} | HEAD~{} | {} | {} | blocked by {} ({}) | {}",
+                entry.repository_name,
+                entry.head_offset,
+                entry.commit_hash,
+                entry.subject,
+                entry.rule_name,
+                entry.rule_id,
+                markers
+            )
+        }));
+    }
     let count = lines.len();
     Ok(HistoryReportResult {
         lines,
@@ -4350,12 +4673,14 @@ fn save_workspace_manifest_from_inputs(
     selected_repo_id: Option<String>,
     clone_after_save: bool,
 ) -> Result<SaveManifestResult, String> {
-    let (workspace_root, manifest) = build_workspace_manifest_from_inputs(
+    let (workspace_root, mut manifest) = build_workspace_manifest_from_inputs(
         workspace_name,
         workspace_root,
         shared_hooks_path,
         repo_rows,
     )?;
+    manifest.commit_check_rules = existing_commit_check_rules_for_workspace(&workspace_root)
+        .or_else(|| Some(default_commit_check_rules()));
     let manifest_path = default_manifest_path(&workspace_root);
     save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
     sync_workspace_gitignore(&workspace_root, &manifest.repos)
@@ -4375,6 +4700,16 @@ fn save_workspace_manifest_from_inputs(
             repo_count
         ),
     })
+}
+
+fn existing_commit_check_rules_for_workspace(
+    workspace_root: &Path,
+) -> Option<Vec<CommitCheckRule>> {
+    let app_state = state().lock().expect("state mutex poisoned");
+    let manifest = app_state.manifest.as_ref()?;
+    (manifest.root == workspace_root)
+        .then(|| manifest.commit_check_rules.clone())
+        .flatten()
 }
 
 fn sync_workspace_gitignore(
@@ -5923,7 +6258,20 @@ fn load_manifest_if_present(path: &Path) -> Option<WorkspaceManifest> {
     if !path.exists() {
         return None;
     }
-    load_manifest(path).ok()
+    let mut manifest = load_manifest(path).ok()?;
+    if ensure_commit_check_rules_initialized(&mut manifest) {
+        match save_manifest(path, &manifest) {
+            Ok(()) => append_log(format!(
+                "Initialized default commit check rules in {}.",
+                path.display()
+            )),
+            Err(error) => append_log(format!(
+                "Failed to save default commit check rules to {}: {error}",
+                path.display()
+            )),
+        }
+    }
+    Some(manifest)
 }
 
 fn normalized_watch_path(path: &Path) -> PathBuf {
@@ -6014,6 +6362,7 @@ mod tests {
             root: workspace_root.clone(),
             repos: Vec::new(),
             shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
         };
 
         assert!(workspace_watch_path_matches(
@@ -6044,6 +6393,7 @@ mod tests {
                 enabled: true,
             }],
             shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
         };
 
         assert!(workspace_watch_path_matches(
@@ -6070,6 +6420,7 @@ mod tests {
                 enabled: true,
             }],
             shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
         };
 
         let repo_event_path = cwd.join("../maruzzella/.git/refs/heads/main");
@@ -6134,6 +6485,7 @@ mod tests {
                 enabled: true,
             }],
             shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
         };
 
         let remote_error =
@@ -6156,6 +6508,7 @@ mod tests {
             root: workspace_root,
             repos: Vec::new(),
             shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
         };
 
         let error =

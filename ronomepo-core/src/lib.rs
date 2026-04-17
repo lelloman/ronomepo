@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 pub const MANIFEST_FILE_NAME: &str = "ronomepo.json";
@@ -14,6 +15,8 @@ pub struct WorkspaceManifest {
     pub root: PathBuf,
     pub repos: Vec<RepositoryEntry>,
     pub shared_hooks_path: Option<PathBuf>,
+    #[serde(default)]
+    pub commit_check_rules: Option<Vec<CommitCheckRule>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +26,43 @@ pub struct RepositoryEntry {
     pub dir_name: String,
     pub remote_url: String,
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitCheckRule {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub priority: i32,
+    pub effect: CommitCheckRuleEffect,
+    pub scope: CommitCheckRuleScope,
+    pub matcher: CommitCheckRuleMatcher,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitCheckRuleEffect {
+    Block,
+    Allow,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommitCheckRuleScope {
+    All,
+    Repositories { repository_ids: Vec<String> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommitCheckRuleMatcher {
+    Regex { pattern: String },
+    CommitHash { hash: String },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,11 +104,27 @@ pub struct LastCommitInfo {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryMatch {
+    pub repository_id: Option<String>,
     pub repository_name: String,
     pub head_offset: usize,
     pub commit_hash: String,
     pub subject: String,
     pub matching_lines: Vec<String>,
+    pub rule_id: String,
+    pub rule_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitCheckReport {
+    pub matches: Vec<HistoryMatch>,
+    pub invalid_rules: Vec<InvalidCommitCheckRule>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidCommitCheckRule {
+    pub rule_id: String,
+    pub rule_name: String,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,6 +252,42 @@ pub fn save_manifest(path: &Path, manifest: &WorkspaceManifest) -> Result<(), Wo
     Ok(())
 }
 
+pub fn default_commit_check_rules() -> Vec<CommitCheckRule> {
+    [
+        ("generated-marker", "Generated marker", "(?i)generated:"),
+        (
+            "generated-by-marker",
+            "Generated-by marker",
+            "(?i)generated-by:",
+        ),
+        ("anthropic-marker", "Anthropic marker", "(?i)@anthropic"),
+        ("co-author-marker", "Co-author marker", "(?i)co-author"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (id, name, pattern))| CommitCheckRule {
+        id: id.to_string(),
+        name: name.to_string(),
+        enabled: true,
+        priority: (index as i32) * 10,
+        effect: CommitCheckRuleEffect::Block,
+        scope: CommitCheckRuleScope::All,
+        matcher: CommitCheckRuleMatcher::Regex {
+            pattern: pattern.to_string(),
+        },
+    })
+    .collect()
+}
+
+pub fn ensure_commit_check_rules_initialized(manifest: &mut WorkspaceManifest) -> bool {
+    if manifest.commit_check_rules.is_some() {
+        return false;
+    }
+
+    manifest.commit_check_rules = Some(default_commit_check_rules());
+    true
+}
+
 pub fn import_repos_txt(
     path: &Path,
     workspace_root: &Path,
@@ -225,6 +317,7 @@ pub fn import_repos_txt(
         root: workspace_root.to_path_buf(),
         repos,
         shared_hooks_path: Some(workspace_root.join("hooks")),
+        commit_check_rules: None,
     })
 }
 
@@ -422,7 +515,7 @@ pub fn run_workspace_operation<F>(
                 repository_id: None,
                 repository_name: None,
                 message: format!(
-                    "Push aborted because generated-commit markers were found in: {}. Use force push to override.",
+                    "Push aborted because commit check rules blocked commits in: {}. Use force push to override.",
                     flagged.join(", ")
                 ),
             });
@@ -492,7 +585,20 @@ pub fn collect_generated_history_matches(
     selected_repo_ids: &[String],
     num_commits: usize,
 ) -> Vec<HistoryMatch> {
-    let mut matches = collect_repo_history_matches(&manifest.root, "(monorepo)", num_commits);
+    collect_commit_check_report(manifest, selected_repo_ids, num_commits).matches
+}
+
+pub fn collect_commit_check_report(
+    manifest: &WorkspaceManifest,
+    selected_repo_ids: &[String],
+    num_commits: usize,
+) -> CommitCheckReport {
+    let rules = manifest
+        .commit_check_rules
+        .clone()
+        .unwrap_or_else(default_commit_check_rules);
+    let compiled_rules = compile_commit_check_rules(&rules);
+    let mut commits = collect_repo_recent_commits(&manifest.root, None, "(monorepo)", num_commits);
 
     for repo in manifest
         .repos
@@ -506,14 +612,18 @@ pub fn collect_generated_history_matches(
         if !repo_path.exists() {
             continue;
         }
-        matches.extend(collect_repo_history_matches(
+        commits.extend(collect_repo_recent_commits(
             &repo_path,
+            Some(&repo.id),
             &repo.name,
             num_commits,
         ));
     }
 
-    matches
+    CommitCheckReport {
+        matches: evaluate_commit_check_rules(&commits, &compiled_rules.valid),
+        invalid_rules: compiled_rules.invalid,
+    }
 }
 
 pub fn collect_workspace_line_stats(
@@ -914,7 +1024,8 @@ fn generated_history_matches(
     selected_repo_ids: &[String],
     num_commits: usize,
 ) -> Vec<String> {
-    collect_generated_history_matches(manifest, selected_repo_ids, num_commits)
+    collect_commit_check_report(manifest, selected_repo_ids, num_commits)
+        .matches
         .into_iter()
         .map(|entry| entry.repository_name)
         .collect()
@@ -922,14 +1033,87 @@ fn generated_history_matches(
 
 #[cfg(test)]
 fn repo_history_has_generated_markers(repo_path: &Path, num_commits: usize) -> bool {
-    !collect_repo_history_matches(repo_path, "(repo)", num_commits).is_empty()
+    let manifest = WorkspaceManifest {
+        name: "Test".to_string(),
+        root: repo_path.to_path_buf(),
+        repos: Vec::new(),
+        shared_hooks_path: None,
+        commit_check_rules: Some(default_commit_check_rules()),
+    };
+    !collect_commit_check_report(&manifest, &[], num_commits)
+        .matches
+        .is_empty()
 }
 
-fn collect_repo_history_matches(
+#[derive(Clone, Debug)]
+struct RecentCommit {
+    repository_id: Option<String>,
+    repository_name: String,
+    head_offset: usize,
+    commit_hash: String,
+    subject: String,
+    body_lines: Vec<String>,
+}
+
+struct CompiledCommitCheckRules {
+    valid: Vec<CompiledCommitCheckRule>,
+    invalid: Vec<InvalidCommitCheckRule>,
+}
+
+struct CompiledCommitCheckRule {
+    rule: CommitCheckRule,
+    matcher: CompiledCommitCheckMatcher,
+}
+
+enum CompiledCommitCheckMatcher {
+    Regex(Regex),
+    CommitHash(String),
+}
+
+fn compile_commit_check_rules(rules: &[CommitCheckRule]) -> CompiledCommitCheckRules {
+    let mut ordered_rules = rules.to_vec();
+    ordered_rules.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    for rule in ordered_rules {
+        if !rule.enabled {
+            continue;
+        }
+
+        let matcher = match &rule.matcher {
+            CommitCheckRuleMatcher::Regex { pattern } => match Regex::new(pattern) {
+                Ok(regex) => CompiledCommitCheckMatcher::Regex(regex),
+                Err(error) => {
+                    invalid.push(InvalidCommitCheckRule {
+                        rule_id: rule.id.clone(),
+                        rule_name: rule.name.clone(),
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
+            },
+            CommitCheckRuleMatcher::CommitHash { hash } => {
+                CompiledCommitCheckMatcher::CommitHash(hash.trim().to_ascii_lowercase())
+            }
+        };
+
+        valid.push(CompiledCommitCheckRule { rule, matcher });
+    }
+
+    CompiledCommitCheckRules { valid, invalid }
+}
+
+fn collect_repo_recent_commits(
     repo_path: &Path,
+    repository_id: Option<&str>,
     repository_name: &str,
     num_commits: usize,
-) -> Vec<HistoryMatch> {
+) -> Vec<RecentCommit> {
     let limit = num_commits.to_string();
     let Some(output) = git_stdout(
         repo_path,
@@ -943,41 +1127,28 @@ fn collect_repo_history_matches(
         return Vec::new();
     };
 
-    const WHITELIST: &[&str] = &["e4e373f65715ad492dbe9db3ba89b2dd02c137f7"];
-
-    let mut matches = Vec::new();
+    let mut commits = Vec::new();
     let mut current_hash = String::new();
     let mut current_subject = String::new();
     let mut body_lines = Vec::new();
     let mut head_offset = 0usize;
 
-    let push_match = |matches: &mut Vec<HistoryMatch>,
-                      current_hash: &str,
-                      current_subject: &str,
-                      body_lines: &[String],
-                      head_offset: usize| {
-        if current_hash.is_empty() || WHITELIST.contains(&current_hash) {
+    let push_commit = |commits: &mut Vec<RecentCommit>,
+                       current_hash: &str,
+                       current_subject: &str,
+                       body_lines: &[String],
+                       head_offset: usize| {
+        if current_hash.is_empty() {
             return;
         }
-        let mut matching_lines = Vec::new();
-        let subject_lower = current_subject.to_ascii_lowercase();
-        if contains_generated_marker(&subject_lower) {
-            matching_lines.push(current_subject.to_string());
-        }
-        for line in body_lines {
-            if contains_generated_marker(&line.to_ascii_lowercase()) {
-                matching_lines.push(line.clone());
-            }
-        }
-        if !matching_lines.is_empty() {
-            matches.push(HistoryMatch {
-                repository_name: repository_name.to_string(),
-                head_offset,
-                commit_hash: current_hash.to_string(),
-                subject: current_subject.to_string(),
-                matching_lines,
-            });
-        }
+        commits.push(RecentCommit {
+            repository_id: repository_id.map(ToOwned::to_owned),
+            repository_name: repository_name.to_string(),
+            head_offset,
+            commit_hash: current_hash.to_string(),
+            subject: current_subject.to_string(),
+            body_lines: body_lines.to_vec(),
+        });
     };
 
     for line in output.lines() {
@@ -996,8 +1167,8 @@ fn collect_repo_history_matches(
             continue;
         }
         if line == "END---" {
-            push_match(
-                &mut matches,
+            push_commit(
+                &mut commits,
                 &current_hash,
                 &current_subject,
                 &body_lines,
@@ -1016,14 +1187,98 @@ fn collect_repo_history_matches(
         }
     }
 
+    commits
+}
+
+fn evaluate_commit_check_rules(
+    commits: &[RecentCommit],
+    rules: &[CompiledCommitCheckRule],
+) -> Vec<HistoryMatch> {
+    let mut matches = Vec::new();
+
+    for commit in commits {
+        let mut blocked: Option<HistoryMatch> = None;
+        for rule in rules {
+            if !rule_applies_to_repository(&rule.rule, commit.repository_id.as_deref()) {
+                continue;
+            }
+
+            let Some(matching_lines) = commit_matches_rule(commit, &rule.matcher) else {
+                continue;
+            };
+
+            match rule.rule.effect {
+                CommitCheckRuleEffect::Block => {
+                    blocked = Some(HistoryMatch {
+                        repository_id: commit.repository_id.clone(),
+                        repository_name: commit.repository_name.clone(),
+                        head_offset: commit.head_offset,
+                        commit_hash: commit.commit_hash.clone(),
+                        subject: commit.subject.clone(),
+                        matching_lines,
+                        rule_id: rule.rule.id.clone(),
+                        rule_name: rule.rule.name.clone(),
+                    });
+                }
+                CommitCheckRuleEffect::Allow => {
+                    blocked = None;
+                }
+            }
+        }
+
+        if let Some(entry) = blocked {
+            matches.push(entry);
+        }
+    }
+
     matches
 }
 
-fn contains_generated_marker(lowered: &str) -> bool {
-    lowered.contains("generated:")
-        || lowered.contains("generated-by:")
-        || lowered.contains("@anthropic")
-        || lowered.contains("co-author")
+fn rule_applies_to_repository(rule: &CommitCheckRule, repository_id: Option<&str>) -> bool {
+    match &rule.scope {
+        CommitCheckRuleScope::All => true,
+        CommitCheckRuleScope::Repositories { repository_ids } => repository_id
+            .map(|repository_id| repository_ids.iter().any(|id| id == repository_id))
+            .unwrap_or(false),
+    }
+}
+
+fn commit_matches_rule(
+    commit: &RecentCommit,
+    matcher: &CompiledCommitCheckMatcher,
+) -> Option<Vec<String>> {
+    match matcher {
+        CompiledCommitCheckMatcher::Regex(regex) => {
+            let mut matching_lines = Vec::new();
+            if regex.is_match(&commit.subject) {
+                matching_lines.push(commit.subject.clone());
+            }
+            for line in &commit.body_lines {
+                if regex.is_match(line) {
+                    matching_lines.push(line.clone());
+                }
+            }
+            if matching_lines.is_empty() {
+                let message = commit_message(commit);
+                if regex.is_match(&message) {
+                    matching_lines.push("<message>".to_string());
+                }
+            }
+            (!matching_lines.is_empty()).then_some(matching_lines)
+        }
+        CompiledCommitCheckMatcher::CommitHash(hash) => (commit.commit_hash.to_ascii_lowercase()
+            == *hash)
+            .then(|| vec![commit.commit_hash.clone()]),
+    }
+}
+
+fn commit_message(commit: &RecentCommit) -> String {
+    let mut message = commit.subject.clone();
+    for line in &commit.body_lines {
+        message.push('\n');
+        message.push_str(line);
+    }
+    message
 }
 
 fn collect_repo_line_stats(
@@ -1224,6 +1479,7 @@ mod tests {
                 enabled: true,
             }],
             shared_hooks_path: Some(PathBuf::from("/tmp/example/hooks")),
+            commit_check_rules: Some(default_commit_check_rules()),
         };
 
         save_manifest(&path, &manifest).unwrap();
@@ -1267,6 +1523,7 @@ mod tests {
                 enabled: true,
             }],
             shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
         };
 
         let items = build_repository_list(&manifest);
@@ -1345,6 +1602,7 @@ mod tests {
             root: workspace,
             repos: vec![],
             shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
         };
 
         let matches = collect_generated_history_matches(&manifest, &[], 25);
@@ -1372,6 +1630,7 @@ mod tests {
                 enabled: true,
             }],
             shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
         };
 
         let stats = collect_workspace_line_stats(&manifest, None);
@@ -1414,6 +1673,115 @@ mod tests {
     }
 
     #[test]
+    fn commit_check_defaults_are_seeded_once() {
+        let mut manifest = WorkspaceManifest {
+            name: "Example".to_string(),
+            root: PathBuf::from("/tmp/example"),
+            repos: vec![],
+            shared_hooks_path: None,
+            commit_check_rules: None,
+        };
+
+        assert!(ensure_commit_check_rules_initialized(&mut manifest));
+        assert_eq!(manifest.commit_check_rules.as_ref().unwrap().len(), 4);
+        assert!(!ensure_commit_check_rules_initialized(&mut manifest));
+
+        manifest.commit_check_rules = Some(Vec::new());
+        assert!(!ensure_commit_check_rules_initialized(&mut manifest));
+        assert_eq!(manifest.commit_check_rules.as_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn later_commit_hash_allow_rule_unblocks_blocked_commit() {
+        let repo_path = temp_dir_path("commit-hash-allow");
+        init_git_repo(&repo_path);
+        run_git(
+            repo_path.as_path(),
+            [
+                "commit",
+                "--allow-empty",
+                "-m",
+                "bot work",
+                "-m",
+                "Generated: Claude",
+            ],
+        );
+        let hash = git_stdout(&repo_path, ["rev-parse", "HEAD"]).unwrap();
+
+        let manifest = WorkspaceManifest {
+            name: "Example".to_string(),
+            root: repo_path,
+            repos: vec![],
+            shared_hooks_path: None,
+            commit_check_rules: Some(vec![
+                CommitCheckRule {
+                    id: "block-generated".to_string(),
+                    name: "Block generated".to_string(),
+                    enabled: true,
+                    priority: 0,
+                    effect: CommitCheckRuleEffect::Block,
+                    scope: CommitCheckRuleScope::All,
+                    matcher: CommitCheckRuleMatcher::Regex {
+                        pattern: "(?i)generated:".to_string(),
+                    },
+                },
+                CommitCheckRule {
+                    id: "allow-hash".to_string(),
+                    name: "Allow hash".to_string(),
+                    enabled: true,
+                    priority: 10,
+                    effect: CommitCheckRuleEffect::Allow,
+                    scope: CommitCheckRuleScope::All,
+                    matcher: CommitCheckRuleMatcher::CommitHash { hash },
+                },
+            ]),
+        };
+
+        let report = collect_commit_check_report(&manifest, &[], 25);
+        assert!(report.invalid_rules.is_empty());
+        assert!(report.matches.is_empty());
+    }
+
+    #[test]
+    fn invalid_regex_is_reported_without_blocking() {
+        let repo_path = temp_dir_path("invalid-regex");
+        init_git_repo(&repo_path);
+        run_git(
+            repo_path.as_path(),
+            [
+                "commit",
+                "--allow-empty",
+                "-m",
+                "bot work",
+                "-m",
+                "Generated: Claude",
+            ],
+        );
+
+        let manifest = WorkspaceManifest {
+            name: "Example".to_string(),
+            root: repo_path,
+            repos: vec![],
+            shared_hooks_path: None,
+            commit_check_rules: Some(vec![CommitCheckRule {
+                id: "bad-regex".to_string(),
+                name: "Bad regex".to_string(),
+                enabled: true,
+                priority: 0,
+                effect: CommitCheckRuleEffect::Block,
+                scope: CommitCheckRuleScope::All,
+                matcher: CommitCheckRuleMatcher::Regex {
+                    pattern: "[".to_string(),
+                },
+            }]),
+        };
+
+        let report = collect_commit_check_report(&manifest, &[], 25);
+        assert_eq!(report.invalid_rules.len(), 1);
+        assert!(report.matches.is_empty());
+    }
+
+    #[test]
     fn push_is_blocked_when_generated_history_is_present() {
         let workspace = temp_dir_path("push-preflight");
         fs::create_dir_all(&workspace).unwrap();
@@ -1443,6 +1811,7 @@ mod tests {
             root: workspace,
             repos: vec![],
             shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
         };
 
         let mut events = Vec::new();
@@ -1476,6 +1845,7 @@ mod tests {
                 enabled: true,
             }],
             shared_hooks_path: Some(hooks_path.clone()),
+            commit_check_rules: Some(default_commit_check_rules()),
         };
 
         let mut events = Vec::new();
