@@ -29,9 +29,10 @@ use gtk::{
     SorterChange, TextBuffer, TextView, ToggleButton, Window, WrapMode,
 };
 use maruzzella_sdk::{
-    export_plugin, CommandSpec, HostApi, MzLogLevel, MzStatusCode, MzToolbarDisplayMode,
-    MzViewOpenDisposition, MzViewPlacement, OpenViewRequest, Plugin, PluginDependency,
-    PluginDescriptor, SurfaceContributionSpec, ToolbarWidgetSpec, Version, ViewFactorySpec,
+    button_css_class, export_plugin, input_css_class, surface_css_class, text_css_class,
+    CommandSpec, HostApi, MzLogLevel, MzStatusCode, MzToolbarDisplayMode, MzViewOpenDisposition,
+    MzViewPlacement, OpenViewRequest, Plugin, PluginDependency, PluginDescriptor,
+    SurfaceContributionSpec, ToolbarWidgetSpec, Version, ViewFactorySpec,
 };
 use notify::{Config as NotifyConfig, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use ronomepo_core::{
@@ -1617,6 +1618,20 @@ fn refresh_overview_views(snapshot: &StateSnapshot) {
                 if let Some(panel) = handle.auxiliary_root.upgrade() {
                     sync_repo_terminal_panel(&panel, &snapshot, handle.instance_key.as_deref());
                 }
+                true
+            }
+            None => false,
+        });
+    });
+}
+
+fn refresh_commit_check_views_now() {
+    let snapshot = snapshot();
+    COMMIT_CHECK_VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        views.retain(|handle| match handle.root.upgrade() {
+            Some(root) => {
+                render_commit_check_into(&root, &snapshot);
                 true
             }
             None => false,
@@ -3483,18 +3498,23 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
         append_commit_check_rule_row(&rules_box, &rule_rows, Some(rule));
     }
 
-    let rules_scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(false)
-        .min_content_height(260)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .child(&rules_box)
-        .build();
-
-    let rule_status = Label::new(Some(
-        "Use Save Rules to persist changes to the workspace manifest.",
-    ));
+    let rule_status_text = snapshot
+        .manifest_path
+        .as_ref()
+        .map(|path| {
+            format!(
+                "Loaded {} commit check rules from {}. Use Save Rules to persist edits.",
+                manifest_rules.len(),
+                path.display()
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "Loaded {} commit check rules. No workspace manifest is loaded.",
+                manifest_rules.len()
+            )
+        });
+    let rule_status = Label::new(Some(&rule_status_text));
     rule_status.set_xalign(0.0);
     rule_status.set_wrap(true);
     rule_status.add_css_class("muted");
@@ -3504,8 +3524,14 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
     add_rule.connect_clicked({
         let rules_box = rules_box.clone();
         let rule_rows = rule_rows.clone();
+        let rule_status = rule_status.clone();
         move |_| {
-            append_commit_check_rule_row(&rules_box, &rule_rows, None);
+            open_add_commit_check_rule_dialog(
+                active_window(),
+                rules_box.clone(),
+                rule_rows.clone(),
+                rule_status.clone(),
+            );
         }
     });
     let save_rules = Button::with_label("Save Rules");
@@ -3541,39 +3567,13 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
         rule_actions.append(&button);
     }
 
-    let sections = GtkBox::new(Orientation::Vertical, 12);
-    append_overview_section(
-        &sections,
-        "Selection Scope",
-        &if snapshot.selected_repo_ids.is_empty() {
-            "No repos selected. Commit Check scans all eligible repos in the workspace.".to_string()
-        } else {
-            format!(
-                "{} repos selected. Commit Check reports only against the current selection.",
-                snapshot.selected_repo_ids.len()
-            )
-        },
-    );
-    append_lines_section(
-        &sections,
-        "Report",
-        &if snapshot.history_report_loading {
-            vec!["Commit check is running...".to_string()]
-        } else {
-            snapshot.history_report.clone()
-        },
-        "Run Check to surface the same rule matches that block a protected push.",
-    );
-    append_log_section(&sections, "Recent Operations", &snapshot.logs, 8);
-
     root.append(&hero);
     root.append(&actions);
     root.append(&rules_header);
     root.append(&rules_help);
     root.append(&rule_actions);
-    root.append(&rules_scroller);
     root.append(&rule_status);
-    root.append(&sections);
+    root.append(&rules_box);
 }
 
 fn append_commit_check_rule_row(
@@ -3676,6 +3676,185 @@ fn append_commit_check_rule_row(
     });
 }
 
+fn open_add_commit_check_rule_dialog(
+    parent: Option<Window>,
+    rules_box: GtkBox,
+    rule_rows: Rc<RefCell<Vec<CommitCheckRuleRowHandle>>>,
+    status: Label,
+) {
+    let dialog = Dialog::builder()
+        .modal(true)
+        .title("Add Commit Check Rule")
+        .build();
+    if let Some(parent) = parent.as_ref() {
+        dialog.set_transient_for(Some(parent));
+    }
+    let cancel = dialog.add_button("Cancel", ResponseType::Cancel);
+    cancel.add_css_class(&button_css_class("secondary"));
+    let add = dialog.add_button("Add Rule", ResponseType::Accept);
+    add.add_css_class(&button_css_class("primary"));
+    dialog.set_default_response(ResponseType::Accept);
+    dialog.add_css_class(&surface_css_class("ronomepo-workbench"));
+    dialog.add_css_class(&text_css_class("body"));
+
+    let content = dialog.content_area();
+    content.add_css_class(&surface_css_class("ronomepo-workbench"));
+    content.add_css_class(&text_css_class("body"));
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    content.set_spacing(12);
+
+    let body = GtkBox::new(Orientation::Vertical, 8);
+    body.add_css_class(&surface_css_class("ronomepo-workbench"));
+    body.add_css_class(&text_css_class("body"));
+
+    let enabled = CheckButton::with_label("Enabled");
+    enabled.set_active(true);
+
+    let allow = CheckButton::with_label("Allow");
+
+    let hash_matcher = CheckButton::with_label("Hash");
+
+    let name = Entry::new();
+    name.add_css_class(&input_css_class("search"));
+    name.set_hexpand(true);
+    name.set_placeholder_text(Some("Rule name"));
+
+    let priority = Entry::new();
+    priority.add_css_class(&input_css_class("search"));
+    priority.set_placeholder_text(Some("100"));
+    priority.set_text("100");
+
+    let value = Entry::new();
+    value.add_css_class(&input_css_class("search"));
+    value.set_hexpand(true);
+    value.set_placeholder_text(Some("Regex pattern or commit hash"));
+
+    let repository_ids = Entry::new();
+    repository_ids.add_css_class(&input_css_class("search"));
+    repository_ids.set_hexpand(true);
+    repository_ids.set_placeholder_text(Some("Repo IDs, comma-separated; empty means all"));
+
+    let toggles = GtkBox::new(Orientation::Horizontal, 8);
+    toggles.append(&enabled);
+    toggles.append(&allow);
+    toggles.append(&hash_matcher);
+
+    let error = Label::new(None);
+    error.set_xalign(0.0);
+    error.set_wrap(true);
+    error.add_css_class("error");
+
+    body.append(&toggles);
+    body.append(&labeled_field("Name", &name));
+    body.append(&labeled_field("Priority", &priority));
+    body.append(&labeled_field("Pattern Or Hash", &value));
+    body.append(&labeled_field("Repository Scope", &repository_ids));
+    body.append(&error);
+    content.append(&body);
+
+    dialog.connect_response({
+        let dialog = dialog.clone();
+        let enabled = enabled.clone();
+        let allow = allow.clone();
+        let hash_matcher = hash_matcher.clone();
+        let name = name.clone();
+        let priority = priority.clone();
+        let value = value.clone();
+        let repository_ids = repository_ids.clone();
+        let error = error.clone();
+        move |_, response| {
+            if response != ResponseType::Accept {
+                dialog.close();
+                return;
+            }
+
+            let rule_name = name.text().trim().to_string();
+            if rule_name.is_empty() {
+                error.set_text("Rule needs a name.");
+                return;
+            }
+
+            let rule_value = value.text().trim().to_string();
+            if rule_value.is_empty() {
+                error.set_text("Rule needs a regex pattern or commit hash.");
+                return;
+            }
+
+            let priority_value = match priority.text().trim().parse::<i32>() {
+                Ok(priority) => priority,
+                Err(_) => {
+                    error.set_text("Priority must be an integer.");
+                    return;
+                }
+            };
+
+            let repository_ids = repository_ids
+                .text()
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+
+            let rule = CommitCheckRule {
+                id: new_commit_check_rule_id(),
+                name: rule_name,
+                enabled: enabled.is_active(),
+                priority: priority_value,
+                effect: if allow.is_active() {
+                    CommitCheckRuleEffect::Allow
+                } else {
+                    CommitCheckRuleEffect::Block
+                },
+                scope: if repository_ids.is_empty() {
+                    CommitCheckRuleScope::All
+                } else {
+                    CommitCheckRuleScope::Repositories { repository_ids }
+                },
+                matcher: if hash_matcher.is_active() {
+                    CommitCheckRuleMatcher::CommitHash { hash: rule_value }
+                } else {
+                    CommitCheckRuleMatcher::Regex {
+                        pattern: rule_value,
+                    }
+                },
+            };
+
+            let mut rules = match build_commit_check_rules_from_rows(&rule_rows.borrow()) {
+                Ok(rules) => rules,
+                Err(message) => {
+                    error.set_text(&message);
+                    return;
+                }
+            };
+            rules.push(rule.clone());
+
+            status.set_text("Saving commit check rule...");
+            match save_commit_check_rules(rules) {
+                Ok(message) => {
+                    append_commit_check_rule_row(&rules_box, &rule_rows, Some(&rule));
+                    status.set_text(&format!("Saved rule \"{}\". {}", rule.name, message));
+                    append_log(message);
+                    dialog.close();
+                    refresh_commit_check_views_now();
+                    refresh_log_surfaces();
+                }
+                Err(message) => {
+                    error.set_text(&message);
+                    status.set_text(&message);
+                    append_log(message);
+                    refresh_log_surfaces();
+                }
+            }
+        }
+    });
+
+    dialog.present();
+}
+
 fn commit_check_rule_value(rule: &CommitCheckRule) -> String {
     match &rule.matcher {
         CommitCheckRuleMatcher::Regex { pattern } => pattern.clone(),
@@ -3774,7 +3953,6 @@ fn save_commit_check_rules(rules: Vec<CommitCheckRule>) -> Result<String, String
             .unwrap_or_else(|| default_manifest_path(&manifest.root));
         (manifest_path, manifest)
     };
-
     manifest.commit_check_rules = Some(rules);
     save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
 
