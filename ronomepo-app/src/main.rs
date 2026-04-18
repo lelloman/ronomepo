@@ -13,6 +13,7 @@ use maruzzella::{
 use ronomepo_core::normalize_workspace_root;
 
 fn main() {
+    configure_gtk_input_method();
     reset_stale_persisted_layout();
 
     let workspace_root = parse_workspace_root_arg()
@@ -311,6 +312,30 @@ fn main() {
         .next()
         .unwrap_or_else(|| "ronomepo-app".to_string());
     application.run_with_args(&[argv0]);
+}
+
+fn configure_gtk_input_method() {
+    if env::var_os("RONOMEPO_USE_SYSTEM_INPUT_METHOD").is_some() {
+        return;
+    }
+
+    // Keep Ronomepo from talking to IBus. When IBus is wedged, GTK's repeated
+    // input-context creation attempts can also disturb the rest of the i3
+    // session, so use GTK's built-in simple context for this process.
+    env::set_var("GTK_IM_MODULE", "gtk-im-context-simple");
+
+    if env_var_uses_ibus("XMODIFIERS") {
+        env::remove_var("XMODIFIERS");
+    }
+    if env_var_uses_ibus("QT_IM_MODULE") {
+        env::remove_var("QT_IM_MODULE");
+    }
+}
+
+fn env_var_uses_ibus(name: &str) -> bool {
+    env::var(name)
+        .map(|value| value.to_ascii_lowercase().contains("ibus"))
+        .unwrap_or(false)
 }
 
 fn reset_stale_persisted_layout() {
