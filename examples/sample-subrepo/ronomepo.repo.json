@@ -1,0 +1,55 @@
+{
+  "$schema": "../../docs/repo-manifest.schema.json",
+  "schema_version": 1,
+  "repo_id": "sample-product",
+  "items": [
+    {
+      "id": "desktop-app",
+      "type": "cargo",
+      "path": ".",
+      "artifacts": [
+        {
+          "name": "desktop-binary",
+          "kind": "binary",
+          "path": "target/release/sample-product",
+          "build_action": "build"
+        }
+      ]
+    },
+    {
+      "id": "python-tools",
+      "type": "python",
+      "path": "tools",
+      "actions": [
+        {
+          "action": "test",
+          "command": ["tox", "-q"],
+          "timeout_seconds": 120
+        }
+      ]
+    }
+  ],
+  "repo_actions": [
+    {
+      "action": "deploy",
+      "command": ["./scripts/deploy.sh", "--prod"],
+      "workdir": "."
+    }
+  ],
+  "aggregation": [
+    {
+      "action": "test",
+      "item_ids": ["desktop-app", "python-tools"],
+      "execution": "parallel",
+      "failure_policy": "continue",
+      "merge": "combined"
+    },
+    {
+      "action": "list_artifacts",
+      "item_ids": ["desktop-app", "python-tools"],
+      "execution": "sequential",
+      "failure_policy": "fail_fast",
+      "merge": "combined"
+    }
+  ]
+}

@@ -40,9 +40,10 @@ use ronomepo_core::{
     collect_workspace_line_stats, default_commit_check_rules, default_manifest_path,
     derive_dir_name, ensure_commit_check_rules_initialized, format_sync_label, import_repos_txt,
     load_manifest, normalize_workspace_root, run_workspace_operation, save_manifest,
-    workspace_summary, CommitCheckRule, CommitCheckRuleEffect, CommitCheckRuleMatcher,
-    CommitCheckRuleScope, OperationEvent, OperationEventKind, OperationKind, RepositoryDetails,
-    RepositoryEntry, RepositoryListItem, RepositoryStatus, WorkspaceManifest, MANIFEST_FILE_NAME,
+    scan_repo_manifest, workspace_summary, CommitCheckRule, CommitCheckRuleEffect,
+    CommitCheckRuleMatcher, CommitCheckRuleScope, OperationEvent, OperationEventKind,
+    OperationKind, RepoManifestScan, RepoManifestScanState, RepositoryDetails, RepositoryEntry,
+    RepositoryListItem, RepositoryStatus, WorkspaceManifest, MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -69,9 +70,11 @@ const CMD_REFRESH_LOGS: &str = "ronomepo.logs.refresh";
 const CMD_CLEAR_LOGS: &str = "ronomepo.logs.clear";
 const MONITOR_NAME_COL_CHARS: i32 = 28;
 const MONITOR_BRANCH_COL_CHARS: i32 = 14;
+const MONITOR_MANIFEST_COL_CHARS: i32 = 12;
 const MONITOR_STATE_COL_CHARS: i32 = 12;
 const MONITOR_NAME_COL_WIDTH: i32 = 300;
 const MONITOR_BRANCH_COL_WIDTH: i32 = 120;
+const MONITOR_MANIFEST_COL_WIDTH: i32 = 120;
 const MONITOR_STATE_COL_WIDTH: i32 = 120;
 const WORKER_POOL_SIZE: usize = 4;
 const LOCAL_RESCAN_INTERVAL_SECS: u32 = 5 * 60;
@@ -238,8 +241,7 @@ enum WorkerJob {
         workspace_root: PathBuf,
     },
     RepositoryStatusRefresh {
-        repo_id: String,
-        repo_path: PathBuf,
+        item: RepositoryListItem,
     },
     RepositoryRemoteFetch {
         repo_id: String,
@@ -297,8 +299,7 @@ enum WorkerResult {
         workspace_status: RepositoryStatus,
     },
     RepositoryStatusRefreshed {
-        repo_id: String,
-        status: RepositoryStatus,
+        item: RepositoryListItem,
     },
     RepositoryRemoteFetchCompleted {
         repo_id: String,
@@ -537,9 +538,10 @@ fn run_worker_job(queued_job: QueuedJob) {
             let workspace_status = ronomepo_core::collect_repository_status(&workspace_root);
             dispatch_worker_result(WorkerResult::WorkspaceRootStatusRefreshed { workspace_status });
         }
-        WorkerJob::RepositoryStatusRefresh { repo_id, repo_path } => {
-            let status = ronomepo_core::collect_repository_status(&repo_path);
-            dispatch_worker_result(WorkerResult::RepositoryStatusRefreshed { repo_id, status });
+        WorkerJob::RepositoryStatusRefresh { mut item } => {
+            item.status = ronomepo_core::collect_repository_status(&item.status.repo_path);
+            item.repo_manifest = Some(scan_repo_manifest(&item.status.repo_path));
+            dispatch_worker_result(WorkerResult::RepositoryStatusRefreshed { item });
         }
         WorkerJob::RepositoryRemoteFetch {
             repo_id,
@@ -1369,21 +1371,28 @@ fn handle_worker_result(result: WorkerResult) {
             }
             refresh_views();
         }
-        WorkerResult::RepositoryStatusRefreshed { repo_id, status } => {
+        WorkerResult::RepositoryStatusRefreshed { item } => {
             let follow_up_refresh = {
                 let mut app_state = state().lock().expect("state mutex poisoned");
+                let repo_id = item.id.clone();
                 let follow_up_refresh = finalize_repo_status_refresh(&mut app_state, &repo_id);
-                if let Some(item) = app_state
+                if let Some(existing_item) = app_state
                     .repository_items
                     .iter_mut()
-                    .find(|item| item.id == repo_id)
+                    .find(|existing_item| existing_item.id == repo_id)
                 {
-                    item.status = status;
+                    *existing_item = item.clone();
                 }
                 follow_up_refresh
             };
             if let Some(repo_path) = follow_up_refresh {
-                schedule_repository_status_refresh(&repo_id, repo_path);
+                if let Some(item) = repository_item_from_state(&item.id) {
+                    schedule_repository_status_refresh(&item);
+                } else {
+                    let mut fallback = item.clone();
+                    fallback.status.repo_path = repo_path;
+                    schedule_repository_status_refresh(&fallback);
+                }
             }
             refresh_views();
         }
@@ -1410,8 +1419,10 @@ fn handle_worker_result(result: WorkerResult) {
                     format!("Remote sync refresh failed for {repo_name}: {error}")
                 }
             };
-            if let Some(repo_path) = refresh_path {
-                schedule_repository_status_refresh(&repo_id, repo_path);
+            if refresh_path.is_some() {
+                if let Some(item) = repository_item_from_state(&repo_id) {
+                    schedule_repository_status_refresh(&item);
+                }
             }
             append_log(message);
             refresh_views();
@@ -1541,7 +1552,18 @@ fn schedule_refresh_for_operation_event(manifest: &WorkspaceManifest, event: &Op
     };
 
     invalidate_repo_details(repo_id);
-    schedule_repository_status_refresh(repo_id, manifest.root.join(&repo.dir_name));
+    let item = RepositoryListItem {
+        id: repo.id.clone(),
+        name: repo.name.clone(),
+        dir_name: repo.dir_name.clone(),
+        remote_url: repo.remote_url.clone(),
+        status: RepositoryStatus {
+            repo_path: manifest.root.join(&repo.dir_name),
+            ..empty_repository_status(manifest.root.join(&repo.dir_name))
+        },
+        repo_manifest: Some(scan_repo_manifest(&manifest.root.join(&repo.dir_name))),
+    };
+    schedule_repository_status_refresh(&item);
 }
 
 fn refresh_views() {
@@ -1788,6 +1810,61 @@ fn status_label(state: &ronomepo_core::RepositoryState) -> &'static str {
     }
 }
 
+fn manifest_presence_label(scan: Option<&RepoManifestScan>) -> &'static str {
+    match scan.map(|scan| &scan.state) {
+        Some(RepoManifestScanState::Valid(_)) => "Manifest",
+        Some(RepoManifestScanState::Invalid { .. }) => "Manifest!",
+        Some(RepoManifestScanState::Missing) => "No Manifest",
+        None => "",
+    }
+}
+
+fn manifest_presence_search_text(scan: Option<&RepoManifestScan>) -> &'static str {
+    match scan.map(|scan| &scan.state) {
+        Some(RepoManifestScanState::Valid(_)) => "manifest valid",
+        Some(RepoManifestScanState::Invalid { .. }) => "manifest invalid",
+        Some(RepoManifestScanState::Missing) => "manifest missing",
+        None => "",
+    }
+}
+
+fn manifest_presence_tooltip(scan: Option<&RepoManifestScan>) -> Option<String> {
+    match scan.map(|scan| (&scan.path, &scan.state)) {
+        Some((path, RepoManifestScanState::Valid(summary))) => Some(format!(
+            "{}\n{} items | types: {} | actions: {}",
+            path.display(),
+            summary.item_count,
+            summary.item_types.join(", "),
+            summary
+                .supported_actions
+                .iter()
+                .map(|action| standard_action_label(*action).to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        Some((path, RepoManifestScanState::Invalid { message })) => {
+            Some(format!("{}\nInvalid manifest: {}", path.display(), message))
+        }
+        Some((path, RepoManifestScanState::Missing)) => {
+            Some(format!("{} not found.", path.display()))
+        }
+        None => None,
+    }
+}
+
+fn standard_action_label(action: ronomepo_core::StandardActionName) -> &'static str {
+    match action {
+        ronomepo_core::StandardActionName::ListArtifacts => "list_artifacts",
+        ronomepo_core::StandardActionName::Build => "build",
+        ronomepo_core::StandardActionName::Test => "test",
+        ronomepo_core::StandardActionName::Clean => "clean",
+        ronomepo_core::StandardActionName::VerifyDependenciesFreshness => {
+            "verify_dependencies_freshness"
+        }
+        ronomepo_core::StandardActionName::Deploy => "deploy",
+    }
+}
+
 fn branch_label(item: &RepositoryListItem) -> &str {
     item.status.branch.as_deref().unwrap_or("detached")
 }
@@ -1917,12 +1994,14 @@ fn repo_monitor_filter_matches(item: &RepositoryListItem, snapshot: &StateSnapsh
     let branch = branch_label(item).to_ascii_lowercase();
     let sync = format_sync_label(&item.status.sync).to_ascii_lowercase();
     let state = status_label(&item.status.state).to_ascii_lowercase();
+    let manifest = manifest_presence_search_text(item.repo_manifest.as_ref()).to_ascii_lowercase();
     item.name.to_ascii_lowercase().contains(&filter)
         || item.dir_name.to_ascii_lowercase().contains(&filter)
         || item.remote_url.to_ascii_lowercase().contains(&filter)
         || branch.contains(&filter)
         || sync.contains(&filter)
         || state.contains(&filter)
+        || manifest.contains(&filter)
 }
 
 fn build_repo_monitor_row(
@@ -1954,12 +2033,14 @@ fn build_repo_monitor_row(
         MONITOR_BRANCH_COL_WIDTH,
         false,
     );
+    let manifest = monitor_manifest_cell(item.repo_manifest.as_ref());
     let status = monitor_state_cell(&item.status.state);
 
     let sync = monitor_sync_cell(&item.status.sync);
 
     content.append(&name);
     content.append(&branch);
+    content.append(&manifest);
     content.append(&status);
     content.append(&sync);
     attach_repo_monitor_context_menu(&content, host_ptr);
@@ -1979,6 +2060,7 @@ fn monorepo_monitor_item(snapshot: &StateSnapshot) -> RepositoryListItem {
         dir_name: ".".to_string(),
         remote_url: snapshot.workspace_root.display().to_string(),
         status: snapshot.workspace_status.clone(),
+        repo_manifest: None,
     }
 }
 
@@ -2256,23 +2338,23 @@ fn schedule_pending_local_rescans() {
                 if runtime.local_refresh_in_flight || !runtime.needs_rescan() {
                     return None;
                 }
-                Some((item.id.clone(), item.status.repo_path.clone()))
+                Some(item.clone())
             })
             .collect::<Vec<_>>()
     };
 
     if !scheduled.is_empty() {
         let mut app_state = state().lock().expect("state mutex poisoned");
-        for (repo_id, _) in &scheduled {
-            if let Some(runtime) = app_state.repo_runtime.get_mut(repo_id) {
+        for item in &scheduled {
+            if let Some(runtime) = app_state.repo_runtime.get_mut(&item.id) {
                 runtime.local_refresh_in_flight = true;
                 runtime.scheduled_scan_seq = runtime.invalidation_seq;
             }
         }
     }
 
-    for (repo_id, repo_path) in scheduled {
-        schedule_repository_status_refresh(&repo_id, repo_path);
+    for item in scheduled {
+        schedule_repository_status_refresh(&item);
     }
 }
 
@@ -2378,13 +2460,12 @@ fn schedule_workspace_root_status_refresh(workspace_root: PathBuf) {
     }
 }
 
-fn schedule_repository_status_refresh(repo_id: &str, repo_path: PathBuf) {
-    let repo_id = repo_id.to_string();
+fn schedule_repository_status_refresh(item: &RepositoryListItem) {
+    let repo_id = item.id.clone();
     match submit_coalesced_job(
         JobKey::RepoStatus(repo_id.clone()),
         WorkerJob::RepositoryStatusRefresh {
-            repo_id: repo_id.clone(),
-            repo_path,
+            item: item.clone(),
         },
     ) {
         Ok(true) => {}
@@ -2401,6 +2482,16 @@ fn schedule_repository_status_refresh(repo_id: &str, repo_path: PathBuf) {
             refresh_views();
         }
     }
+}
+
+fn repository_item_from_state(repo_id: &str) -> Option<RepositoryListItem> {
+    state()
+        .lock()
+        .expect("state mutex poisoned")
+        .repository_items
+        .iter()
+        .find(|item| item.id == repo_id)
+        .cloned()
 }
 
 fn schedule_repository_remote_fetch(repo_id: &str, repo_name: &str, repo_path: PathBuf) {
@@ -3101,6 +3192,12 @@ fn repo_monitor_header() -> GtkBox {
         MONITOR_BRANCH_COL_WIDTH,
         false,
     );
+    let manifest = monitor_text_cell(
+        "Manifest",
+        MONITOR_MANIFEST_COL_CHARS,
+        MONITOR_MANIFEST_COL_WIDTH,
+        false,
+    );
     let state = monitor_text_cell(
         "State",
         MONITOR_STATE_COL_CHARS,
@@ -3112,7 +3209,7 @@ fn repo_monitor_header() -> GtkBox {
     sync.set_hexpand(true);
     sync.set_ellipsize(EllipsizeMode::End);
 
-    for label in [&name, &branch, &state, &sync] {
+    for label in [&name, &branch, &manifest, &state, &sync] {
         label.add_css_class("dim-label");
         header.append(label);
     }
@@ -3130,6 +3227,33 @@ fn monitor_text_cell(text: &str, width_chars: i32, width_px: i32, expand: bool) 
     label.set_ellipsize(EllipsizeMode::End);
     label.set_hexpand(expand);
     label
+}
+
+fn monitor_manifest_cell(scan: Option<&RepoManifestScan>) -> Label {
+    let label = monitor_text_cell(
+        manifest_presence_label(scan),
+        MONITOR_MANIFEST_COL_CHARS,
+        MONITOR_MANIFEST_COL_WIDTH,
+        false,
+    );
+    if let Some(tooltip) = manifest_presence_tooltip(scan) {
+        label.set_tooltip_text(Some(&tooltip));
+    }
+    let escaped = glib::markup_escape_text(manifest_presence_label(scan));
+    label.set_markup(&format!(
+        "<span foreground=\"{}\">{escaped}</span>",
+        manifest_presence_color(scan)
+    ));
+    label
+}
+
+fn manifest_presence_color(scan: Option<&RepoManifestScan>) -> &'static str {
+    match scan.map(|scan| &scan.state) {
+        Some(RepoManifestScanState::Valid(_)) => "#7fdc8a",
+        Some(RepoManifestScanState::Invalid { .. }) => "#ff6b6b",
+        Some(RepoManifestScanState::Missing) => "#8f96a3",
+        None => "#8f96a3",
+    }
 }
 
 fn monitor_state_cell(state: &ronomepo_core::RepositoryState) -> Label {
@@ -6624,6 +6748,10 @@ mod tests {
                 sync: RepositorySync::UpToDate,
                 repo_path: repo_path.clone(),
             },
+            repo_manifest: Some(RepoManifestScan {
+                path: repo_path.join("ronomepo.repo.json"),
+                state: RepoManifestScanState::Missing,
+            }),
         });
         app_state.repo_runtime.insert(
             repo_id.to_string(),

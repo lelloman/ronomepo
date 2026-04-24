@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ronomepo.dev/schemas/repo-manifest.schema.json",
+  "title": "Ronomepo Repo Manifest",
+  "description": "Versioned manifest for a managed repository exposed to Ronomepo and agents.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "items"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Manifest schema version. Only version 1 is valid."
+    },
+    "repo_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional stable logical identifier for the repository."
+    },
+    "items": {
+      "type": "array",
+      "description": "Typed work units that Ronomepo can operate on.",
+      "items": {
+        "$ref": "#/$defs/item"
+      }
+    },
+    "repo_actions": {
+      "type": "array",
+      "description": "Explicit repo-level commands for standardized actions.",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/action_command"
+      }
+    },
+    "aggregation": {
+      "type": "array",
+      "description": "Explicit repo-level action planning for actions spanning multiple items.",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/action_aggregation"
+      }
+    }
+  },
+  "$defs": {
+    "standard_action": {
+      "type": "string",
+      "enum": [
+        "list_artifacts",
+        "build",
+        "test",
+        "clean",
+        "verify_dependencies_freshness",
+        "deploy"
+      ]
+    },
+    "output_mode": {
+      "type": "string",
+      "enum": ["text", "json", "json_lines"],
+      "default": "text"
+    },
+    "execution_mode": {
+      "type": "string",
+      "enum": ["sequential", "parallel"],
+      "default": "sequential"
+    },
+    "failure_policy": {
+      "type": "string",
+      "enum": ["fail_fast", "continue"],
+      "default": "fail_fast"
+    },
+    "merge_strategy": {
+      "type": "string",
+      "enum": ["combined", "per_item"],
+      "default": "combined"
+    },
+    "relative_or_absolute_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "$ref": "#/$defs/relative_or_absolute_path",
+          "description": "Concrete artifact path relative to the item root unless absolute."
+        },
+        "pattern": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Glob-like pattern for one or more artifacts relative to the item root."
+        },
+        "build_action": {
+          "$ref": "#/$defs/standard_action"
+        }
+      },
+      "anyOf": [
+        { "required": ["path"] },
+        { "required": ["pattern"] }
+      ]
+    },
+    "action_command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "command"],
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/standard_action"
+        },
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "argv-style command. The first item is the program."
+        },
+        "workdir": {
+          "$ref": "#/$defs/relative_or_absolute_path",
+          "description": "Working directory relative to the item or repo root."
+        },
+        "env": {
+          "type": "object",
+          "description": "Environment variables for the command.",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "output": {
+          "$ref": "#/$defs/output_mode"
+        }
+      }
+    },
+    "action_aggregation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "item_ids"],
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/standard_action"
+        },
+        "item_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "execution": {
+          "$ref": "#/$defs/execution_mode"
+        },
+        "failure_policy": {
+          "$ref": "#/$defs/failure_policy"
+        },
+        "merge": {
+          "$ref": "#/$defs/merge_strategy"
+        }
+      }
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "path"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Ronomepo handler type, for example cargo or python."
+        },
+        "path": {
+          "$ref": "#/$defs/relative_or_absolute_path",
+          "description": "Item root relative to the repository root unless absolute."
+        },
+        "config": {
+          "description": "Optional handler-specific configuration payload."
+        },
+        "artifacts": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/artifact"
+          }
+        },
+        "actions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/action_command"
+          }
+        }
+      }
+    }
+  }
+}

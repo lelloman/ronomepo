@@ -99,6 +99,40 @@ A first-pass schema should include:
 
 The legacy `repos.txt` can be imported automatically during bootstrap.
 
+## Subrepo Capability Manifest
+
+Managed repositories can now expose a repo-local Ronomepo manifest at the repository root:
+
+- `ronomepo.repo.json`
+
+This manifest is separate from the workspace inventory. It tells Ronomepo and AI agents how to navigate the repository through standardized actions.
+
+Formal references:
+
+- [Repo manifest specification](./docs/REPO_MANIFEST_SPEC.md)
+- [JSON Schema](./docs/repo-manifest.schema.json)
+
+Core ideas:
+
+- a repository contains one or more `items`
+- each item has a Ronomepo `type`, such as `cargo`, `gradle`, `gradle_android`, `python`, or `node`
+- Ronomepo knows the built-in behavior for each supported type
+- custom behavior can be declared with explicit action commands
+- repo-level execution across multiple items must be declared explicitly
+
+The standardized action model is:
+
+- `list_artifacts`
+- `build`
+- `test`
+- `clean`
+- `verify_dependencies_freshness`
+- `deploy`
+
+If a repository has multiple applicable items for the same action, repo-level execution must declare aggregation rules instead of relying on inference.
+
+See [examples/sample-subrepo/ronomepo.repo.json](./examples/sample-subrepo/ronomepo.repo.json) for a concrete example.
+
 ## UI Direction
 
 The UI should stay operational and dense rather than decorative.
