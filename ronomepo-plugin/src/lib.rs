@@ -41,11 +41,12 @@ use ronomepo_core::{
     build_repository_list, collect_commit_check_report, collect_repository_details,
     collect_workspace_line_stats, default_commit_check_rules, default_manifest_path,
     derive_dir_name, ensure_commit_check_rules_initialized, format_sync_label, import_repos_txt,
-    load_manifest, normalize_workspace_root, run_workspace_operation, save_manifest,
-    scan_repo_manifest, workspace_summary, CommitCheckRule, CommitCheckRuleEffect,
-    CommitCheckRuleMatcher, CommitCheckRuleScope, OperationEvent, OperationEventKind,
-    OperationKind, RepoManifestScan, RepoManifestScanState, RepositoryDetails, RepositoryEntry,
-    RepositoryListItem, RepositoryStatus, WorkspaceManifest, MANIFEST_FILE_NAME,
+    list_repo_artifacts, load_manifest, load_repo_manifest, normalize_workspace_root, plan_repo_action,
+    run_workspace_operation, save_manifest, scan_repo_manifest, verify_repo_dependencies_freshness,
+    workspace_summary, CommitCheckRule, CommitCheckRuleEffect, CommitCheckRuleMatcher,
+    CommitCheckRuleScope, OperationEvent, OperationEventKind, OperationKind, PlannedCommand,
+    RepoActionExecutor, RepoManifestScan, RepoManifestScanState, RepositoryDetails, RepositoryEntry,
+    RepositoryListItem, RepositoryStatus, StandardActionName, WorkspaceManifest, MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -3262,6 +3263,15 @@ fn refresh_repo_context_menu(
     ) {
         has_section = true;
     }
+    if append_repo_context_ronomepo_section(
+        &menu,
+        popover,
+        &selection,
+        &child_hovered,
+        &schedule_close,
+    ) {
+        has_section = true;
+    }
     if !has_section {
         let empty = Label::new(Some("No actions available for this selection."));
         empty.set_xalign(0.0);
@@ -3275,6 +3285,37 @@ fn refresh_repo_context_menu(
 
     attach_root_context_menu_close(&menu, popover, &root_hovered, &schedule_close);
     popover.set_child(Some(&menu));
+}
+
+fn append_repo_context_ronomepo_section(
+    menu: &GtkBox,
+    popover: &Popover,
+    selection: &[RepositoryListItem],
+    root_child_hovered: &Rc<Cell<bool>>,
+    root_schedule_close: &Rc<dyn Fn()>,
+) -> bool {
+    let supported_actions = repo_context_supported_manifest_actions(selection);
+    if supported_actions.is_empty() {
+        return false;
+    }
+
+    let submenu = GtkBox::new(Orientation::Vertical, 0);
+    for action in supported_actions {
+        let label = context_action_label(action);
+        append_context_button(&submenu, popover, &label, move || {
+            run_selected_repo_manifest_action(action);
+        });
+    }
+
+    append_context_submenu(
+        menu,
+        popover,
+        "Ronomepo",
+        &submenu,
+        root_child_hovered,
+        root_schedule_close,
+    );
+    true
 }
 
 fn append_repo_context_open_section(
@@ -3399,7 +3440,7 @@ fn append_context_submenu(
     root_child_hovered: &Rc<Cell<bool>>,
     root_schedule_close: &Rc<dyn Fn()>,
 ) {
-    let header = Button::with_label(&format!("{title}  ▸"));
+    let header = Button::new();
     header.set_halign(Align::Fill);
     header.set_hexpand(true);
     header.set_margin_top(2);
@@ -3408,6 +3449,23 @@ fn append_context_submenu(
     header.add_css_class("menu-heading");
     header.set_margin_start(4);
     header.set_margin_end(4);
+
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    row.set_halign(Align::Fill);
+    row.set_hexpand(true);
+
+    let label = Label::new(Some(title));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_halign(Align::Start);
+
+    let chevron = Label::new(Some("›"));
+    chevron.set_xalign(1.0);
+    chevron.set_halign(Align::End);
+
+    row.append(&label);
+    row.append(&chevron);
+    header.set_child(Some(&row));
 
     let submenu_popover = Popover::new();
     submenu_popover.set_autohide(true);
@@ -3517,13 +3575,198 @@ fn repo_can_clone_missing(item: &RepositoryListItem) -> bool {
     matches!(item.status.state, ronomepo_core::RepositoryState::Missing)
 }
 
+fn repo_context_supported_manifest_actions(selection: &[RepositoryListItem]) -> Vec<StandardActionName> {
+    let mut actions = selection
+        .iter()
+        .filter_map(|item| item.repo_manifest.as_ref())
+        .filter_map(|scan| match &scan.state {
+            RepoManifestScanState::Valid(summary) => Some(summary.supported_actions.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    actions.sort();
+    actions.dedup();
+    actions
+}
+
+fn context_action_label(action: StandardActionName) -> String {
+    match action {
+        StandardActionName::ListArtifacts => "List Artifacts".to_string(),
+        StandardActionName::Build => "Build".to_string(),
+        StandardActionName::Test => "Test".to_string(),
+        StandardActionName::Clean => "Clean".to_string(),
+        StandardActionName::VerifyDependenciesFreshness => {
+            "Verify Dependencies Freshness".to_string()
+        }
+        StandardActionName::Deploy => "Deploy".to_string(),
+    }
+}
+
+fn selected_repo_manifest_targets(
+    action: StandardActionName,
+) -> Vec<(RepositoryListItem, ronomepo_core::RepoManifest)> {
+    selected_repository_items_from_state()
+        .into_iter()
+        .filter_map(|item| {
+            let scan = item.repo_manifest.as_ref()?;
+            let RepoManifestScanState::Valid(summary) = &scan.state else {
+                return None;
+            };
+            if !summary.supported_actions.contains(&action) {
+                return None;
+            }
+            let manifest = load_repo_manifest(&scan.path).ok()?;
+            Some((item, manifest))
+        })
+        .collect()
+}
+
+fn run_selected_repo_manifest_action(action: StandardActionName) {
+    let targets = selected_repo_manifest_targets(action);
+    if targets.is_empty() {
+        append_log(format!(
+            "Ronomepo action {} skipped because no selected repo exposes it.",
+            standard_action_label(action)
+        ));
+        return;
+    }
+
+    for (item, manifest) in targets {
+        match action {
+            StandardActionName::ListArtifacts => match list_repo_artifacts(&item.status.repo_path, &manifest) {
+                Ok(artifacts) => {
+                    if artifacts.is_empty() {
+                        append_log(format!("Ronomepo list_artifacts for {} found no artifacts.", item.name));
+                    } else {
+                        append_log(format!(
+                            "Ronomepo list_artifacts for {}: {} artifact(s).",
+                            item.name,
+                            artifacts.len()
+                        ));
+                        for artifact in artifacts {
+                            append_log(format!(
+                                "  [{}] {} {}",
+                                artifact.item_id,
+                                artifact.name,
+                                artifact
+                                    .path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string())
+                                    .or(artifact.pattern.clone())
+                                    .unwrap_or_else(|| "<no-path>".to_string())
+                            ));
+                        }
+                    }
+                }
+                Err(error) => append_log(format!(
+                    "Ronomepo list_artifacts failed for {}: {error}",
+                    item.name
+                )),
+            },
+            StandardActionName::VerifyDependenciesFreshness => {
+                match verify_repo_dependencies_freshness(&item.status.repo_path, &manifest) {
+                    Ok(reports) => {
+                        let findings = reports.iter().map(|report| report.findings.len()).sum::<usize>();
+                        append_log(format!(
+                            "Ronomepo verify_dependencies_freshness for {}: {} report(s), {} finding(s).",
+                            item.name,
+                            reports.len(),
+                            findings
+                        ));
+                        for report in reports {
+                            if report.findings.is_empty() {
+                                append_log(format!("  [{}] no issues found.", report.item_id));
+                            } else {
+                                for finding in report.findings {
+                                    append_log(format!("  [{}] {}", report.item_id, finding.message));
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => append_log(format!(
+                        "Ronomepo verify_dependencies_freshness failed for {}: {error}",
+                        item.name
+                    )),
+                }
+            }
+            _ => match plan_repo_action(&item.status.repo_path, &manifest, action) {
+                Ok(plan) => {
+                    append_log(format!(
+                        "Running Ronomepo {} for {} ({} step(s)).",
+                        standard_action_label(action),
+                        item.name,
+                        plan.steps.len()
+                    ));
+                    for step in plan.steps {
+                        match step.executor {
+                            RepoActionExecutor::Command(command) => {
+                                run_planned_repo_command(&item.name, action, command);
+                            }
+                            RepoActionExecutor::BuiltInInspector => {
+                                append_log(format!(
+                                    "Ronomepo {} for {} uses a built-in inspector and has no terminal command to launch.",
+                                    standard_action_label(action),
+                                    item.name
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(error) => append_log(format!(
+                    "Ronomepo {} failed for {}: {error}",
+                    standard_action_label(action),
+                    item.name
+                )),
+            },
+        }
+    }
+}
+
+fn run_planned_repo_command(repo_name: &str, action: StandardActionName, command: PlannedCommand) {
+    let mut process = Command::new(&command.program);
+    process.args(&command.args);
+    process.current_dir(&command.workdir);
+    for (key, value) in &command.env {
+        process.env(key, value);
+    }
+
+    let command_text = if command.args.is_empty() {
+        command.program.clone()
+    } else {
+        format!("{} {}", command.program, command.args.join(" "))
+    };
+
+    match process.spawn() {
+        Ok(_) => append_log(format!(
+            "Started Ronomepo {} for {}: {} (cwd: {}).",
+            standard_action_label(action),
+            repo_name,
+            command_text,
+            command.workdir.display()
+        )),
+        Err(error) => append_log(format!(
+            "Failed to start Ronomepo {} for {}: {} ({error})",
+            standard_action_label(action),
+            repo_name,
+            command_text
+        )),
+    }
+}
+
 fn append_context_button<F>(menu: &GtkBox, popover: &Popover, label: &str, action: F)
 where
     F: Fn() + 'static,
 {
-    let button = Button::with_label(label);
+    let button = Button::new();
     button.set_halign(Align::Fill);
+    button.set_hexpand(true);
     button.add_css_class("flat");
+    let text = Label::new(Some(label));
+    text.set_xalign(0.0);
+    text.set_halign(Align::Start);
+    text.set_hexpand(true);
+    button.set_child(Some(&text));
     let popover = popover.clone();
     button.connect_clicked(move |_| {
         popover.popdown();
