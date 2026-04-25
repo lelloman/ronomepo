@@ -3175,6 +3175,33 @@ fn build_repo_context_menu(
     popover
 }
 
+fn attach_root_context_menu_close(
+    menu: &GtkBox,
+    popover: &Popover,
+    root_hovered: &Rc<Cell<bool>>,
+    schedule_close: &Rc<dyn Fn()>,
+) {
+    let root_hovered_for_enter = Rc::clone(root_hovered);
+    let motion = EventControllerMotion::new();
+    motion.connect_enter(move |_, _, _| {
+        root_hovered_for_enter.set(true);
+    });
+    let root_hovered_for_leave = Rc::clone(root_hovered);
+    let schedule_close_for_root = Rc::clone(schedule_close);
+    motion.connect_leave(move |_| {
+        root_hovered_for_leave.set(false);
+        schedule_close_for_root();
+    });
+    menu.add_controller(motion);
+
+    popover.connect_show({
+        let root_hovered = Rc::clone(root_hovered);
+        move |_| {
+            root_hovered.set(false);
+        }
+    });
+}
+
 fn update_repo_context_selection(list: &ListBox, row: &ListBoxRow) {
     let keep_existing_selection = row.is_selected() && list.selected_rows().len() > 1;
     if !keep_existing_selection {
@@ -3196,12 +3223,43 @@ fn refresh_repo_context_menu(
     menu.set_margin_end(4);
 
     let selection = selected_repository_items_from_state();
+    let root_hovered = Rc::new(Cell::new(false));
+    let child_hovered = Rc::new(Cell::new(false));
+    let schedule_close: Rc<dyn Fn()> = Rc::new({
+        let popover = popover.clone();
+        let root_hovered = Rc::clone(&root_hovered);
+        let child_hovered = Rc::clone(&child_hovered);
+        move || {
+            let popover = popover.clone();
+            let root_hovered = Rc::clone(&root_hovered);
+            let child_hovered = Rc::clone(&child_hovered);
+            glib::timeout_add_local(Duration::from_millis(140), move || {
+                if !root_hovered.get() && !child_hovered.get() {
+                    popover.popdown();
+                }
+                glib::ControlFlow::Break
+            });
+        }
+    });
 
     let mut has_section = false;
-    if append_repo_context_open_section(&menu, popover, host_ptr, &selection) {
+    if append_repo_context_open_section(
+        &menu,
+        popover,
+        host_ptr,
+        &selection,
+        &child_hovered,
+        &schedule_close,
+    ) {
         has_section = true;
     }
-    if append_repo_context_git_section(&menu, popover, &selection) {
+    if append_repo_context_git_section(
+        &menu,
+        popover,
+        &selection,
+        &child_hovered,
+        &schedule_close,
+    ) {
         has_section = true;
     }
     if !has_section {
@@ -3215,6 +3273,7 @@ fn refresh_repo_context_menu(
         menu.append(&empty);
     }
 
+    attach_root_context_menu_close(&menu, popover, &root_hovered, &schedule_close);
     popover.set_child(Some(&menu));
 }
 
@@ -3223,6 +3282,8 @@ fn append_repo_context_open_section(
     popover: &Popover,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
     selection: &[RepositoryListItem],
+    root_child_hovered: &Rc<Cell<bool>>,
+    root_schedule_close: &Rc<dyn Fn()>,
 ) -> bool {
     let can_open_overview = !selection.is_empty();
     let can_open_folder = selection.iter().any(|item| item.status.repo_path.exists());
@@ -3265,7 +3326,14 @@ fn append_repo_context_open_section(
             open_selected_repo_in_editor();
         });
     }
-    append_context_submenu(menu, popover, "Open", &submenu);
+    append_context_submenu(
+        menu,
+        popover,
+        "Open",
+        &submenu,
+        root_child_hovered,
+        root_schedule_close,
+    );
     true
 }
 
@@ -3273,6 +3341,8 @@ fn append_repo_context_git_section(
     menu: &GtkBox,
     popover: &Popover,
     selection: &[RepositoryListItem],
+    root_child_hovered: &Rc<Cell<bool>>,
+    root_schedule_close: &Rc<dyn Fn()>,
 ) -> bool {
     let can_pull = selection.iter().any(repo_can_pull);
     let can_push = selection.iter().any(repo_can_push);
@@ -3310,7 +3380,14 @@ fn append_repo_context_git_section(
             let _ = command_apply_hooks(maruzzella_sdk::ffi::MzBytes::empty());
         });
     }
-    append_context_submenu(menu, popover, "Git", &submenu);
+    append_context_submenu(
+        menu,
+        popover,
+        "Git",
+        &submenu,
+        root_child_hovered,
+        root_schedule_close,
+    );
     true
 }
 
@@ -3319,6 +3396,8 @@ fn append_context_submenu(
     parent_popover: &Popover,
     title: &str,
     submenu: &GtkBox,
+    root_child_hovered: &Rc<Cell<bool>>,
+    root_schedule_close: &Rc<dyn Fn()>,
 ) {
     let header = Button::with_label(&format!("{title}  ▸"));
     header.set_halign(Align::Fill);
@@ -3373,17 +3452,23 @@ fn append_context_submenu(
     header.add_controller(motion);
 
     let submenu_hovered_for_enter = Rc::clone(&submenu_hovered);
+    let root_child_hovered_for_enter = Rc::clone(root_child_hovered);
     let popup = submenu_popover.clone();
     let motion = EventControllerMotion::new();
     motion.connect_enter(move |_, _, _| {
         submenu_hovered_for_enter.set(true);
+        root_child_hovered_for_enter.set(true);
         popup.popup();
     });
     let submenu_hovered_for_leave = Rc::clone(&submenu_hovered);
+    let root_child_hovered_for_leave = Rc::clone(root_child_hovered);
+    let root_schedule_close_for_submenu = Rc::clone(root_schedule_close);
     let schedule_close_for_submenu = Rc::clone(&schedule_close);
     motion.connect_leave(move |_| {
         submenu_hovered_for_leave.set(false);
+        root_child_hovered_for_leave.set(false);
         schedule_close_for_submenu();
+        root_schedule_close_for_submenu();
     });
     submenu.add_controller(motion);
 
@@ -3400,7 +3485,9 @@ fn append_context_submenu(
 
     parent_popover.connect_closed({
         let submenu_popover = submenu_popover.clone();
+        let root_child_hovered = Rc::clone(root_child_hovered);
         move |_| {
+            root_child_hovered.set(false);
             submenu_popover.popdown();
         }
     });
