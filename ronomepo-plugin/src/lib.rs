@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -25,9 +25,10 @@ use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
     Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, Dialog, Entry,
-    FilterChange, GestureClick, Image, Label, ListBox, ListBoxRow, Orientation, Paned, PolicyType,
-    Popover, PositionType, ResponseType, ScrolledWindow, SelectionMode, Separator, SortListModel,
-    SorterChange, TextBuffer, TextView, ToggleButton, Window, WrapMode,
+    EventControllerMotion, FilterChange, GestureClick, Image, Label, ListBox, ListBoxRow,
+    Orientation, Paned, PolicyType, Popover, PositionType, ResponseType, ScrolledWindow,
+    SelectionMode, Separator, SortListModel, SorterChange, TextBuffer, TextView, ToggleButton,
+    Window, WrapMode,
 };
 use maruzzella_sdk::{
     button_css_class, export_plugin, input_css_class, surface_css_class, text_css_class,
@@ -3149,10 +3150,8 @@ fn attach_repo_monitor_context_menu(
         move |_, _, x, y| {
             if let Some(row) = relative_to.parent().and_downcast::<ListBoxRow>() {
                 if let Some(list) = row.parent().and_downcast::<ListBox>() {
-                    list.unselect_all();
-                    list.select_row(Some(&row));
-                    sync_selection_css(&list);
-                    update_selected_repo_ids(selection_ids_from_list(&list));
+                    update_repo_context_selection(&list, &row);
+                    refresh_repo_context_menu(&popover, host_ptr);
                 }
             }
             popover.set_pointing_to(Some(&Rectangle::new(x as i32, y as i32, 1, 1)));
@@ -3172,46 +3171,263 @@ fn build_repo_context_menu(
     popover.set_position(PositionType::Bottom);
     popover.set_parent(relative_to);
 
-    let menu = GtkBox::new(Orientation::Vertical, 4);
+    refresh_repo_context_menu(&popover, host_ptr);
+    popover
+}
+
+fn update_repo_context_selection(list: &ListBox, row: &ListBoxRow) {
+    let keep_existing_selection = row.is_selected() && list.selected_rows().len() > 1;
+    if !keep_existing_selection {
+        list.unselect_all();
+        list.select_row(Some(row));
+    }
+    sync_selection_css(list);
+    update_selected_repo_ids(selection_ids_from_list(list));
+}
+
+fn refresh_repo_context_menu(
+    popover: &Popover,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) {
+    let menu = GtkBox::new(Orientation::Vertical, 0);
     menu.set_margin_top(4);
     menu.set_margin_bottom(4);
     menu.set_margin_start(4);
     menu.set_margin_end(4);
 
-    append_context_button(&menu, &popover, "Open Overview", move || {
-        let repo_ids = {
-            let app_state = state().lock().expect("state mutex poisoned");
-            app_state.selected_repo_ids.clone()
-        };
-        open_repo_overviews(host_ptr, &repo_ids);
-    });
-    append_context_button(&menu, &popover, "Open Folder", || {
-        open_selected_repo_folders();
-    });
-    append_context_button(&menu, &popover, "Open Terminal", || {
-        open_selected_repo_terminal();
-    });
-    append_context_button(&menu, &popover, "Open In Editor", || {
-        open_selected_repo_in_editor();
-    });
-    append_context_button(&menu, &popover, "Pull", || {
-        let _ = command_pull(maruzzella_sdk::ffi::MzBytes::empty());
-    });
-    append_context_button(&menu, &popover, "Push", || {
-        let _ = command_push(maruzzella_sdk::ffi::MzBytes::empty());
-    });
-    append_context_button(&menu, &popover, "Push Force", || {
-        let _ = command_push_force(maruzzella_sdk::ffi::MzBytes::empty());
-    });
-    append_context_button(&menu, &popover, "Clone Missing", || {
-        let _ = command_clone_missing(maruzzella_sdk::ffi::MzBytes::empty());
-    });
-    append_context_button(&menu, &popover, "Apply Hooks", || {
-        let _ = command_apply_hooks(maruzzella_sdk::ffi::MzBytes::empty());
-    });
+    let selection = selected_repository_items_from_state();
+
+    let mut has_section = false;
+    if append_repo_context_open_section(&menu, popover, host_ptr, &selection) {
+        has_section = true;
+    }
+    if append_repo_context_git_section(&menu, popover, &selection) {
+        has_section = true;
+    }
+    if !has_section {
+        let empty = Label::new(Some("No actions available for this selection."));
+        empty.set_xalign(0.0);
+        empty.add_css_class("dim-label");
+        empty.set_margin_top(6);
+        empty.set_margin_bottom(6);
+        empty.set_margin_start(8);
+        empty.set_margin_end(8);
+        menu.append(&empty);
+    }
 
     popover.set_child(Some(&menu));
-    popover
+}
+
+fn append_repo_context_open_section(
+    menu: &GtkBox,
+    popover: &Popover,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    selection: &[RepositoryListItem],
+) -> bool {
+    let can_open_overview = !selection.is_empty();
+    let can_open_folder = selection.iter().any(|item| item.status.repo_path.exists());
+    let can_open_terminal = selection
+        .iter()
+        .filter(|item| item.status.repo_path.exists())
+        .nth(1)
+        .is_none()
+        && selection.iter().any(|item| item.status.repo_path.exists());
+    let can_open_in_editor = can_open_terminal;
+
+    let has_actions =
+        can_open_overview || can_open_folder || can_open_terminal || can_open_in_editor;
+    if !has_actions {
+        return false;
+    }
+
+    let submenu = GtkBox::new(Orientation::Vertical, 0);
+    if can_open_overview {
+        append_context_button(&submenu, popover, "Overview", move || {
+            let repo_ids = {
+                let app_state = state().lock().expect("state mutex poisoned");
+                app_state.selected_repo_ids.clone()
+            };
+            open_repo_overviews(host_ptr, &repo_ids);
+        });
+    }
+    if can_open_folder {
+        append_context_button(&submenu, popover, "Folder", || {
+            open_selected_repo_folders();
+        });
+    }
+    if can_open_terminal {
+        append_context_button(&submenu, popover, "Terminal", || {
+            open_selected_repo_terminal();
+        });
+    }
+    if can_open_in_editor {
+        append_context_button(&submenu, popover, "In Editor", || {
+            open_selected_repo_in_editor();
+        });
+    }
+    append_context_submenu(menu, popover, "Open", &submenu);
+    true
+}
+
+fn append_repo_context_git_section(
+    menu: &GtkBox,
+    popover: &Popover,
+    selection: &[RepositoryListItem],
+) -> bool {
+    let can_pull = selection.iter().any(repo_can_pull);
+    let can_push = selection.iter().any(repo_can_push);
+    let can_push_force = selection.iter().any(repo_can_push_force);
+    let can_clone_missing = selection.iter().any(repo_can_clone_missing);
+    let can_apply_hooks = !selection.is_empty();
+    let has_actions = can_pull || can_push || can_push_force || can_clone_missing || can_apply_hooks;
+    if !has_actions {
+        return false;
+    }
+
+    let submenu = GtkBox::new(Orientation::Vertical, 0);
+    if can_pull {
+        append_context_button(&submenu, popover, "Pull", || {
+            let _ = command_pull(maruzzella_sdk::ffi::MzBytes::empty());
+        });
+    }
+    if can_push {
+        append_context_button(&submenu, popover, "Push", || {
+            let _ = command_push(maruzzella_sdk::ffi::MzBytes::empty());
+        });
+    }
+    if can_push_force {
+        append_context_button(&submenu, popover, "Push Force", || {
+            let _ = command_push_force(maruzzella_sdk::ffi::MzBytes::empty());
+        });
+    }
+    if can_clone_missing {
+        append_context_button(&submenu, popover, "Clone Missing", || {
+            let _ = command_clone_missing(maruzzella_sdk::ffi::MzBytes::empty());
+        });
+    }
+    if can_apply_hooks {
+        append_context_button(&submenu, popover, "Apply Hooks", || {
+            let _ = command_apply_hooks(maruzzella_sdk::ffi::MzBytes::empty());
+        });
+    }
+    append_context_submenu(menu, popover, "Git", &submenu);
+    true
+}
+
+fn append_context_submenu(
+    menu: &GtkBox,
+    parent_popover: &Popover,
+    title: &str,
+    submenu: &GtkBox,
+) {
+    let header = Button::with_label(&format!("{title}  ▸"));
+    header.set_halign(Align::Fill);
+    header.set_hexpand(true);
+    header.set_margin_top(2);
+    header.set_margin_bottom(2);
+    header.add_css_class("flat");
+    header.add_css_class("menu-heading");
+    header.set_margin_start(4);
+    header.set_margin_end(4);
+
+    let submenu_popover = Popover::new();
+    submenu_popover.set_autohide(true);
+    submenu_popover.set_has_arrow(false);
+    submenu_popover.set_position(PositionType::Right);
+    submenu_popover.set_parent(&header);
+    submenu_popover.set_child(Some(submenu));
+
+    let header_hovered = Rc::new(Cell::new(false));
+    let submenu_hovered = Rc::new(Cell::new(false));
+
+    let schedule_close: Rc<dyn Fn()> = Rc::new({
+        let submenu_popover = submenu_popover.clone();
+        let header_hovered = Rc::clone(&header_hovered);
+        let submenu_hovered = Rc::clone(&submenu_hovered);
+        move || {
+            let submenu_popover = submenu_popover.clone();
+            let header_hovered = Rc::clone(&header_hovered);
+            let submenu_hovered = Rc::clone(&submenu_hovered);
+            glib::timeout_add_local(Duration::from_millis(120), move || {
+                if !header_hovered.get() && !submenu_hovered.get() {
+                    submenu_popover.popdown();
+                }
+                glib::ControlFlow::Break
+            });
+        }
+    });
+
+    let popup = submenu_popover.clone();
+    let header_hovered_for_enter = Rc::clone(&header_hovered);
+    let motion = EventControllerMotion::new();
+    motion.connect_enter(move |_, _, _| {
+        header_hovered_for_enter.set(true);
+        popup.popup();
+    });
+    let header_hovered_for_leave = Rc::clone(&header_hovered);
+    let schedule_close_for_header = Rc::clone(&schedule_close);
+    motion.connect_leave(move |_| {
+        header_hovered_for_leave.set(false);
+        schedule_close_for_header();
+    });
+    header.add_controller(motion);
+
+    let submenu_hovered_for_enter = Rc::clone(&submenu_hovered);
+    let popup = submenu_popover.clone();
+    let motion = EventControllerMotion::new();
+    motion.connect_enter(move |_, _, _| {
+        submenu_hovered_for_enter.set(true);
+        popup.popup();
+    });
+    let submenu_hovered_for_leave = Rc::clone(&submenu_hovered);
+    let schedule_close_for_submenu = Rc::clone(&schedule_close);
+    motion.connect_leave(move |_| {
+        submenu_hovered_for_leave.set(false);
+        schedule_close_for_submenu();
+    });
+    submenu.add_controller(motion);
+
+    header.connect_clicked({
+        let submenu_popover = submenu_popover.clone();
+        move |_| {
+            if submenu_popover.is_visible() {
+                submenu_popover.popdown();
+            } else {
+                submenu_popover.popup();
+            }
+        }
+    });
+
+    parent_popover.connect_closed({
+        let submenu_popover = submenu_popover.clone();
+        move |_| {
+            submenu_popover.popdown();
+        }
+    });
+
+    menu.append(&header);
+}
+
+fn repo_can_pull(item: &RepositoryListItem) -> bool {
+    !matches!(
+        item.status.state,
+        ronomepo_core::RepositoryState::Missing | ronomepo_core::RepositoryState::Dirty
+    )
+}
+
+fn repo_can_push(item: &RepositoryListItem) -> bool {
+    matches!(
+        item.status.sync,
+        ronomepo_core::RepositorySync::Ahead(_) | ronomepo_core::RepositorySync::Diverged { .. }
+    )
+}
+
+fn repo_can_push_force(item: &RepositoryListItem) -> bool {
+    repo_can_push(item)
+}
+
+fn repo_can_clone_missing(item: &RepositoryListItem) -> bool {
+    matches!(item.status.state, ronomepo_core::RepositoryState::Missing)
 }
 
 fn append_context_button<F>(menu: &GtkBox, popover: &Popover, label: &str, action: F)
