@@ -3541,6 +3541,18 @@ fn append_context_submenu(
         }
     });
 
+    header.connect_unrealize({
+        let submenu_popover = submenu_popover.clone();
+        let root_child_hovered = Rc::clone(root_child_hovered);
+        move |_| {
+            root_child_hovered.set(false);
+            submenu_popover.popdown();
+            if submenu_popover.parent().is_some() {
+                submenu_popover.unparent();
+            }
+        }
+    });
+
     parent_popover.connect_closed({
         let submenu_popover = submenu_popover.clone();
         let root_child_hovered = Rc::clone(root_child_hovered);
