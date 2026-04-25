@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -83,8 +84,10 @@ const REMOTE_FETCH_INTERVAL_SECS: u64 = 60 * 60;
 const REMOTE_FETCH_JITTER_SECS: u64 = 30 * 60;
 const REMOTE_FETCH_CONCURRENCY: usize = 1;
 const WATCH_POLL_FALLBACK_SECS: u64 = 15;
+const MAX_PENDING_WATCH_PATHS: usize = 4_096;
 const UI_REFRESH_DEBOUNCE_MILLIS: u64 = 75;
 const MAX_LOG_ENTRIES: usize = 500;
+const RUNTIME_PROFILE_ENV: &str = "RONOMEPO_PROFILE";
 
 pub struct RonomepoPlugin;
 
@@ -129,6 +132,8 @@ struct AppState {
     line_stats_loading: bool,
     line_stats_since: String,
     repo_runtime: HashMap<String, RepoRuntimeState>,
+    watch_manager_sync_in_flight: bool,
+    watch_manager_sync_pending: bool,
 }
 
 impl Default for AppState {
@@ -155,6 +160,8 @@ impl Default for AppState {
             line_stats_loading: false,
             line_stats_since: String::new(),
             repo_runtime: HashMap::new(),
+            watch_manager_sync_in_flight: false,
+            watch_manager_sync_pending: false,
         }
     }
 }
@@ -195,14 +202,24 @@ enum WatchBackend {
     Poll(PollWatcher),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchBackendKind {
+    None,
+    Recommended,
+    Poll,
+}
+
 struct WatchManager {
     _backend: WatchBackend,
+    backend_kind: WatchBackendKind,
+    watched_paths: usize,
 }
 
 #[derive(Default)]
 struct PendingWatchEvents {
-    paths: Vec<PathBuf>,
+    paths: HashSet<PathBuf>,
     flush_scheduled: bool,
+    overflowed: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -212,6 +229,7 @@ enum JobKey {
     RepoStatus(String),
     RepoFetch(String),
     RepoDetails(String),
+    WatchManagerSync,
     HistoryReport,
     LineStats(Option<String>),
 }
@@ -251,6 +269,10 @@ enum WorkerJob {
     RepoDetailsLoad {
         repo_id: String,
         repo_path: PathBuf,
+    },
+    WatchManagerSync {
+        manifest: Option<WorkspaceManifest>,
+        sync_seq: usize,
     },
     RefreshWorkspace {
         workspace_root: PathBuf,
@@ -309,6 +331,10 @@ enum WorkerResult {
     RepoDetailsLoaded {
         repo_id: String,
         details: RepositoryDetails,
+    },
+    WatchManagerSyncCompleted {
+        sync_seq: usize,
+        result: Result<Option<WatchManager>, String>,
     },
     RefreshWorkspaceCompleted {
         result: Result<RefreshWorkspaceResult, String>,
@@ -428,6 +454,23 @@ static BACKGROUND_LOOPS_STARTED: AtomicUsize = AtomicUsize::new(0);
 static LOG_REFRESH_SCHEDULED: AtomicUsize = AtomicUsize::new(0);
 static VIEW_REFRESH_SCHEDULED: AtomicUsize = AtomicUsize::new(0);
 static WATCH_MANAGER_SYNC_SEQ: AtomicUsize = AtomicUsize::new(0);
+static RUNTIME_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
+static WATCH_BACKEND_CODE: AtomicUsize = AtomicUsize::new(0);
+static WATCHED_PATH_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WATCH_SYNC_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static WATCH_SYNC_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
+static WATCH_SYNC_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static WATCH_SYNC_PENDING_COLLAPSES: AtomicUsize = AtomicUsize::new(0);
+static WATCH_EVENTS_RECEIVED: AtomicUsize = AtomicUsize::new(0);
+static WATCH_EVENT_FLUSHES: AtomicUsize = AtomicUsize::new(0);
+static PENDING_WATCH_PATHS: AtomicUsize = AtomicUsize::new(0);
+static PENDING_WATCH_PATHS_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+static LOCAL_RESCAN_TICKS: AtomicUsize = AtomicUsize::new(0);
+static REMOTE_FETCH_TICKS: AtomicUsize = AtomicUsize::new(0);
+static DISPATCHED_JOBS: AtomicUsize = AtomicUsize::new(0);
+static LOG_REFRESH_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VIEW_REFRESH_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LAST_WATCH_SYNC_SEQ_COMPLETED: AtomicUsize = AtomicUsize::new(0);
 
 fn state() -> &'static Mutex<AppState> {
     STATE.get_or_init(|| Mutex::new(AppState::default()))
@@ -459,6 +502,144 @@ fn pending_watch_events() -> &'static Mutex<PendingWatchEvents> {
     PENDING_WATCH_EVENTS.get_or_init(|| Mutex::new(PendingWatchEvents::default()))
 }
 
+fn runtime_profile_enabled() -> bool {
+    *RUNTIME_PROFILE_ENABLED.get_or_init(|| {
+        env::var_os(RUNTIME_PROFILE_ENV)
+            .is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+fn watch_backend_kind_code(kind: WatchBackendKind) -> usize {
+    match kind {
+        WatchBackendKind::None => 0,
+        WatchBackendKind::Recommended => 1,
+        WatchBackendKind::Poll => 2,
+    }
+}
+
+fn watch_backend_kind_label(kind: WatchBackendKind) -> &'static str {
+    match kind {
+        WatchBackendKind::None => "none",
+        WatchBackendKind::Recommended => "recommended",
+        WatchBackendKind::Poll => "poll",
+    }
+}
+
+fn current_watch_backend_kind() -> WatchBackendKind {
+    match WATCH_BACKEND_CODE.load(Ordering::Relaxed) {
+        1 => WatchBackendKind::Recommended,
+        2 => WatchBackendKind::Poll,
+        _ => WatchBackendKind::None,
+    }
+}
+
+fn update_max_atomic(target: &AtomicUsize, value: usize) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn current_view_registry_counts() -> (usize, usize, usize, usize, usize, usize, usize) {
+    let repository_views = REPOSITORY_VIEWS.with(|views| views.borrow().len());
+    let monorepo_views = MONOREPO_OVERVIEWS.with(|views| views.borrow().len());
+    let repo_views = REPO_OVERVIEWS.with(|views| views.borrow().len());
+    let commit_check_views = COMMIT_CHECK_VIEWS.with(|views| views.borrow().len());
+    let workspace_settings_views = WORKSPACE_SETTINGS_VIEWS.with(|views| views.borrow().len());
+    let operation_buffers = OPERATION_BUFFERS.with(|buffers| buffers.borrow().len());
+    let operation_summaries = OPERATION_SUMMARIES.with(|labels| labels.borrow().len());
+    (
+        repository_views,
+        monorepo_views,
+        repo_views,
+        commit_check_views,
+        workspace_settings_views,
+        operation_buffers,
+        operation_summaries,
+    )
+}
+
+fn runtime_profile_summary(reason: &str) -> Option<String> {
+    if !runtime_profile_enabled() {
+        return None;
+    }
+
+    let app_state = state().lock().expect("state mutex poisoned");
+    let pending_watch_paths = PENDING_WATCH_PATHS.load(Ordering::Relaxed);
+    let in_flight_jobs = executor()
+        .in_flight
+        .lock()
+        .expect("executor mutex poisoned")
+        .len();
+    let (
+        repository_views,
+        monorepo_views,
+        repo_views,
+        commit_check_views,
+        workspace_settings_views,
+        operation_buffers,
+        operation_summaries,
+    ) = current_view_registry_counts();
+    let mut line = format!(
+        "[runtime:{reason}] watch_backend={} watched_paths={} repo_runtime={} repo_details_cache={} repo_details_loading={} pending_watch_paths={} pending_watch_paths_high_water={} watch_sync_requests={} watch_sync_completions={} watch_sync_failures={} watch_sync_pending_collapses={} watch_events={} watch_event_flushes={} local_rescan_ticks={} remote_fetch_ticks={} dispatched_jobs={} in_flight_jobs={} view_refreshes={} log_refreshes={} repository_views={} monorepo_views={} repo_views={} commit_check_views={} workspace_settings_views={} operation_buffers={} operation_summaries={}",
+        watch_backend_kind_label(current_watch_backend_kind()),
+        WATCHED_PATH_COUNT.load(Ordering::Relaxed),
+        app_state.repo_runtime.len(),
+        app_state.repo_details_cache.len(),
+        app_state.repo_details_loading.len(),
+        pending_watch_paths,
+        PENDING_WATCH_PATHS_HIGH_WATER.load(Ordering::Relaxed),
+        WATCH_SYNC_REQUESTS.load(Ordering::Relaxed),
+        WATCH_SYNC_COMPLETIONS.load(Ordering::Relaxed),
+        WATCH_SYNC_FAILURES.load(Ordering::Relaxed),
+        WATCH_SYNC_PENDING_COLLAPSES.load(Ordering::Relaxed),
+        WATCH_EVENTS_RECEIVED.load(Ordering::Relaxed),
+        WATCH_EVENT_FLUSHES.load(Ordering::Relaxed),
+        LOCAL_RESCAN_TICKS.load(Ordering::Relaxed),
+        REMOTE_FETCH_TICKS.load(Ordering::Relaxed),
+        DISPATCHED_JOBS.load(Ordering::Relaxed),
+        in_flight_jobs,
+        VIEW_REFRESH_COUNT.load(Ordering::Relaxed),
+        LOG_REFRESH_COUNT.load(Ordering::Relaxed),
+        repository_views,
+        monorepo_views,
+        repo_views,
+        commit_check_views,
+        workspace_settings_views,
+        operation_buffers,
+        operation_summaries,
+    );
+    if app_state.watch_manager_sync_in_flight {
+        let _ = write!(line, " watch_sync_in_flight=1");
+    }
+    if app_state.watch_manager_sync_pending {
+        let _ = write!(line, " watch_sync_pending=1");
+    }
+    Some(line)
+}
+
+fn emit_runtime_profile(reason: &str) {
+    let Some(line) = runtime_profile_summary(reason) else {
+        return;
+    };
+    eprintln!("{line}");
+}
+
+fn record_watch_manager_metrics(manager: Option<&WatchManager>, reason: &str) {
+    let next_kind = manager
+        .map(|manager| manager.backend_kind)
+        .unwrap_or(WatchBackendKind::None);
+    let next_watched_paths = manager.map(|manager| manager.watched_paths).unwrap_or(0);
+    let previous = WATCH_BACKEND_CODE.swap(watch_backend_kind_code(next_kind), Ordering::Relaxed);
+    WATCHED_PATH_COUNT.store(next_watched_paths, Ordering::Relaxed);
+    if runtime_profile_enabled() && previous != watch_backend_kind_code(next_kind) {
+        emit_runtime_profile(reason);
+    }
+}
+
 fn submit_job(job: WorkerJob) -> Result<(), String> {
     submit_queued_job(QueuedJob { key: None, job })
 }
@@ -483,6 +664,7 @@ fn submit_coalesced_job(key: JobKey, job: WorkerJob) -> Result<bool, String> {
 }
 
 fn submit_queued_job(queued_job: QueuedJob) -> Result<(), String> {
+    DISPATCHED_JOBS.fetch_add(1, Ordering::Relaxed);
     executor()
         .sender
         .send(queued_job)
@@ -558,6 +740,10 @@ fn run_worker_job(queued_job: QueuedJob) {
         WorkerJob::RepoDetailsLoad { repo_id, repo_path } => {
             let details = collect_repository_details(&repo_path);
             dispatch_worker_result(WorkerResult::RepoDetailsLoaded { repo_id, details });
+        }
+        WorkerJob::WatchManagerSync { manifest, sync_seq } => {
+            let result = manifest.map(|manifest| build_watch_manager(&manifest)).transpose();
+            dispatch_worker_result(WorkerResult::WatchManagerSyncCompleted { sync_seq, result });
         }
         WorkerJob::RefreshWorkspace {
             workspace_root,
@@ -680,11 +866,13 @@ fn ensure_background_loops_started() {
     }
 
     glib::timeout_add_seconds_local(LOCAL_RESCAN_INTERVAL_SECS, || {
+        LOCAL_RESCAN_TICKS.fetch_add(1, Ordering::Relaxed);
         mark_all_repos_stale();
         schedule_pending_local_rescans();
         glib::ControlFlow::Continue
     });
     glib::timeout_add_seconds_local(REMOTE_FETCH_TICK_SECS, || {
+        REMOTE_FETCH_TICKS.fetch_add(1, Ordering::Relaxed);
         schedule_due_remote_fetches();
         glib::ControlFlow::Continue
     });
@@ -856,6 +1044,7 @@ fn initialize_state(config: &RonomepoPluginConfig) {
         ));
     }
     drop(app_state);
+    emit_runtime_profile("startup");
     sync_watch_manager_from_state();
     schedule_workspace_scan();
 }
@@ -1179,6 +1368,7 @@ fn schedule_log_surface_refresh() {
     }
     glib::timeout_add_local(Duration::from_millis(UI_REFRESH_DEBOUNCE_MILLIS), || {
         LOG_REFRESH_SCHEDULED.store(0, Ordering::SeqCst);
+        LOG_REFRESH_COUNT.fetch_add(1, Ordering::Relaxed);
         refresh_log_surfaces();
         glib::ControlFlow::Break
     });
@@ -1365,26 +1555,40 @@ fn handle_worker_result(result: WorkerResult) {
             refresh_views();
         }
         WorkerResult::WorkspaceRootStatusRefreshed { workspace_status } => {
-            {
+            let changed = {
                 let mut app_state = state().lock().expect("state mutex poisoned");
-                app_state.workspace_status = workspace_status;
+                if app_state.workspace_status == workspace_status {
+                    false
+                } else {
+                    app_state.workspace_status = workspace_status;
+                    true
+                }
+            };
+            if changed {
+                refresh_views();
             }
-            refresh_views();
         }
         WorkerResult::RepositoryStatusRefreshed { item } => {
-            let follow_up_refresh = {
+            let (follow_up_refresh, changed) = {
                 let mut app_state = state().lock().expect("state mutex poisoned");
                 let repo_id = item.id.clone();
                 let follow_up_refresh = finalize_repo_status_refresh(&mut app_state, &repo_id);
-                if let Some(existing_item) = app_state
+                let changed = if let Some(existing_item) = app_state
                     .repository_items
                     .iter_mut()
                     .find(|existing_item| existing_item.id == repo_id)
                 {
-                    *existing_item = item.clone();
-                }
-                follow_up_refresh
+                    let changed = *existing_item != item;
+                    if changed {
+                        *existing_item = item.clone();
+                    }
+                    changed
+                } else {
+                    false
+                };
+                (follow_up_refresh, changed)
             };
+            let has_follow_up_refresh = follow_up_refresh.is_some();
             if let Some(repo_path) = follow_up_refresh {
                 if let Some(item) = repository_item_from_state(&item.id) {
                     schedule_repository_status_refresh(&item);
@@ -1394,7 +1598,9 @@ fn handle_worker_result(result: WorkerResult) {
                     schedule_repository_status_refresh(&fallback);
                 }
             }
-            refresh_views();
+            if has_follow_up_refresh || changed {
+                refresh_views();
+            }
         }
         WorkerResult::RepositoryRemoteFetchCompleted {
             repo_id,
@@ -1428,12 +1634,58 @@ fn handle_worker_result(result: WorkerResult) {
             refresh_views();
         }
         WorkerResult::RepoDetailsLoaded { repo_id, details } => {
-            {
+            let changed = {
                 let mut app_state = state().lock().expect("state mutex poisoned");
                 app_state.repo_details_loading.remove(&repo_id);
+                let changed = app_state.repo_details_cache.get(&repo_id) != Some(&details);
                 app_state.repo_details_cache.insert(repo_id, details);
+                changed
+            };
+            if changed {
+                refresh_views();
             }
-            refresh_views();
+        }
+        WorkerResult::WatchManagerSyncCompleted { sync_seq, result } => {
+            let rerun = {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                app_state.watch_manager_sync_in_flight = false;
+                let rerun = app_state.watch_manager_sync_pending;
+                app_state.watch_manager_sync_pending = false;
+                rerun
+            };
+
+            match result {
+                Ok(manager) => {
+                    LAST_WATCH_SYNC_SEQ_COMPLETED.store(sync_seq, Ordering::Relaxed);
+                    WATCH_SYNC_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+                    {
+                        let mut slot = watch_manager()
+                            .lock()
+                            .expect("watch manager mutex poisoned");
+                        *slot = manager;
+                        record_watch_manager_metrics(slot.as_ref(), "watch-backend-changed");
+                    }
+                    emit_runtime_profile("watch-sync");
+                }
+                Err(message) => {
+                    LAST_WATCH_SYNC_SEQ_COMPLETED.store(sync_seq, Ordering::Relaxed);
+                    WATCH_SYNC_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    {
+                        let mut slot = watch_manager()
+                            .lock()
+                            .expect("watch manager mutex poisoned");
+                        *slot = None;
+                        record_watch_manager_metrics(None, "watch-backend-changed");
+                    }
+                    append_log(format!("Repository watcher setup failed: {message}"));
+                    emit_runtime_profile("watch-sync-failed");
+                }
+            }
+
+            if rerun {
+                WATCH_SYNC_PENDING_COLLAPSES.fetch_add(1, Ordering::Relaxed);
+                sync_watch_manager_from_state();
+            }
         }
         WorkerResult::RefreshWorkspaceCompleted {
             result,
@@ -1575,6 +1827,7 @@ fn refresh_views() {
     }
     glib::timeout_add_local(Duration::from_millis(UI_REFRESH_DEBOUNCE_MILLIS), || {
         VIEW_REFRESH_SCHEDULED.store(0, Ordering::SeqCst);
+        VIEW_REFRESH_COUNT.fetch_add(1, Ordering::Relaxed);
         refresh_views_now();
         glib::ControlFlow::Break
     });
@@ -2239,6 +2492,12 @@ fn sync_repo_runtime_state(app_state: &mut AppState) {
         .unwrap_or_default();
 
     app_state
+        .repo_details_cache
+        .retain(|repo_id, _| expected_ids.contains(repo_id));
+    app_state
+        .repo_details_loading
+        .retain(|repo_id| expected_ids.contains(repo_id));
+    app_state
         .repo_runtime
         .retain(|repo_id, _| expected_ids.contains(repo_id));
 
@@ -2318,13 +2577,15 @@ fn mark_remote_fetch_completed(app_state: &mut AppState, repo_id: &str, success:
     }
 }
 
-fn mark_repo_stale(app_state: &mut AppState, repo_id: &str) {
+fn mark_repo_stale(app_state: &mut AppState, repo_id: &str) -> bool {
     let now = SystemTime::now();
     let runtime = app_state
         .repo_runtime
         .entry(repo_id.to_string())
         .or_insert_with(|| RepoRuntimeState::new(now, repo_id));
+    let was_stale = runtime.needs_rescan();
     runtime.invalidation_seq = runtime.invalidation_seq.saturating_add(1);
+    !was_stale
 }
 
 fn schedule_pending_local_rescans() {
@@ -2561,55 +2822,29 @@ fn schedule_repo_details_load(repo_id: &str, repo_path: &Path) {
 
 fn sync_watch_manager_from_state() {
     let manifest = {
-        let app_state = state().lock().expect("state mutex poisoned");
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        if app_state.watch_manager_sync_in_flight {
+            app_state.watch_manager_sync_pending = true;
+            WATCH_SYNC_PENDING_COLLAPSES.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        app_state.watch_manager_sync_in_flight = true;
+        app_state.watch_manager_sync_pending = false;
         app_state.manifest.clone()
     };
 
+    WATCH_SYNC_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let sync_seq = WATCH_MANAGER_SYNC_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
-    let Some(manifest) = manifest else {
-        let mut manager = watch_manager()
-            .lock()
-            .expect("watch manager mutex poisoned");
-        *manager = None;
-        return;
-    };
-
-    let spawn_result = thread::Builder::new()
-        .name(format!("ronomepo-watch-sync-{sync_seq}"))
-        .spawn(move || {
-            let next_manager = build_watch_manager(&manifest);
-            if WATCH_MANAGER_SYNC_SEQ.load(Ordering::SeqCst) != sync_seq {
-                return;
-            }
-
-            match next_manager {
-                Ok(manager) => {
-                    let mut slot = watch_manager()
-                        .lock()
-                        .expect("watch manager mutex poisoned");
-                    if WATCH_MANAGER_SYNC_SEQ.load(Ordering::SeqCst) == sync_seq {
-                        *slot = Some(manager);
-                    }
-                }
-                Err(message) => {
-                    {
-                        let mut slot = watch_manager()
-                            .lock()
-                            .expect("watch manager mutex poisoned");
-                        if WATCH_MANAGER_SYNC_SEQ.load(Ordering::SeqCst) != sync_seq {
-                            return;
-                        }
-                        *slot = None;
-                    }
-                    glib::MainContext::default().invoke(move || {
-                        append_log(format!("Repository watcher setup failed: {message}"));
-                    });
-                }
-            }
-        });
-
-    if let Err(error) = spawn_result {
+    if let Err(error) = submit_coalesced_job(
+        JobKey::WatchManagerSync,
+        WorkerJob::WatchManagerSync { manifest, sync_seq },
+    ) {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        app_state.watch_manager_sync_in_flight = false;
+        app_state.watch_manager_sync_pending = false;
+        WATCH_SYNC_FAILURES.fetch_add(1, Ordering::Relaxed);
         append_log(format!("Repository watcher setup failed to start: {error}"));
+        emit_runtime_profile("watch-sync-submit-failed");
     }
 }
 
@@ -2622,46 +2857,50 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
         .filter(|(_, path)| path.exists())
         .collect::<Vec<_>>();
 
-    let mut backend = create_watch_backend()?;
+    let (mut backend, backend_kind) = create_watch_backend()?;
     let workspace_git_dir = workspace_root.join(".git");
-    let mut watched_any = false;
+    let mut watched_paths = 0;
 
     if workspace_root.exists() {
         watch_backend_mut(&mut backend)
             .watch(&workspace_root, RecursiveMode::NonRecursive)
             .map_err(|error| format!("{}: {error}", workspace_root.display()))?;
-        watched_any = true;
+        watched_paths += 1;
     }
     if workspace_git_dir.exists() {
         watch_backend_mut(&mut backend)
             .watch(&workspace_git_dir, RecursiveMode::Recursive)
             .map_err(|error| format!("{}: {error}", workspace_git_dir.display()))?;
-        watched_any = true;
+        watched_paths += 1;
     }
 
     for (_, path) in &repos {
         watch_backend_mut(&mut backend)
             .watch(path, RecursiveMode::Recursive)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        watched_any = true;
+        watched_paths += 1;
     }
 
-    if !watched_any {
+    if watched_paths == 0 {
         return Err("no local repositories are available to watch".to_string());
     }
 
-    Ok(WatchManager { _backend: backend })
+    Ok(WatchManager {
+        _backend: backend,
+        backend_kind,
+        watched_paths,
+    })
 }
 
-fn create_watch_backend() -> Result<WatchBackend, String> {
+fn create_watch_backend() -> Result<(WatchBackend, WatchBackendKind), String> {
     let config = NotifyConfig::default();
     match RecommendedWatcher::new(dispatch_watch_event_result, config) {
-        Ok(watcher) => Ok(WatchBackend::Recommended(watcher)),
+        Ok(watcher) => Ok((WatchBackend::Recommended(watcher), WatchBackendKind::Recommended)),
         Err(_) => PollWatcher::new(
             dispatch_watch_event_result,
             config.with_poll_interval(Duration::from_secs(WATCH_POLL_FALLBACK_SECS)),
         )
-        .map(WatchBackend::Poll)
+        .map(|watcher| (WatchBackend::Poll(watcher), WatchBackendKind::Poll))
         .map_err(|error| error.to_string()),
     }
 }
@@ -2680,11 +2919,25 @@ fn dispatch_watch_event_result(event: notify::Result<notify::Event>) {
             if event.paths.is_empty() {
                 return;
             }
+            WATCH_EVENTS_RECEIVED.fetch_add(1, Ordering::Relaxed);
             let should_schedule = {
                 let mut pending = pending_watch_events()
                     .lock()
                     .expect("pending watch events mutex poisoned");
-                pending.paths.extend(event.paths);
+                if !pending.overflowed {
+                    pending.paths.extend(event.paths);
+                    if pending.paths.len() > MAX_PENDING_WATCH_PATHS {
+                        pending.paths.clear();
+                        pending.overflowed = true;
+                    }
+                }
+                let pending_len = if pending.overflowed {
+                    MAX_PENDING_WATCH_PATHS
+                } else {
+                    pending.paths.len()
+                };
+                PENDING_WATCH_PATHS.store(pending_len, Ordering::Relaxed);
+                update_max_atomic(&PENDING_WATCH_PATHS_HIGH_WATER, pending_len);
                 if pending.flush_scheduled {
                     false
                 } else {
@@ -2711,19 +2964,28 @@ fn schedule_watch_event_flush() {
 }
 
 fn flush_pending_watch_events() {
-    let paths = {
+    WATCH_EVENT_FLUSHES.fetch_add(1, Ordering::Relaxed);
+    let (paths, overflowed) = {
         let mut pending = pending_watch_events()
             .lock()
             .expect("pending watch events mutex poisoned");
         pending.flush_scheduled = false;
-        std::mem::take(&mut pending.paths)
+        let overflowed = pending.overflowed;
+        pending.overflowed = false;
+        PENDING_WATCH_PATHS.store(0, Ordering::Relaxed);
+        (std::mem::take(&mut pending.paths), overflowed)
     };
+
+    if overflowed {
+        handle_overflow_watch_paths();
+        return;
+    }
 
     if paths.is_empty() {
         return;
     }
 
-    handle_watch_paths(paths);
+    handle_watch_paths(paths.into_iter().collect());
 }
 
 fn handle_watch_paths(paths: Vec<PathBuf>) {
@@ -2744,10 +3006,10 @@ fn handle_watch_paths(paths: Vec<PathBuf>) {
             }
         }
 
-        for repo_id in &touched {
-            mark_repo_stale(&mut app_state, repo_id);
-        }
-        (workspace_touched, !touched.is_empty())
+        let any_marked = touched
+            .iter()
+            .any(|repo_id| mark_repo_stale(&mut app_state, repo_id));
+        (workspace_touched, any_marked)
     };
 
     if workspace_touched {
@@ -2760,6 +3022,17 @@ fn handle_watch_paths(paths: Vec<PathBuf>) {
     if any_marked {
         schedule_pending_local_rescans();
     }
+}
+
+fn handle_overflow_watch_paths() {
+    let workspace_root = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        app_state.workspace_root.clone()
+    };
+    mark_all_repos_stale();
+    append_log("Repository watcher overflowed pending events; forcing a full local refresh.".to_string());
+    schedule_workspace_root_status_refresh(workspace_root);
+    schedule_pending_local_rescans();
 }
 
 fn workspace_watch_path_matches(manifest: &WorkspaceManifest, path: &Path) -> bool {
@@ -6546,14 +6819,19 @@ fn operation_summary_text(logs: &[String]) -> String {
         .map(String::as_str)
         .unwrap_or("No operations recorded yet.");
 
-    match latest_failure {
+    let mut summary = match latest_failure {
         Some(failure) => format!(
             "{total} log lines | {starts} started | {ok} ok | {skipped} skipped | {failed} failed | Latest failure: {failure} | Latest: {latest}"
         ),
         None => format!(
             "{total} log lines | {starts} started | {ok} ok | {skipped} skipped | {failed} failed | Latest: {latest}"
         ),
+    };
+    if let Some(runtime_line) = runtime_profile_summary("operations") {
+        summary.push_str(" | ");
+        summary.push_str(&runtime_line);
     }
+    summary
 }
 
 fn load_manifest_if_present(path: &Path) -> Option<WorkspaceManifest> {
@@ -6775,6 +7053,59 @@ mod tests {
         assert_eq!(runtime.last_scanned_seq, 1);
         assert_eq!(runtime.scheduled_scan_seq, 2);
         assert!(runtime.needs_rescan());
+    }
+
+    #[test]
+    fn sync_repo_runtime_state_prunes_removed_repo_entries() {
+        let workspace_root = temp_test_dir("runtime-prune");
+        let mut app_state = AppState::default();
+        app_state.manifest = Some(WorkspaceManifest {
+            name: "Workspace".to_string(),
+            root: workspace_root,
+            repos: vec![RepositoryEntry {
+                id: "alpha".to_string(),
+                name: "alpha".to_string(),
+                dir_name: "alpha".to_string(),
+                remote_url: "git@example.com:org/alpha.git".to_string(),
+                enabled: true,
+            }],
+            shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
+        });
+        app_state
+            .repo_runtime
+            .insert("alpha".to_string(), RepoRuntimeState::new(UNIX_EPOCH, "alpha"));
+        app_state
+            .repo_runtime
+            .insert("beta".to_string(), RepoRuntimeState::new(UNIX_EPOCH, "beta"));
+        app_state.repo_details_cache.insert(
+            "beta".to_string(),
+            RepositoryDetails {
+                remotes: vec!["origin".to_string()],
+                last_commit: None,
+                changed_files: Vec::new(),
+            },
+        );
+        app_state.repo_details_loading.insert("beta".to_string());
+
+        sync_repo_runtime_state(&mut app_state);
+
+        assert!(app_state.repo_runtime.contains_key("alpha"));
+        assert!(!app_state.repo_runtime.contains_key("beta"));
+        assert!(!app_state.repo_details_cache.contains_key("beta"));
+        assert!(!app_state.repo_details_loading.contains("beta"));
+    }
+
+    #[test]
+    fn mark_repo_stale_only_reports_first_transition_to_stale() {
+        let mut app_state = AppState::default();
+        app_state
+            .repo_runtime
+            .insert("alpha".to_string(), RepoRuntimeState::new(UNIX_EPOCH, "alpha"));
+
+        assert!(mark_repo_stale(&mut app_state, "alpha"));
+        assert!(!mark_repo_stale(&mut app_state, "alpha"));
+        assert!(app_state.repo_runtime["alpha"].needs_rescan());
     }
 
     #[test]
