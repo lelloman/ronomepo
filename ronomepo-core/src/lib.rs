@@ -605,7 +605,11 @@ pub fn plan_repo_action(
 ) -> Result<RepoActionPlan, WorkspaceError> {
     validate_repo_manifest(manifest)?;
 
-    if let Some(repo_action) = manifest.repo_actions.iter().find(|entry| entry.action == action) {
+    if let Some(repo_action) = manifest
+        .repo_actions
+        .iter()
+        .find(|entry| entry.action == action)
+    {
         return Ok(RepoActionPlan {
             action,
             execution: AggregationExecutionMode::Sequential,
@@ -776,7 +780,11 @@ fn built_in_command(
     }
 }
 
-fn cargo_command(repo_root: &Path, item: &RepoItem, action: StandardActionName) -> Option<PlannedCommand> {
+fn cargo_command(
+    repo_root: &Path,
+    item: &RepoItem,
+    action: StandardActionName,
+) -> Option<PlannedCommand> {
     let manifest_path = cargo_manifest_path(repo_root, item);
     let workdir = manifest_path
         .parent()
@@ -811,7 +819,11 @@ fn cargo_command(repo_root: &Path, item: &RepoItem, action: StandardActionName) 
     })
 }
 
-fn gradle_command(repo_root: &Path, item: &RepoItem, action: StandardActionName) -> Option<PlannedCommand> {
+fn gradle_command(
+    repo_root: &Path,
+    item: &RepoItem,
+    action: StandardActionName,
+) -> Option<PlannedCommand> {
     let workdir = resolve_item_path(repo_root, item);
     let args = match action {
         StandardActionName::Build => vec!["build".to_string()],
@@ -853,7 +865,11 @@ fn gradle_android_command(
     })
 }
 
-fn python_command(repo_root: &Path, item: &RepoItem, action: StandardActionName) -> Option<PlannedCommand> {
+fn python_command(
+    repo_root: &Path,
+    item: &RepoItem,
+    action: StandardActionName,
+) -> Option<PlannedCommand> {
     let workdir = resolve_item_path(repo_root, item);
     let args = match action {
         StandardActionName::Build => vec!["-m".to_string(), "build".to_string()],
@@ -901,7 +917,11 @@ fn node_supported_actions(repo_root: &Path, item: &RepoItem) -> Vec<StandardActi
     actions
 }
 
-fn node_command(repo_root: &Path, item: &RepoItem, action: StandardActionName) -> Option<PlannedCommand> {
+fn node_command(
+    repo_root: &Path,
+    item: &RepoItem,
+    action: StandardActionName,
+) -> Option<PlannedCommand> {
     let script = node_script_name(item, action)?;
     if !node_has_script(repo_root, item, &script) {
         return None;
@@ -1078,12 +1098,32 @@ pub fn list_repo_artifacts(
 fn default_artifacts_for_item(item: &RepoItem, item_root: &Path) -> Vec<ListedArtifact> {
     let defaults = match item.item_type.as_str() {
         "cargo" => vec![
-            ("cargo-debug", "binary", Some(item_root.join("target/debug")), Some("target/debug/*".to_string())),
-            ("cargo-release", "binary", Some(item_root.join("target/release")), Some("target/release/*".to_string())),
+            (
+                "cargo-debug",
+                "binary",
+                Some(item_root.join("target/debug")),
+                Some("target/debug/*".to_string()),
+            ),
+            (
+                "cargo-release",
+                "binary",
+                Some(item_root.join("target/release")),
+                Some("target/release/*".to_string()),
+            ),
         ],
         "gradle" => vec![
-            ("gradle-libs", "archive", Some(item_root.join("build/libs")), Some("build/libs/*".to_string())),
-            ("gradle-distributions", "archive", Some(item_root.join("build/distributions")), Some("build/distributions/*".to_string())),
+            (
+                "gradle-libs",
+                "archive",
+                Some(item_root.join("build/libs")),
+                Some("build/libs/*".to_string()),
+            ),
+            (
+                "gradle-distributions",
+                "archive",
+                Some(item_root.join("build/distributions")),
+                Some("build/distributions/*".to_string()),
+            ),
         ],
         "gradle_android" => vec![(
             "android-outputs",
@@ -1142,7 +1182,11 @@ pub fn verify_item_dependencies_freshness(
             WorkspaceError::InvalidRepoManifest(format!("unknown item id: {item_id}"))
         })?;
 
-    if !item_supports_action(repo_root, item, StandardActionName::VerifyDependenciesFreshness) {
+    if !item_supports_action(
+        repo_root,
+        item,
+        StandardActionName::VerifyDependenciesFreshness,
+    ) {
         return Err(WorkspaceError::InvalidRepoManifest(format!(
             "item {} does not support action {}",
             item.id,
@@ -1171,12 +1215,17 @@ pub fn verify_repo_dependencies_freshness(
         let Some(item_id) = step.item_id.as_deref() else {
             continue;
         };
-        reports.push(verify_item_dependencies_freshness(repo_root, manifest, item_id)?);
+        reports.push(verify_item_dependencies_freshness(
+            repo_root, manifest, item_id,
+        )?);
     }
     Ok(reports)
 }
 
-fn dependency_freshness_findings(item: &RepoItem, item_root: &Path) -> Vec<DependencyFreshnessFinding> {
+fn dependency_freshness_findings(
+    item: &RepoItem,
+    item_root: &Path,
+) -> Vec<DependencyFreshnessFinding> {
     match item.item_type.as_str() {
         "cargo" => missing_lockfile_finding(item_root.join("Cargo.lock"), "Cargo.lock"),
         "gradle" | "gradle_android" => {
@@ -1203,7 +1252,8 @@ fn dependency_freshness_findings(item: &RepoItem, item_root: &Path) -> Vec<Depen
             } else {
                 vec![DependencyFreshnessFinding {
                     kind: DependencyFreshnessFindingKind::MissingLockfile,
-                    message: "No Python lockfile or pinned requirements file was found.".to_string(),
+                    message: "No Python lockfile or pinned requirements file was found."
+                        .to_string(),
                 }]
             }
         }
@@ -2656,12 +2706,12 @@ mod tests {
             aggregation: Vec::new(),
         };
 
-        let build = plan_item_action(&repo_root, &manifest, "cli", StandardActionName::Build)
-            .unwrap();
-        let test = plan_item_action(&repo_root, &manifest, "cli", StandardActionName::Test)
-            .unwrap();
-        let clean = plan_item_action(&repo_root, &manifest, "cli", StandardActionName::Clean)
-            .unwrap();
+        let build =
+            plan_item_action(&repo_root, &manifest, "cli", StandardActionName::Build).unwrap();
+        let test =
+            plan_item_action(&repo_root, &manifest, "cli", StandardActionName::Test).unwrap();
+        let clean =
+            plan_item_action(&repo_root, &manifest, "cli", StandardActionName::Clean).unwrap();
 
         match &build.steps[0].executor {
             RepoActionExecutor::Command(command) => {
@@ -2716,8 +2766,7 @@ mod tests {
             aggregation: Vec::new(),
         };
 
-        let error =
-            plan_repo_action(&repo_root, &manifest, StandardActionName::Test).unwrap_err();
+        let error = plan_repo_action(&repo_root, &manifest, StandardActionName::Test).unwrap_err();
         assert!(error.to_string().contains("requires explicit aggregation"));
     }
 
@@ -2800,7 +2849,10 @@ mod tests {
 
         let plan =
             plan_item_action(&repo_root, &manifest, "backend", StandardActionName::Test).unwrap();
-        assert!(matches!(plan.steps[0].source, RepoActionSource::ItemOverride));
+        assert!(matches!(
+            plan.steps[0].source,
+            RepoActionSource::ItemOverride
+        ));
         match &plan.steps[0].executor {
             RepoActionExecutor::Command(command) => {
                 assert_eq!(command.program, "tox");
@@ -2841,7 +2893,8 @@ mod tests {
         assert!(artifacts.iter().any(|artifact| artifact.name == "wheel"));
         assert!(artifacts
             .iter()
-            .any(|artifact| artifact.name == "python-dist" && artifact.pattern.as_deref() == Some("dist/*")));
+            .any(|artifact| artifact.name == "python-dist"
+                && artifact.pattern.as_deref() == Some("dist/*")));
     }
 
     #[test]
@@ -2906,7 +2959,10 @@ mod tests {
 
         let plan = plan_repo_action(&repo_root, &manifest, StandardActionName::Deploy).unwrap();
         assert_eq!(plan.steps.len(), 1);
-        assert!(matches!(plan.steps[0].source, RepoActionSource::RepoCommand));
+        assert!(matches!(
+            plan.steps[0].source,
+            RepoActionSource::RepoCommand
+        ));
         match &plan.steps[0].executor {
             RepoActionExecutor::Command(command) => {
                 assert_eq!(command.program, "./scripts/deploy.sh");
@@ -2953,12 +3009,12 @@ mod tests {
             aggregation: Vec::new(),
         };
 
-        let build = plan_item_action(&repo_root, &manifest, "web", StandardActionName::Build)
-            .unwrap();
-        let test = plan_item_action(&repo_root, &manifest, "web", StandardActionName::Test)
-            .unwrap();
-        let deploy = plan_item_action(&repo_root, &manifest, "web", StandardActionName::Deploy)
-            .unwrap();
+        let build =
+            plan_item_action(&repo_root, &manifest, "web", StandardActionName::Build).unwrap();
+        let test =
+            plan_item_action(&repo_root, &manifest, "web", StandardActionName::Test).unwrap();
+        let deploy =
+            plan_item_action(&repo_root, &manifest, "web", StandardActionName::Deploy).unwrap();
         let clean =
             plan_item_action(&repo_root, &manifest, "web", StandardActionName::Clean).unwrap_err();
 
@@ -3022,8 +3078,12 @@ mod tests {
         };
 
         let artifacts = list_item_artifacts(&repo_root, &manifest, "web").unwrap();
-        assert!(artifacts.iter().any(|artifact| artifact.name == "node-dist"));
-        assert!(artifacts.iter().any(|artifact| artifact.name == "node-build"));
+        assert!(artifacts
+            .iter()
+            .any(|artifact| artifact.name == "node-dist"));
+        assert!(artifacts
+            .iter()
+            .any(|artifact| artifact.name == "node-build"));
 
         let report = verify_item_dependencies_freshness(&repo_root, &manifest, "web").unwrap();
         assert!(report.findings.is_empty());
@@ -3031,8 +3091,8 @@ mod tests {
 
     #[test]
     fn sample_repo_manifest_is_valid() {
-        let manifest_path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/sample-subrepo/ronomepo.repo.json");
+        let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/sample-subrepo/ronomepo.repo.json");
         let raw = fs::read_to_string(manifest_path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let object = value.as_object().unwrap();
@@ -3109,7 +3169,10 @@ mod tests {
         match scan.state {
             RepoManifestScanState::Valid(summary) => {
                 assert_eq!(summary.item_count, 2);
-                assert_eq!(summary.item_types, vec!["cargo".to_string(), "python".to_string()]);
+                assert_eq!(
+                    summary.item_types,
+                    vec!["cargo".to_string(), "python".to_string()]
+                );
                 assert!(summary
                     .supported_actions
                     .contains(&StandardActionName::Build));
