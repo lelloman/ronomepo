@@ -41,12 +41,13 @@ use ronomepo_core::{
     build_repository_list, collect_commit_check_report, collect_repository_details,
     collect_workspace_line_stats, default_commit_check_rules, default_manifest_path,
     derive_dir_name, ensure_commit_check_rules_initialized, format_sync_label, import_repos_txt,
-    list_repo_artifacts, load_manifest, load_repo_manifest, normalize_workspace_root, plan_repo_action,
-    run_workspace_operation, save_manifest, scan_repo_manifest, verify_repo_dependencies_freshness,
-    workspace_summary, CommitCheckRule, CommitCheckRuleEffect, CommitCheckRuleMatcher,
-    CommitCheckRuleScope, OperationEvent, OperationEventKind, OperationKind, PlannedCommand,
-    RepoActionExecutor, RepoManifestScan, RepoManifestScanState, RepositoryDetails, RepositoryEntry,
-    RepositoryListItem, RepositoryStatus, StandardActionName, WorkspaceManifest, MANIFEST_FILE_NAME,
+    list_repo_artifacts, load_manifest, load_repo_manifest, normalize_workspace_root,
+    plan_repo_action, run_workspace_operation, save_manifest, scan_repo_manifest,
+    verify_repo_dependencies_freshness, workspace_summary, CommitCheckRule, CommitCheckRuleEffect,
+    CommitCheckRuleMatcher, CommitCheckRuleScope, OperationEvent, OperationEventKind,
+    OperationKind, PlannedCommand, RepoActionExecutor, RepoManifestScan, RepoManifestScanState,
+    RepositoryDetails, RepositoryEntry, RepositoryListItem, RepositoryStatus, StandardActionName,
+    WorkspaceManifest, MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -437,6 +438,13 @@ struct ContainerViewHandle {
     host_ptr: usize,
 }
 
+struct OperationFollowHandle {
+    scroller: glib::WeakRef<ScrolledWindow>,
+    toggle: glib::WeakRef<ToggleButton>,
+    follow_enabled: Rc<Cell<bool>>,
+    suppress_scroll_events: Rc<Cell<bool>>,
+}
+
 thread_local! {
     static REPOSITORY_VIEWS: RefCell<Vec<RepositoryViewHandle>> = const { RefCell::new(Vec::new()) };
     static MONOREPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
@@ -445,6 +453,7 @@ thread_local! {
     static WORKSPACE_SETTINGS_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_BUFFERS: RefCell<Vec<glib::WeakRef<TextBuffer>>> = const { RefCell::new(Vec::new()) };
     static OPERATION_SUMMARIES: RefCell<Vec<glib::WeakRef<Label>>> = const { RefCell::new(Vec::new()) };
+    static OPERATION_FOLLOWERS: RefCell<Vec<OperationFollowHandle>> = const { RefCell::new(Vec::new()) };
 }
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -506,8 +515,7 @@ fn pending_watch_events() -> &'static Mutex<PendingWatchEvents> {
 
 fn runtime_profile_enabled() -> bool {
     *RUNTIME_PROFILE_ENABLED.get_or_init(|| {
-        env::var_os(RUNTIME_PROFILE_ENV)
-            .is_some_and(|value| !value.is_empty() && value != "0")
+        env::var_os(RUNTIME_PROFILE_ENV).is_some_and(|value| !value.is_empty() && value != "0")
     })
 }
 
@@ -744,7 +752,9 @@ fn run_worker_job(queued_job: QueuedJob) {
             dispatch_worker_result(WorkerResult::RepoDetailsLoaded { repo_id, details });
         }
         WorkerJob::WatchManagerSync { manifest, sync_seq } => {
-            let result = manifest.map(|manifest| build_watch_manager(&manifest)).transpose();
+            let result = manifest
+                .map(|manifest| build_watch_manager(&manifest))
+                .transpose();
             dispatch_worker_result(WorkerResult::WatchManagerSyncCompleted { sync_seq, result });
         }
         WorkerJob::RefreshWorkspace {
@@ -1951,11 +1961,64 @@ fn refresh_operation_views(snapshot: &StateSnapshot) {
             None => false,
         });
     });
+
+    OPERATION_FOLLOWERS.with(|followers| {
+        let mut followers = followers.borrow_mut();
+        followers.retain(|handle| {
+            let Some(scroller) = handle.scroller.upgrade() else {
+                return false;
+            };
+            let Some(toggle) = handle.toggle.upgrade() else {
+                return false;
+            };
+
+            if handle.follow_enabled.get() {
+                if !toggle.is_active() {
+                    toggle.set_active(true);
+                }
+                handle.suppress_scroll_events.set(true);
+                schedule_scroll_to_bottom(&scroller, handle.suppress_scroll_events.clone());
+            }
+
+            true
+        });
+    });
 }
 
 fn refresh_log_surfaces() {
     let snapshot = snapshot();
     refresh_operation_views(&snapshot);
+}
+
+fn adjustment_bottom_value(adjustment: &gtk::Adjustment) -> f64 {
+    (adjustment.upper() - adjustment.page_size()).max(adjustment.lower())
+}
+
+fn adjustment_is_at_bottom(adjustment: &gtk::Adjustment) -> bool {
+    (adjustment.value() - adjustment_bottom_value(adjustment)).abs() <= 1.0
+}
+
+fn schedule_scroll_to_bottom(scroller: &ScrolledWindow, suppress_scroll_events: Rc<Cell<bool>>) {
+    let scroller = scroller.clone();
+    glib::idle_add_local_once(move || {
+        let adjustment = scroller.vadjustment();
+        adjustment.set_value(adjustment_bottom_value(&adjustment));
+        suppress_scroll_events.set(false);
+    });
+}
+
+fn operation_follow_button() -> ToggleButton {
+    let button = ToggleButton::new();
+    button.add_css_class("toolbar-button");
+    button.add_css_class("toolbar-icon-button");
+    button.add_css_class(&button_css_class("ronomepo-toolbar-ghost"));
+    button.set_focus_on_click(false);
+    button.set_tooltip_text(Some("Follow scroll to bottom"));
+
+    let icon = Image::from_icon_name("document-save-symbolic");
+    icon.set_icon_size(gtk::IconSize::Normal);
+    button.set_child(Some(&icon));
+    button
 }
 
 fn remember_host_ptr(host: *const maruzzella_sdk::ffi::MzHostApi) {
@@ -2727,9 +2790,7 @@ fn schedule_repository_status_refresh(item: &RepositoryListItem) {
     let repo_id = item.id.clone();
     match submit_coalesced_job(
         JobKey::RepoStatus(repo_id.clone()),
-        WorkerJob::RepositoryStatusRefresh {
-            item: item.clone(),
-        },
+        WorkerJob::RepositoryStatusRefresh { item: item.clone() },
     ) {
         Ok(true) => {}
         Ok(false) => {}
@@ -2897,7 +2958,10 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
 fn create_watch_backend() -> Result<(WatchBackend, WatchBackendKind), String> {
     let config = NotifyConfig::default();
     match RecommendedWatcher::new(dispatch_watch_event_result, config) {
-        Ok(watcher) => Ok((WatchBackend::Recommended(watcher), WatchBackendKind::Recommended)),
+        Ok(watcher) => Ok((
+            WatchBackend::Recommended(watcher),
+            WatchBackendKind::Recommended,
+        )),
         Err(_) => PollWatcher::new(
             dispatch_watch_event_result,
             config.with_poll_interval(Duration::from_secs(WATCH_POLL_FALLBACK_SECS)),
@@ -3032,7 +3096,9 @@ fn handle_overflow_watch_paths() {
         app_state.workspace_root.clone()
     };
     mark_all_repos_stale();
-    append_log("Repository watcher overflowed pending events; forcing a full local refresh.".to_string());
+    append_log(
+        "Repository watcher overflowed pending events; forcing a full local refresh.".to_string(),
+    );
     schedule_workspace_root_status_refresh(workspace_root);
     schedule_pending_local_rescans();
 }
@@ -3213,10 +3279,7 @@ fn update_repo_context_selection(list: &ListBox, row: &ListBoxRow) {
     update_selected_repo_ids(selection_ids_from_list(list));
 }
 
-fn refresh_repo_context_menu(
-    popover: &Popover,
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-) {
+fn refresh_repo_context_menu(popover: &Popover, host_ptr: *const maruzzella_sdk::ffi::MzHostApi) {
     let menu = GtkBox::new(Orientation::Vertical, 0);
     menu.set_margin_top(4);
     menu.set_margin_bottom(4);
@@ -3254,13 +3317,8 @@ fn refresh_repo_context_menu(
     ) {
         has_section = true;
     }
-    if append_repo_context_git_section(
-        &menu,
-        popover,
-        &selection,
-        &child_hovered,
-        &schedule_close,
-    ) {
+    if append_repo_context_git_section(&menu, popover, &selection, &child_hovered, &schedule_close)
+    {
         has_section = true;
     }
     if append_repo_context_ronomepo_section(
@@ -3390,7 +3448,8 @@ fn append_repo_context_git_section(
     let can_push_force = selection.iter().any(repo_can_push_force);
     let can_clone_missing = selection.iter().any(repo_can_clone_missing);
     let can_apply_hooks = !selection.is_empty();
-    let has_actions = can_pull || can_push || can_push_force || can_clone_missing || can_apply_hooks;
+    let has_actions =
+        can_pull || can_push || can_push_force || can_clone_missing || can_apply_hooks;
     if !has_actions {
         return false;
     }
@@ -3587,7 +3646,9 @@ fn repo_can_clone_missing(item: &RepositoryListItem) -> bool {
     matches!(item.status.state, ronomepo_core::RepositoryState::Missing)
 }
 
-fn repo_context_supported_manifest_actions(selection: &[RepositoryListItem]) -> Vec<StandardActionName> {
+fn repo_context_supported_manifest_actions(
+    selection: &[RepositoryListItem],
+) -> Vec<StandardActionName> {
     let mut actions = selection
         .iter()
         .filter_map(|item| item.repo_manifest.as_ref())
@@ -3646,40 +3707,48 @@ fn run_selected_repo_manifest_action(action: StandardActionName) {
 
     for (item, manifest) in targets {
         match action {
-            StandardActionName::ListArtifacts => match list_repo_artifacts(&item.status.repo_path, &manifest) {
-                Ok(artifacts) => {
-                    if artifacts.is_empty() {
-                        append_log(format!("Ronomepo list_artifacts for {} found no artifacts.", item.name));
-                    } else {
-                        append_log(format!(
-                            "Ronomepo list_artifacts for {}: {} artifact(s).",
-                            item.name,
-                            artifacts.len()
-                        ));
-                        for artifact in artifacts {
+            StandardActionName::ListArtifacts => {
+                match list_repo_artifacts(&item.status.repo_path, &manifest) {
+                    Ok(artifacts) => {
+                        if artifacts.is_empty() {
                             append_log(format!(
-                                "  [{}] {} {}",
-                                artifact.item_id,
-                                artifact.name,
-                                artifact
-                                    .path
-                                    .as_ref()
-                                    .map(|path| path.display().to_string())
-                                    .or(artifact.pattern.clone())
-                                    .unwrap_or_else(|| "<no-path>".to_string())
+                                "Ronomepo list_artifacts for {} found no artifacts.",
+                                item.name
                             ));
+                        } else {
+                            append_log(format!(
+                                "Ronomepo list_artifacts for {}: {} artifact(s).",
+                                item.name,
+                                artifacts.len()
+                            ));
+                            for artifact in artifacts {
+                                append_log(format!(
+                                    "  [{}] {} {}",
+                                    artifact.item_id,
+                                    artifact.name,
+                                    artifact
+                                        .path
+                                        .as_ref()
+                                        .map(|path| path.display().to_string())
+                                        .or(artifact.pattern.clone())
+                                        .unwrap_or_else(|| "<no-path>".to_string())
+                                ));
+                            }
                         }
                     }
+                    Err(error) => append_log(format!(
+                        "Ronomepo list_artifacts failed for {}: {error}",
+                        item.name
+                    )),
                 }
-                Err(error) => append_log(format!(
-                    "Ronomepo list_artifacts failed for {}: {error}",
-                    item.name
-                )),
-            },
+            }
             StandardActionName::VerifyDependenciesFreshness => {
                 match verify_repo_dependencies_freshness(&item.status.repo_path, &manifest) {
                     Ok(reports) => {
-                        let findings = reports.iter().map(|report| report.findings.len()).sum::<usize>();
+                        let findings = reports
+                            .iter()
+                            .map(|report| report.findings.len())
+                            .sum::<usize>();
                         append_log(format!(
                             "Ronomepo verify_dependencies_freshness for {}: {} report(s), {} finding(s).",
                             item.name,
@@ -3691,7 +3760,10 @@ fn run_selected_repo_manifest_action(action: StandardActionName) {
                                 append_log(format!("  [{}] no issues found.", report.item_id));
                             } else {
                                 for finding in report.findings {
-                                    append_log(format!("  [{}] {}", report.item_id, finding.message));
+                                    append_log(format!(
+                                        "  [{}] {}",
+                                        report.item_id, finding.message
+                                    ));
                                 }
                             }
                         }
@@ -7284,6 +7356,8 @@ extern "C" fn create_operations_view(
     summary_row.set_valign(Align::Center);
 
     let view_host = unsafe { host.as_ref() }.map(HostApi::from_raw);
+    let follow = operation_follow_button();
+    follow.set_active(true);
     let refresh = view_host
         .as_ref()
         .and_then(|host| {
@@ -7349,11 +7423,58 @@ extern "C" fn create_operations_view(
         .child(&text)
         .build();
 
+    let follow_enabled = Rc::new(Cell::new(true));
+    let suppress_scroll_events = Rc::new(Cell::new(false));
+    follow.connect_toggled({
+        let follow_enabled = follow_enabled.clone();
+        let scroller = scroller.clone();
+        let suppress_scroll_events = suppress_scroll_events.clone();
+        move |button| {
+            let enabled = button.is_active();
+            follow_enabled.set(enabled);
+            if enabled {
+                suppress_scroll_events.set(true);
+                schedule_scroll_to_bottom(&scroller, suppress_scroll_events.clone());
+            }
+        }
+    });
+    scroller.vadjustment().connect_value_changed({
+        let follow = follow.clone();
+        let follow_enabled = follow_enabled.clone();
+        let suppress_scroll_events = suppress_scroll_events.clone();
+        move |adjustment| {
+            if suppress_scroll_events.get() || !follow_enabled.get() {
+                return;
+            }
+            if adjustment_is_at_bottom(adjustment) {
+                return;
+            }
+            follow.set_active(false);
+        }
+    });
+
+    let scroller_ref = glib::WeakRef::new();
+    scroller_ref.set(Some(&scroller));
+    let toggle_ref = glib::WeakRef::new();
+    toggle_ref.set(Some(&follow));
+    OPERATION_FOLLOWERS.with(|followers| {
+        followers.borrow_mut().push(OperationFollowHandle {
+            scroller: scroller_ref,
+            toggle: toggle_ref,
+            follow_enabled: follow_enabled.clone(),
+            suppress_scroll_events: suppress_scroll_events.clone(),
+        });
+    });
+
     summary_row.append(&summary);
+    summary_row.append(&follow);
     summary_row.append(&refresh);
     summary_row.append(&clear);
     root.append(&summary_row);
     root.append(&scroller);
+
+    suppress_scroll_events.set(true);
+    schedule_scroll_to_bottom(&scroller, suppress_scroll_events);
 
     unsafe {
         <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
@@ -7630,12 +7751,14 @@ mod tests {
             shared_hooks_path: None,
             commit_check_rules: Some(default_commit_check_rules()),
         });
-        app_state
-            .repo_runtime
-            .insert("alpha".to_string(), RepoRuntimeState::new(UNIX_EPOCH, "alpha"));
-        app_state
-            .repo_runtime
-            .insert("beta".to_string(), RepoRuntimeState::new(UNIX_EPOCH, "beta"));
+        app_state.repo_runtime.insert(
+            "alpha".to_string(),
+            RepoRuntimeState::new(UNIX_EPOCH, "alpha"),
+        );
+        app_state.repo_runtime.insert(
+            "beta".to_string(),
+            RepoRuntimeState::new(UNIX_EPOCH, "beta"),
+        );
         app_state.repo_details_cache.insert(
             "beta".to_string(),
             RepositoryDetails {
@@ -7657,9 +7780,10 @@ mod tests {
     #[test]
     fn mark_repo_stale_only_reports_first_transition_to_stale() {
         let mut app_state = AppState::default();
-        app_state
-            .repo_runtime
-            .insert("alpha".to_string(), RepoRuntimeState::new(UNIX_EPOCH, "alpha"));
+        app_state.repo_runtime.insert(
+            "alpha".to_string(),
+            RepoRuntimeState::new(UNIX_EPOCH, "alpha"),
+        );
 
         assert!(mark_repo_stale(&mut app_state, "alpha"));
         assert!(!mark_repo_stale(&mut app_state, "alpha"));
