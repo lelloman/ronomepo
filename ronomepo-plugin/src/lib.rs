@@ -4522,21 +4522,18 @@ fn render_monorepo_overview_into(
         .count();
     let ahead = items
         .iter()
-        .filter(|item| {
-            matches!(
-                item.status.sync,
-                ronomepo_core::RepositorySync::Ahead(_)
-                    | ronomepo_core::RepositorySync::Diverged { .. }
-            )
-        })
+        .filter(|item| matches!(item.status.sync, ronomepo_core::RepositorySync::Ahead(_)))
         .count();
     let behind = items
+        .iter()
+        .filter(|item| matches!(item.status.sync, ronomepo_core::RepositorySync::Behind(_)))
+        .count();
+    let diverged = items
         .iter()
         .filter(|item| {
             matches!(
                 item.status.sync,
-                ronomepo_core::RepositorySync::Behind(_)
-                    | ronomepo_core::RepositorySync::Diverged { .. }
+                ronomepo_core::RepositorySync::Diverged { .. }
             )
         })
         .count();
@@ -4571,52 +4568,52 @@ fn render_monorepo_overview_into(
         ("Missing", missing),
         ("Ahead", ahead),
         ("Behind", behind),
+        ("Diverged", diverged),
         ("No Upstream", no_upstream),
     ] {
         stats.append(&stat_card(label, &value.to_string()));
     }
 
-    let actions = overview_actions();
+    let actions = overview_actions(false);
     let selection_actions = monorepo_selection_actions(host_ptr, &items);
     let report_actions = monorepo_report_actions(snapshot);
     let file_actions = overview_file_actions(snapshot, host_ptr);
+    let command_area = GtkBox::new(Orientation::Vertical, 8);
+    command_area.append(&overview_command_group("Workspace", actions));
+    command_area.append(&overview_command_group("Selection", selection_actions));
+    command_area.append(&overview_command_group("Reports", report_actions));
+    command_area.append(&overview_command_group("Files", file_actions));
 
     let sections = GtkBox::new(Orientation::Vertical, 12);
-    append_overview_section(
+    let selection_scope = if selected.is_empty() {
+        "No repos selected. Toolbar and overview actions apply to the whole workspace.".to_string()
+    } else {
+        format!(
+            "{} repos selected. Toolbar and overview actions target the current selection first.",
+            selected.len()
+        )
+    };
+    let repo_focus = snapshot
+        .active_repo_id
+        .as_ref()
+        .map(|repo_id| format!("Active repo overview target: {repo_id}"))
+        .unwrap_or_else(|| "No active repo overview target yet".to_string());
+    append_facts_section(
         &sections,
-        "Workspace",
-        &format!("Current root: {}", snapshot.workspace_root.display()),
-    );
-    append_overview_section(
-        &sections,
-        "Manifest",
-        &snapshot
-            .manifest_path
-            .as_ref()
-            .map(|path| format!("Loaded from {}", path.display()))
-            .unwrap_or_else(|| format!("No {MANIFEST_FILE_NAME} loaded yet")),
-    );
-    append_overview_section(
-        &sections,
-        "Selection Scope",
-        &if selected.is_empty() {
-            "No repos selected. Toolbar and overview actions apply to the whole workspace."
-                .to_string()
-        } else {
-            format!(
-                "{} repos selected. Toolbar and overview actions target the current selection first.",
-                selected.len()
-            )
-        },
-    );
-    append_overview_section(
-        &sections,
-        "Repo Overview Focus",
-        &snapshot
-            .active_repo_id
-            .as_ref()
-            .map(|repo_id| format!("Active repo overview target: {repo_id}"))
-            .unwrap_or_else(|| "No active repo overview target yet".to_string()),
+        "Workspace Context",
+        &[
+            ("Root", snapshot.workspace_root.display().to_string()),
+            (
+                "Manifest",
+                snapshot
+                    .manifest_path
+                    .as_ref()
+                    .map(|path| format!("Loaded from {}", path.display()))
+                    .unwrap_or_else(|| format!("No {MANIFEST_FILE_NAME} loaded yet")),
+            ),
+            ("Selection", selection_scope),
+            ("Repo Focus", repo_focus),
+        ],
     );
     append_repo_group_section(
         &sections,
@@ -4624,6 +4621,7 @@ fn render_monorepo_overview_into(
         "Repos that are missing, dirty, behind, diverged, ahead, or missing an upstream.",
         &attention_items(&items),
         Some(8),
+        host_ptr,
     );
     append_repo_group_section(
         &sections,
@@ -4631,6 +4629,7 @@ fn render_monorepo_overview_into(
         "The repos currently selected in the left monitor.",
         &selected,
         Some(8),
+        host_ptr,
     );
     append_lines_section(
         &sections,
@@ -4656,10 +4655,7 @@ fn render_monorepo_overview_into(
 
     root.append(&hero);
     root.append(&stats);
-    root.append(&actions);
-    root.append(&selection_actions);
-    root.append(&report_actions);
-    root.append(&file_actions);
+    root.append(&command_area);
     root.append(&sections);
 }
 
@@ -6249,7 +6245,7 @@ fn render_repo_overview_into(
         body.set_wrap(true);
         body.add_css_class("muted");
         root.append(&body);
-        root.append(&overview_actions());
+        root.append(&overview_actions(true));
         root.append(&overview_file_actions(snapshot, host_ptr));
         return;
     };
@@ -6263,7 +6259,7 @@ fn render_repo_overview_into(
         body.set_wrap(true);
         body.add_css_class("muted");
         root.append(&body);
-        root.append(&overview_actions());
+        root.append(&overview_actions(true));
         root.append(&overview_file_actions(snapshot, host_ptr));
         return;
     };
@@ -6279,7 +6275,7 @@ fn render_repo_overview_into(
     subtitle.set_wrap(true);
     root.append(&subtitle);
     root.append(&repo_overview_actions(item, host_ptr));
-    root.append(&overview_actions());
+    root.append(&overview_actions(true));
     root.append(&overview_file_actions(snapshot, host_ptr));
 
     let status_cards = GtkBox::new(Orientation::Horizontal, 12);
@@ -6578,20 +6574,24 @@ fn spawn_shell_in_terminal(terminal: &vte4::Terminal, path: &Path, label: &str, 
     );
 }
 
-fn overview_actions() -> GtkBox {
+fn overview_actions(include_open_overview: bool) -> GtkBox {
     let actions = GtkBox::new(Orientation::Horizontal, 8);
-    for (label, handler) in [
+    let mut entries = vec![
         (
             "Refresh",
             command_refresh_workspace as extern "C" fn(_) -> _,
         ),
         ("Pull", command_pull as extern "C" fn(_) -> _),
         ("Push", command_push as extern "C" fn(_) -> _),
-        (
+    ];
+    if include_open_overview {
+        entries.push((
             "Monorepo Overview",
             command_open_overview as extern "C" fn(_) -> _,
-        ),
-    ] {
+        ));
+    }
+
+    for (label, handler) in entries {
         let button = Button::with_label(label);
         button.connect_clicked(move |_| {
             let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
@@ -6599,6 +6599,231 @@ fn overview_actions() -> GtkBox {
         actions.append(&button);
     }
     actions
+}
+
+fn overview_command_group(label: &str, actions: GtkBox) -> GtkBox {
+    let group = GtkBox::new(Orientation::Horizontal, 12);
+    group.set_hexpand(true);
+
+    let label_widget = Label::new(Some(label));
+    label_widget.set_xalign(0.0);
+    label_widget.set_width_chars(10);
+    label_widget.add_css_class("dim-label");
+    group.append(&label_widget);
+
+    actions.set_hexpand(true);
+    group.append(&actions);
+    group
+}
+
+fn action_button(label: &str, count: usize) -> Button {
+    let button = Button::with_label(&format!("{label} ({count})"));
+    button.set_sensitive(count > 0);
+    button
+}
+
+fn select_repo_bucket(label: &str, ids: Vec<String>) -> Button {
+    let count = ids.len();
+    let button = action_button(label, count);
+    let log_label = label.to_string();
+    button.connect_clicked(move |_| {
+        if ids.is_empty() {
+            append_log(format!(
+                "{log_label} skipped because no repos match that bucket."
+            ));
+        } else {
+            update_selected_repo_ids(ids.clone());
+            append_log(format!("{log_label} matched {} repos.", ids.len()));
+            refresh_views();
+        }
+    });
+    button
+}
+
+fn repo_overview_open_button(
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    label: &str,
+    repo_ids: Vec<String>,
+) -> Button {
+    let count = repo_ids.len();
+    let button = action_button(label, count);
+    button.connect_clicked(move |_| {
+        open_repo_overviews(host_ptr, &repo_ids);
+    });
+    button
+}
+
+fn clear_selection_button(selected_count: usize) -> Button {
+    let button = action_button("Clear Selection", selected_count);
+    button.connect_clicked(move |_| {
+        update_selected_repo_ids(Vec::new());
+        append_log("Cleared repository selection.".to_string());
+        refresh_views();
+    });
+    button
+}
+
+fn report_button(
+    label: &str,
+    loading: bool,
+    handler: extern "C" fn(maruzzella_sdk::ffi::MzBytes) -> maruzzella_sdk::ffi::MzStatus,
+) -> Button {
+    let button = Button::with_label(if loading { "Running..." } else { label });
+    button.set_sensitive(!loading);
+    button.connect_clicked(move |_| {
+        let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
+    });
+    button
+}
+
+fn repo_target_button(item: &RepositoryListItem) -> Button {
+    let button = Button::with_label("Target");
+    let repo_id = item.id.clone();
+    let repo_name = item.name.clone();
+    button.connect_clicked(move |_| {
+        update_selected_repo_ids(vec![repo_id.clone()]);
+        append_log(format!("Targeted {repo_name} as the active selection."));
+        refresh_views();
+    });
+    button
+}
+
+fn repo_open_button(
+    item: &RepositoryListItem,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) -> Button {
+    let button = Button::with_label("Open");
+    let repo_id = item.id.clone();
+    button.connect_clicked(move |_| {
+        open_repo_overviews(host_ptr, std::slice::from_ref(&repo_id));
+    });
+    button
+}
+
+fn overview_repo_row(
+    item: &RepositoryListItem,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 10);
+    row.set_margin_top(2);
+    row.set_margin_bottom(2);
+    row.set_margin_start(8);
+    row.set_margin_end(8);
+    row.set_tooltip_text(Some(&format!(
+        "{}\n{}",
+        item.status.repo_path.display(),
+        item.remote_url
+    )));
+
+    let name = monitor_text_cell(
+        &item.name,
+        MONITOR_NAME_COL_CHARS,
+        MONITOR_NAME_COL_WIDTH,
+        false,
+    );
+    let branch = monitor_text_cell(
+        branch_label(item),
+        MONITOR_BRANCH_COL_CHARS,
+        MONITOR_BRANCH_COL_WIDTH,
+        false,
+    );
+    let state = monitor_state_cell(&item.status.state);
+    let sync = monitor_sync_cell(&item.status.sync);
+
+    row.append(&name);
+    row.append(&branch);
+    row.append(&state);
+    row.append(&sync);
+    row.append(&repo_target_button(item));
+    row.append(&repo_open_button(item, host_ptr));
+    row
+}
+
+fn overview_repo_header() -> GtkBox {
+    let header = GtkBox::new(Orientation::Horizontal, 10);
+    header.add_css_class("mono");
+    header.set_margin_start(8);
+    header.set_margin_end(8);
+    header.set_margin_bottom(2);
+
+    let name = monitor_text_cell(
+        "Name",
+        MONITOR_NAME_COL_CHARS,
+        MONITOR_NAME_COL_WIDTH,
+        false,
+    );
+    let branch = monitor_text_cell(
+        "Branch",
+        MONITOR_BRANCH_COL_CHARS,
+        MONITOR_BRANCH_COL_WIDTH,
+        false,
+    );
+    let state = monitor_text_cell(
+        "State",
+        MONITOR_STATE_COL_CHARS,
+        MONITOR_STATE_COL_WIDTH,
+        false,
+    );
+    let sync = Label::new(Some("Sync"));
+    sync.set_xalign(0.0);
+    sync.set_hexpand(true);
+    sync.set_ellipsize(EllipsizeMode::End);
+
+    for label in [&name, &branch, &state, &sync] {
+        label.add_css_class("dim-label");
+        header.append(label);
+    }
+
+    let action_space = Label::new(Some(""));
+    action_space.set_width_chars(14);
+    header.append(&action_space);
+    header
+}
+
+fn append_facts_section(container: &GtkBox, heading: &str, facts: &[(&str, String)]) {
+    let block = GtkBox::new(Orientation::Vertical, 8);
+
+    let heading_label = Label::new(Some(heading));
+    heading_label.set_xalign(0.0);
+    heading_label.add_css_class("title-4");
+    block.append(&heading_label);
+
+    for (label, value) in facts {
+        let row = GtkBox::new(Orientation::Horizontal, 10);
+        row.set_hexpand(true);
+
+        let key = Label::new(Some(label));
+        key.set_xalign(0.0);
+        key.set_width_chars(12);
+        key.add_css_class("dim-label");
+
+        let value_label = Label::new(Some(value));
+        value_label.set_xalign(0.0);
+        value_label.set_hexpand(true);
+        value_label.set_wrap(true);
+
+        row.append(&key);
+        row.append(&value_label);
+        block.append(&row);
+    }
+
+    container.append(&block);
+    container.append(&Separator::new(Orientation::Horizontal));
+}
+
+fn sync_bucket_ids(items: &[RepositoryListItem], sync_label: &str) -> Vec<String> {
+    collect_repo_ids(items, |item| match sync_label {
+        "ahead" => matches!(item.status.sync, ronomepo_core::RepositorySync::Ahead(_)),
+        "behind" => matches!(item.status.sync, ronomepo_core::RepositorySync::Behind(_)),
+        "diverged" => matches!(
+            item.status.sync,
+            ronomepo_core::RepositorySync::Diverged { .. }
+        ),
+        "no_upstream" => {
+            matches!(item.status.sync, ronomepo_core::RepositorySync::NoUpstream)
+        }
+        _ => false,
+    })
 }
 
 fn repo_overview_actions(
@@ -6685,14 +6910,20 @@ fn monorepo_selection_actions(
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
     items: &[RepositoryListItem],
 ) -> GtkBox {
-    let actions = GtkBox::new(Orientation::Horizontal, 8);
+    let actions = GtkBox::new(Orientation::Vertical, 8);
+    let bucket_row = GtkBox::new(Orientation::Horizontal, 8);
+    let scope_row = GtkBox::new(Orientation::Horizontal, 8);
 
-    for (label, ids) in [
-        (
+    let current_snapshot = snapshot();
+    let selected_ids = current_snapshot.selected_repo_ids;
+    let selected_count = selected_ids.len();
+
+    for button in [
+        select_repo_bucket(
             "Select Attention",
             collect_repo_ids(items, |item| repo_attention_rank(item) < 7),
         ),
-        (
+        select_repo_bucket(
             "Select Dirty",
             collect_repo_ids(items, |item| {
                 matches!(
@@ -6702,46 +6933,26 @@ fn monorepo_selection_actions(
                 )
             }),
         ),
-        (
+        select_repo_bucket(
             "Select Missing",
             collect_repo_ids(items, |item| {
                 matches!(item.status.state, ronomepo_core::RepositoryState::Missing)
             }),
         ),
-        (
-            "Select Ahead",
-            collect_repo_ids(items, |item| {
-                matches!(
-                    item.status.sync,
-                    ronomepo_core::RepositorySync::Ahead(_)
-                        | ronomepo_core::RepositorySync::Diverged { .. }
-                )
-            }),
-        ),
+        select_repo_bucket("Select Ahead", sync_bucket_ids(items, "ahead")),
+        select_repo_bucket("Select Behind", sync_bucket_ids(items, "behind")),
+        select_repo_bucket("Select Diverged", sync_bucket_ids(items, "diverged")),
+        select_repo_bucket("Select No Upstream", sync_bucket_ids(items, "no_upstream")),
     ] {
-        let button = Button::with_label(label);
-        button.connect_clicked(move |_| {
-            if ids.is_empty() {
-                append_log(format!(
-                    "{label} skipped because no repos match that bucket."
-                ));
-            } else {
-                set_selected_repo_ids(ids.clone());
-                append_log(format!("{label} matched {} repos.", ids.len()));
-            }
-        });
-        actions.append(&button);
+        bucket_row.append(&button);
     }
 
-    let open_selection = Button::with_label("Open Selected Overviews");
-    open_selection.connect_clicked(move |_| {
-        let repo_ids = {
-            let app_state = state().lock().expect("state mutex poisoned");
-            app_state.selected_repo_ids.clone()
-        };
-        open_repo_overviews(host_ptr, &repo_ids);
-    });
-    actions.append(&open_selection);
+    scope_row.append(&repo_overview_open_button(
+        host_ptr,
+        "Open Selected",
+        selected_ids,
+    ));
+    scope_row.append(&clear_selection_button(selected_count));
 
     let settings = Button::with_label("Workspace Settings");
     settings.connect_clicked(move |_| {
@@ -6750,19 +6961,21 @@ fn monorepo_selection_actions(
             refresh_views();
         }
     });
-    actions.append(&settings);
+    scope_row.append(&settings);
 
+    actions.append(&bucket_row);
+    actions.append(&scope_row);
     actions
 }
 
 fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
     let actions = GtkBox::new(Orientation::Horizontal, 8);
 
-    let history = Button::with_label("Check History");
-    history.connect_clicked(|_| {
-        let _ = command_check_history(maruzzella_sdk::ffi::MzBytes::empty());
-    });
-    actions.append(&history);
+    actions.append(&report_button(
+        "Check History",
+        snapshot.history_report_loading,
+        command_check_history,
+    ));
 
     let open_commit_check = Button::with_label("Open Commit Check");
     open_commit_check.connect_clicked(|_| {
@@ -6777,15 +6990,19 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
     since_entry.connect_changed(|entry| {
         update_line_stats_since(entry.text().to_string());
     });
-    actions.append(&since_entry);
-
-    let line_stats = Button::with_label("Line Stats");
-    line_stats.connect_clicked(|_| {
+    since_entry.connect_activate(|_| {
         let _ = command_line_stats(maruzzella_sdk::ffi::MzBytes::empty());
     });
-    actions.append(&line_stats);
+    actions.append(&since_entry);
+
+    actions.append(&report_button(
+        "Line Stats",
+        snapshot.line_stats_loading,
+        command_line_stats,
+    ));
 
     let all_time = Button::with_label("All Time");
+    all_time.set_sensitive(!snapshot.line_stats_loading);
     all_time.connect_clicked(|_| {
         update_line_stats_since(String::new());
         let _ = command_line_stats(maruzzella_sdk::ffi::MzBytes::empty());
@@ -6869,6 +7086,7 @@ fn append_repo_group_section(
     body: &str,
     items: &[RepositoryListItem],
     limit: Option<usize>,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
     let block = GtkBox::new(Orientation::Vertical, 6);
 
@@ -6891,17 +7109,9 @@ fn append_repo_group_section(
         block.append(&empty_label);
     } else {
         let take = limit.unwrap_or(items.len());
+        block.append(&overview_repo_header());
         for item in items.iter().take(take) {
-            let row = Label::new(Some(&format!(
-                "{}  |  {}  |  {}  |  {}",
-                item.name,
-                branch_label(item),
-                status_label(&item.status.state),
-                format_sync_label(&item.status.sync)
-            )));
-            row.set_xalign(0.0);
-            row.add_css_class("mono");
-            block.append(&row);
+            block.append(&overview_repo_row(item, host_ptr));
         }
         if items.len() > take {
             let more_label = Label::new(Some(&format!(
