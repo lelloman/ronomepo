@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 gtk = { package = "gtk4", version = "0.9" }
-maruzzella_sdk = { path = "../../maruzzella/maruzzella_sdk" }
+maruzzella_sdk = "0.1.1"
 notify = "6"
 ronomepo-core = { path = "../ronomepo-core" }
 serde = { version = "1", features = ["derive"] }

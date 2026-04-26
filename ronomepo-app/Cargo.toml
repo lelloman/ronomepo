@@ -9,6 +9,6 @@ embedded-terminal = ["ronomepo-plugin/embedded-terminal"]
 
 [dependencies]
 gtk = { package = "gtk4", version = "0.9" }
-maruzzella = { path = "../../maruzzella" }
+maruzzella = "0.1.1"
 ronomepo-core = { path = "../ronomepo-core" }
 ronomepo-plugin = { path = "../ronomepo-plugin", default-features = false }

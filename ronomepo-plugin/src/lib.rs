@@ -31,7 +31,8 @@ use gtk::{
     Window, WrapMode,
 };
 use maruzzella_sdk::{
-    button_css_class, export_plugin, input_css_class, surface_css_class, text_css_class,
+    attach_text_tooltip, button_css_class, export_plugin, input_css_class, surface_css_class,
+    text_css_class,
     CommandSpec, HostApi, MzLogLevel, MzStatusCode, MzToolbarDisplayMode, MzViewOpenDisposition,
     MzViewPlacement, OpenViewRequest, Plugin, PluginDependency, PluginDescriptor,
     SurfaceContributionSpec, ToolbarWidgetSpec, Version, ViewFactorySpec,
@@ -4140,7 +4141,7 @@ fn monitor_manifest_cell(scan: Option<&RepoManifestScan>) -> Label {
         false,
     );
     if let Some(tooltip) = manifest_presence_tooltip(scan) {
-        label.set_tooltip_text(Some(&tooltip));
+        attach_text_tooltip(&label, tooltip);
     }
     let escaped = glib::markup_escape_text(manifest_presence_label(scan));
     label.set_markup(&format!(

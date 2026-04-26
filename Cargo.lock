@@ -539,19 +539,24 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "maruzzella"
-version = "0.1.0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd67c18f57605eb81fcf2d1b362976e11602918552d6dcd4d35f833d9762ce87"
 dependencies = [
  "glib",
  "gtk4",
  "libloading",
  "maruzzella_api",
+ "maruzzella_sdk",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "maruzzella_api"
-version = "0.1.0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edca4eea703746a532f79111e0dba190c475e4e73cbd4d2e6bbac45d0ab8bad7"
 dependencies = [
  "serde",
  "serde_json",
@@ -559,8 +564,11 @@ dependencies = [
 
 [[package]]
 name = "maruzzella_sdk"
-version = "0.1.0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c59dd9d1ffe3e5932181087557e04e47a053f1b5fce6990f25baf6c229b32434"
 dependencies = [
+ "gtk4",
  "maruzzella_api",
  "serde",
  "serde_json",
