@@ -3962,7 +3962,7 @@ extern "C" fn create_repo_monitor_view(
         click.set_button(1);
         click.set_propagation_phase(gtk::PropagationPhase::Capture);
         let list_ref = list.clone();
-        click.connect_pressed(move |gesture, _, _x, y| {
+        click.connect_pressed(move |gesture, n_press, _x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
             let Some(row) = list_ref.row_at_y(y as i32) else {
                 return;
@@ -3973,6 +3973,16 @@ extern "C" fn create_repo_monitor_view(
                 .unwrap_or_else(gtk::gdk::ModifierType::empty);
             let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
             let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+
+            if n_press >= 2 && !ctrl && !shift {
+                let repo_id = repo_id_from_list_box_row(&row).unwrap_or_default();
+                if repo_id == MONOREPO_ROW_ID {
+                    let _ = command_open_overview(maruzzella_sdk::ffi::MzBytes::empty());
+                } else if !repo_id.is_empty() {
+                    open_repo_overviews(host, std::slice::from_ref(&repo_id));
+                }
+                return;
+            }
 
             if ctrl {
                 if row.is_selected() {
@@ -4000,19 +4010,15 @@ extern "C" fn create_repo_monitor_view(
                     }
                 }
             } else {
-                list_ref.unselect_all();
-                list_ref.select_row(Some(&row));
+                if row.is_selected() {
+                    list_ref.unselect_all();
+                } else {
+                    list_ref.unselect_all();
+                    list_ref.select_row(Some(&row));
+                }
             }
             sync_selection_css(&list_ref);
             update_selected_repo_ids(selection_ids_from_list(&list_ref));
-            if !ctrl && !shift {
-                let repo_id = repo_id_from_list_box_row(&row).unwrap_or_default();
-                if repo_id == MONOREPO_ROW_ID {
-                    let _ = command_open_overview(maruzzella_sdk::ffi::MzBytes::empty());
-                } else if !repo_id.is_empty() {
-                    open_repo_overviews(host, std::slice::from_ref(&repo_id));
-                }
-            }
         });
         list.add_controller(click);
     }
