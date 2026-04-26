@@ -310,6 +310,7 @@ pub struct RepositoryDetails {
 pub struct LastCommitInfo {
     pub short_sha: String,
     pub subject: String,
+    pub committed_at_epoch_secs: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1545,11 +1546,15 @@ pub fn collect_repository_details(repo_path: &Path) -> RepositoryDetails {
                     .collect()
             })
             .unwrap_or_default(),
-        last_commit: git_stdout(repo_path, ["log", "-1", "--format=%h|%s"]).and_then(|output| {
-            let (short_sha, subject) = output.split_once('|')?;
+        last_commit: git_stdout(repo_path, ["log", "-1", "--format=%h|%s|%ct"]).and_then(|output| {
+            let mut parts = output.splitn(3, '|');
+            let short_sha = parts.next()?;
+            let subject = parts.next()?;
+            let committed_at_epoch_secs = parts.next()?.parse().ok()?;
             Some(LastCommitInfo {
                 short_sha: short_sha.to_string(),
                 subject: subject.to_string(),
+                committed_at_epoch_secs,
             })
         }),
         changed_files: git_stdout(repo_path, ["status", "--short"])
