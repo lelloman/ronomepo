@@ -2488,9 +2488,9 @@ fn repo_monitor_sort_cmp(
             .name
             .to_ascii_lowercase()
             .cmp(&right.name.to_ascii_lowercase()),
-        MonitorSortMode::SyncState => repo_attention_rank(left)
-            .cmp(&repo_attention_rank(right))
-            .then_with(|| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase())),
+        MonitorSortMode::SyncState => {
+            repo_sync_state_sort_key(left).cmp(&repo_sync_state_sort_key(right))
+        }
         MonitorSortMode::RecentActivity => repo_last_activity_sort_key(snapshot, left)
             .cmp(&repo_last_activity_sort_key(snapshot, right))
             .then_with(|| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase())),
@@ -2563,6 +2563,46 @@ fn repo_attention_rank(item: &RepositoryListItem) -> u8 {
         (_, RepositorySync::NoUpstream) => 6,
         _ => 7,
     }
+}
+
+fn repo_sync_state_sort_key(item: &RepositoryListItem) -> (u8, usize, u8, String) {
+    (
+        repo_sync_sort_rank(&item.status.sync),
+        repo_sync_distance_sort_rank(&item.status.sync),
+        repo_local_state_sort_rank(&item.status.state),
+        item.name.to_ascii_lowercase(),
+    )
+}
+
+fn repo_local_state_sort_rank(state: &ronomepo_core::RepositoryState) -> u8 {
+    match state {
+        ronomepo_core::RepositoryState::Missing => 0,
+        ronomepo_core::RepositoryState::Dirty => 1,
+        ronomepo_core::RepositoryState::Untracked => 2,
+        ronomepo_core::RepositoryState::Unknown => 3,
+        ronomepo_core::RepositoryState::Clean => 4,
+    }
+}
+
+fn repo_sync_sort_rank(sync: &ronomepo_core::RepositorySync) -> u8 {
+    match sync {
+        ronomepo_core::RepositorySync::Diverged { .. } => 0,
+        ronomepo_core::RepositorySync::Behind(_) => 1,
+        ronomepo_core::RepositorySync::Ahead(_) => 2,
+        ronomepo_core::RepositorySync::Unknown => 3,
+        ronomepo_core::RepositorySync::NoUpstream => 4,
+        ronomepo_core::RepositorySync::UpToDate => 5,
+    }
+}
+
+fn repo_sync_distance_sort_rank(sync: &ronomepo_core::RepositorySync) -> usize {
+    let distance = match sync {
+        ronomepo_core::RepositorySync::Ahead(count)
+        | ronomepo_core::RepositorySync::Behind(count) => *count,
+        ronomepo_core::RepositorySync::Diverged { ahead, behind } => ahead.saturating_add(*behind),
+        _ => 0,
+    };
+    usize::MAX - distance
 }
 
 fn selection_ids_from_list(list: &ListBox) -> Vec<String> {
@@ -7990,6 +8030,26 @@ mod tests {
         path
     }
 
+    fn test_repository_item(
+        name: &str,
+        state: RepositoryState,
+        sync: RepositorySync,
+    ) -> RepositoryListItem {
+        RepositoryListItem {
+            id: name.to_string(),
+            name: name.to_string(),
+            dir_name: name.to_string(),
+            remote_url: format!("git@example.com:org/{name}.git"),
+            status: RepositoryStatus {
+                state,
+                branch: Some("main".to_string()),
+                sync,
+                repo_path: PathBuf::from(name),
+            },
+            repo_manifest: None,
+        }
+    }
+
     #[test]
     fn descriptor_uses_expected_plugin_id() {
         let descriptor = RonomepoPlugin::descriptor();
@@ -8006,6 +8066,54 @@ mod tests {
         assert_eq!(first, second);
         assert!(first <= REMOTE_FETCH_JITTER_SECS);
         assert!(other <= REMOTE_FETCH_JITTER_SECS);
+    }
+
+    #[test]
+    fn sync_state_sort_key_prioritizes_out_of_sync_repositories() {
+        let mut items = vec![
+            test_repository_item(
+                "z-untracked",
+                RepositoryState::Untracked,
+                RepositorySync::UpToDate,
+            ),
+            test_repository_item(
+                "m-dirty-ahead-four",
+                RepositoryState::Dirty,
+                RepositorySync::Ahead(4),
+            ),
+            test_repository_item(
+                "a-dirty-no-upstream",
+                RepositoryState::Dirty,
+                RepositorySync::NoUpstream,
+            ),
+            test_repository_item(
+                "a-untracked",
+                RepositoryState::Untracked,
+                RepositorySync::UpToDate,
+            ),
+            test_repository_item(
+                "z-dirty-ahead-one",
+                RepositoryState::Dirty,
+                RepositorySync::Ahead(1),
+            ),
+        ];
+
+        items.sort_by_key(repo_sync_state_sort_key);
+
+        let names = items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "m-dirty-ahead-four",
+                "z-dirty-ahead-one",
+                "a-dirty-no-upstream",
+                "a-untracked",
+                "z-untracked",
+            ]
+        );
     }
 
     #[test]
