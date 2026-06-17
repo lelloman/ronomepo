@@ -187,6 +187,8 @@ fn main() {
             secondary: false,
             display_mode: ToolbarDisplayMode::IconOnly,
             appearance_id: "ronomepo-toolbar-primary".to_string(),
+            options: Vec::new(),
+            selected_index: 0,
         },
         ToolbarItemSpec {
             id: "pull".to_string(),
@@ -197,6 +199,8 @@ fn main() {
             secondary: false,
             display_mode: ToolbarDisplayMode::IconOnly,
             appearance_id: "ronomepo-toolbar-primary".to_string(),
+            options: Vec::new(),
+            selected_index: 0,
         },
         ToolbarItemSpec {
             id: "push".to_string(),
@@ -207,6 +211,8 @@ fn main() {
             secondary: false,
             display_mode: ToolbarDisplayMode::IconOnly,
             appearance_id: "ronomepo-toolbar-primary".to_string(),
+            options: Vec::new(),
+            selected_index: 0,
         },
         ToolbarItemSpec {
             id: "monorepo-overview".to_string(),
@@ -217,6 +223,8 @@ fn main() {
             secondary: true,
             display_mode: ToolbarDisplayMode::IconOnly,
             appearance_id: "ronomepo-toolbar-primary".to_string(),
+            options: Vec::new(),
+            selected_index: 0,
         },
         ToolbarItemSpec {
             id: "commit-check".to_string(),
@@ -227,6 +235,8 @@ fn main() {
             secondary: true,
             display_mode: ToolbarDisplayMode::IconOnly,
             appearance_id: "ronomepo-toolbar-primary".to_string(),
+            options: Vec::new(),
+            selected_index: 0,
         },
     ];
 
