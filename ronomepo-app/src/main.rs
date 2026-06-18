@@ -42,17 +42,13 @@ fn main() {
             label: "Monorepo".to_string(),
         },
         MenuRootSpec {
-            id: "settings".to_string(),
-            label: "Settings".to_string(),
-        },
-        MenuRootSpec {
             id: "help".to_string(),
             label: "Help".to_string(),
         },
     ];
     product.menu_items = vec![
         MenuItemSpec {
-            id: "file-new".to_string(),
+            id: "new-buffer".to_string(),
             root_id: "file".to_string(),
             label: "New".to_string(),
             command_id: "shell.new_buffer".to_string(),
@@ -66,7 +62,42 @@ fn main() {
             payload: Vec::new(),
         },
         MenuItemSpec {
+            id: "save-buffer".to_string(),
+            root_id: "file".to_string(),
+            label: "Save".to_string(),
+            command_id: "shell.save_buffer".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "save-buffer-as".to_string(),
+            root_id: "file".to_string(),
+            label: "Save As".to_string(),
+            command_id: "shell.save_buffer_as".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
             id: "file-separator-1".to_string(),
+            root_id: "file".to_string(),
+            label: String::new(),
+            command_id: String::new(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "plugins".to_string(),
+            root_id: "file".to_string(),
+            label: "Plugins".to_string(),
+            command_id: "shell.plugins".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "settings".to_string(),
+            root_id: "file".to_string(),
+            label: "Settings".to_string(),
+            command_id: "shell.settings".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
+            id: "file-separator-2".to_string(),
             root_id: "file".to_string(),
             label: String::new(),
             command_id: String::new(),
@@ -91,6 +122,15 @@ fn main() {
             root_id: "view".to_string(),
             label: "Commit Check".to_string(),
             command_id: "ronomepo.workspace.open_commit_check".to_string(),
+            payload: Vec::new(),
+        },
+        // Reserve the base plugin menu id so its runtime "Reload Theme" item
+        // is not merged into the visible View menu.
+        MenuItemSpec {
+            id: "reload-theme".to_string(),
+            root_id: "ronomepo-hidden".to_string(),
+            label: "Reload Theme".to_string(),
+            command_id: String::new(),
             payload: Vec::new(),
         },
         MenuItemSpec {
@@ -119,20 +159,6 @@ fn main() {
             root_id: "monorepo".to_string(),
             label: "Add repo".to_string(),
             command_id: "ronomepo.workspace.add_repo".to_string(),
-            payload: Vec::new(),
-        },
-        MenuItemSpec {
-            id: "settings-theme".to_string(),
-            root_id: "settings".to_string(),
-            label: "Theme".to_string(),
-            command_id: "shell.settings".to_string(),
-            payload: Vec::new(),
-        },
-        MenuItemSpec {
-            id: "settings-plugins".to_string(),
-            root_id: "settings".to_string(),
-            label: "Plugins".to_string(),
-            command_id: "shell.plugins".to_string(),
             payload: Vec::new(),
         },
         MenuItemSpec {
