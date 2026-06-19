@@ -1,6 +1,6 @@
 {
   "$schema": "../../docs/repo-manifest.schema.json",
-  "schema_version": 1,
+  "schema_version": 2,
   "repo_id": "sample-product",
   "items": [
     {
@@ -27,6 +27,76 @@
           "timeout_seconds": 120
         }
       ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "python-tools/dependencies/outdated",
+      "command": ["python", "scripts/check_outdated_dependencies.py"],
+      "workdir": "tools",
+      "output": "json",
+      "timeout_seconds": 120
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "desktop-app/build",
+      "capability": "integrity.build",
+      "status": "implemented",
+      "item_id": "desktop-app",
+      "standard_action": "cargo.build"
+    },
+    {
+      "id": "desktop-app/test-build",
+      "capability": "integrity.test_build",
+      "status": "implemented",
+      "item_id": "desktop-app",
+      "standard_action": "cargo.test"
+    },
+    {
+      "id": "desktop-app/tests",
+      "capability": "integrity.tests",
+      "status": "implemented",
+      "item_id": "desktop-app",
+      "standard_action": "cargo.test"
+    },
+    {
+      "id": "desktop-app/dependencies/outdated",
+      "capability": "dependencies.outdated",
+      "status": "implemented",
+      "item_id": "desktop-app",
+      "standard_action": "cargo.dependencies_outdated"
+    },
+    {
+      "id": "python-tools/build",
+      "capability": "integrity.build",
+      "status": "not_applicable",
+      "item_id": "python-tools",
+      "reason": "The tools package is script-only and has no build step."
+    },
+    {
+      "id": "python-tools/test-build",
+      "capability": "integrity.test_build",
+      "status": "not_applicable",
+      "item_id": "python-tools",
+      "reason": "Python tests are interpreted and do not have a separate compile step."
+    },
+    {
+      "id": "python-tools/tests",
+      "capability": "integrity.tests",
+      "status": "implemented",
+      "item_id": "python-tools",
+      "standard_action": "python.test"
+    },
+    {
+      "id": "python-tools/dependencies/outdated-capability",
+      "capability": "dependencies.outdated",
+      "status": "implemented",
+      "item_id": "python-tools",
+      "action_ref": {
+        "kind": "repo_action",
+        "id": "python-tools/dependencies/outdated"
+      }
     }
   ],
   "repo_actions": [

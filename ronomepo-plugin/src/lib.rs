@@ -6,13 +6,13 @@ use std::fmt::Write as _;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use gtk::gdk::{Rectangle, RGBA};
 use gtk::gio;
@@ -24,31 +24,35 @@ use gtk::glib::{
 use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
-    Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, Dialog, DropDown,
-    Entry, EventControllerMotion, FilterChange, GestureClick, Image, Label, ListBox, ListBoxRow,
+    Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, Dialog, DropDown, Entry,
+    EventControllerMotion, FilterChange, GestureClick, Image, Label, ListBox, ListBoxRow,
     Orientation, Paned, PolicyType, Popover, PositionType, ResponseType, ScrolledWindow,
     SelectionMode, Separator, SortListModel, SorterChange, TextBuffer, TextView, ToggleButton,
     Window, WrapMode,
 };
 use maruzzella_sdk::{
     attach_text_tooltip, button_css_class, export_plugin, input_css_class, surface_css_class,
-    text_css_class,
-    CommandSpec, HostApi, MzLogLevel, MzStatusCode, MzToolbarDisplayMode, MzViewOpenDisposition,
-    MzViewPlacement, OpenViewRequest, Plugin, PluginDependency, PluginDescriptor,
-    SurfaceContributionSpec, ToolbarWidgetSpec, Version, ViewFactorySpec,
+    text_css_class, CommandSpec, HostApi, MzLogLevel, MzStatusCode, MzToolbarDisplayMode,
+    MzViewOpenDisposition, MzViewPlacement, OpenViewRequest, Plugin, PluginDependency,
+    PluginDescriptor, SurfaceContributionSpec, ToolbarWidgetSpec, Version, ViewFactorySpec,
 };
 use notify::{Config as NotifyConfig, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use ronomepo_core::{
-    build_repository_list, collect_commit_check_report, collect_repository_details,
-    collect_workspace_line_stats, default_commit_check_rules, default_manifest_path,
+    build_repository_list, collect_capability_git_snapshot, collect_commit_check_report,
+    collect_repository_details, collect_workspace_line_stats, current_epoch_secs,
+    default_capability_registry_path, default_commit_check_rules, default_manifest_path,
     derive_dir_name, ensure_commit_check_rules_initialized, format_sync_label, import_repos_txt,
-    list_repo_artifacts, load_manifest, load_repo_manifest, normalize_workspace_root,
-    plan_repo_action, run_workspace_operation, save_manifest, scan_repo_manifest,
-    verify_repo_dependencies_freshness, workspace_summary, CommitCheckRule, CommitCheckRuleEffect,
-    CommitCheckRuleMatcher, CommitCheckRuleScope, OperationEvent, OperationEventKind,
-    OperationKind, PlannedCommand, RepoActionExecutor, RepoManifestScan, RepoManifestScanState,
-    RepositoryDetails, RepositoryEntry, RepositoryListItem, RepositoryStatus, StandardActionName,
-    WorkspaceManifest, MANIFEST_FILE_NAME,
+    list_repo_artifacts, load_capability_registry, load_manifest, load_repo_manifest,
+    normalize_workspace_root, parse_capability_result_json, plan_capability_action,
+    plan_repo_action, run_workspace_operation, save_capability_registry, save_manifest,
+    scan_repo_manifest, text_capability_result, upsert_capability_state,
+    verify_repo_dependencies_freshness, workspace_summary, CapabilityFinding,
+    CapabilityFindingSeverity, CapabilityResult, CapabilityResultStatus, CapabilityState,
+    CommitCheckRule, CommitCheckRuleEffect, CommitCheckRuleMatcher, CommitCheckRuleScope,
+    OperationEvent, OperationEventKind, OperationKind, PlannedCommand, RepoActionExecutor,
+    RepoManifest, RepoManifestScan, RepoManifestScanState, RepositoryDetails, RepositoryEntry,
+    RepositoryListItem, RepositoryStatus, StandardActionName, WorkspaceManifest,
+    MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -253,6 +257,7 @@ enum JobKey {
     WatchManagerSync,
     HistoryReport,
     LineStats(Option<String>),
+    CapabilityChecks,
 }
 
 struct ExecutorState {
@@ -311,6 +316,10 @@ enum WorkerJob {
     LineStats {
         manifest: WorkspaceManifest,
         since_date: Option<String>,
+    },
+    CapabilityChecks {
+        workspace_root: PathBuf,
+        targets: Vec<CapabilityRunTarget>,
     },
     SaveManifestFromEditor {
         host_ptr: usize,
@@ -371,6 +380,9 @@ enum WorkerResult {
     LineStatsCompleted {
         result: Result<LineStatsResult, String>,
     },
+    CapabilityChecksCompleted {
+        result: Result<CapabilityRunReport, String>,
+    },
     SaveManifestCompleted {
         result: Result<SaveManifestResult, String>,
         status_sender: mpsc::Sender<String>,
@@ -396,6 +408,19 @@ struct HistoryReportResult {
 }
 
 struct LineStatsResult {
+    lines: Vec<String>,
+    message: String,
+}
+
+#[derive(Clone)]
+struct CapabilityRunTarget {
+    repo_id: String,
+    repo_name: String,
+    repo_path: PathBuf,
+    manifest: RepoManifest,
+}
+
+struct CapabilityRunReport {
     lines: Vec<String>,
     message: String,
 }
@@ -809,6 +834,13 @@ fn run_worker_job(queued_job: QueuedJob) {
         } => {
             let result = build_line_stats_report(&manifest, since_date.as_deref());
             dispatch_worker_result(WorkerResult::LineStatsCompleted { result });
+        }
+        WorkerJob::CapabilityChecks {
+            workspace_root,
+            targets,
+        } => {
+            let result = run_capability_checks(&workspace_root, targets);
+            dispatch_worker_result(WorkerResult::CapabilityChecksCompleted { result });
         }
         WorkerJob::SaveManifestFromEditor {
             host_ptr,
@@ -1795,6 +1827,20 @@ fn handle_worker_result(result: WorkerResult) {
             append_log(message);
             refresh_views();
         }
+        WorkerResult::CapabilityChecksCompleted { result } => {
+            let message = match result {
+                Ok(result) => {
+                    for line in result.lines {
+                        append_log(line);
+                    }
+                    result.message
+                }
+                Err(message) => format!("Capability checks failed: {message}"),
+            };
+            append_log(message);
+            schedule_workspace_scan();
+            refresh_views();
+        }
         WorkerResult::SaveManifestCompleted {
             result,
             status_sender,
@@ -2158,6 +2204,11 @@ fn status_label(state: &ronomepo_core::RepositoryState) -> &'static str {
 
 fn manifest_presence_label(scan: Option<&RepoManifestScan>) -> &'static str {
     match scan.map(|scan| &scan.state) {
+        Some(RepoManifestScanState::Valid(summary))
+            if summary.missing_required_capability_count > 0 =>
+        {
+            "Manifest!"
+        }
         Some(RepoManifestScanState::Valid(_)) => "Manifest",
         Some(RepoManifestScanState::Invalid { .. }) => "Manifest!",
         Some(RepoManifestScanState::Missing) => "No Manifest",
@@ -2177,7 +2228,7 @@ fn manifest_presence_search_text(scan: Option<&RepoManifestScan>) -> &'static st
 fn manifest_presence_tooltip(scan: Option<&RepoManifestScan>) -> Option<String> {
     match scan.map(|scan| (&scan.path, &scan.state)) {
         Some((path, RepoManifestScanState::Valid(summary))) => Some(format!(
-            "{}\n{} items | types: {} | actions: {}",
+            "{}\n{} items | types: {} | actions: {} | capabilities: {} | policy issues: {}",
             path.display(),
             summary.item_count,
             summary.item_types.join(", "),
@@ -2186,7 +2237,9 @@ fn manifest_presence_tooltip(scan: Option<&RepoManifestScan>) -> Option<String> 
                 .iter()
                 .map(|action| standard_action_label(*action).to_string())
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            summary.capability_count,
+            summary.missing_required_capability_count
         )),
         Some((path, RepoManifestScanState::Invalid { message })) => {
             Some(format!("{}\nInvalid manifest: {}", path.display(), message))
@@ -2478,7 +2531,8 @@ fn repo_monitor_sort_cmp(
     left: &RepositoryListItem,
     right: &RepositoryListItem,
 ) -> std::cmp::Ordering {
-    let monorepo_rank = u8::from(left.id == MONOREPO_ROW_ID).cmp(&u8::from(right.id == MONOREPO_ROW_ID));
+    let monorepo_rank =
+        u8::from(left.id == MONOREPO_ROW_ID).cmp(&u8::from(right.id == MONOREPO_ROW_ID));
     if monorepo_rank != std::cmp::Ordering::Equal {
         return monorepo_rank;
     }
@@ -2493,7 +2547,11 @@ fn repo_monitor_sort_cmp(
         }
         MonitorSortMode::RecentActivity => repo_last_activity_sort_key(snapshot, left)
             .cmp(&repo_last_activity_sort_key(snapshot, right))
-            .then_with(|| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase())),
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            }),
     };
 
     if snapshot.monitor_sort_descending {
@@ -2545,7 +2603,7 @@ fn matches_filter_mode(item: &RepositoryListItem, mode: MonitorFilterMode) -> bo
                 RepositorySync::Diverged { .. }
                     | RepositorySync::NoUpstream
                     | RepositorySync::Unknown
-            )
+            ) || repo_manifest_has_policy_issues(item)
         }
     }
 }
@@ -2561,8 +2619,18 @@ fn repo_attention_rank(item: &RepositoryListItem) -> u8 {
         (_, RepositorySync::Ahead(_)) => 4,
         (RepositoryState::Unknown, _) | (_, RepositorySync::Unknown) => 5,
         (_, RepositorySync::NoUpstream) => 6,
+        _ if repo_manifest_has_policy_issues(item) => 6,
         _ => 7,
     }
+}
+
+fn repo_manifest_has_policy_issues(item: &RepositoryListItem) -> bool {
+    matches!(
+        item.repo_manifest.as_ref().map(|scan| &scan.state),
+        Some(RepoManifestScanState::Valid(summary))
+            if summary.missing_required_capability_count > 0
+                || summary.unsupported_capability_count > 0
+    )
 }
 
 fn repo_sync_state_sort_key(item: &RepositoryListItem) -> (u8, usize, u8, String) {
@@ -3526,11 +3594,17 @@ fn append_repo_context_ronomepo_section(
     root_schedule_close: &Rc<dyn Fn()>,
 ) -> bool {
     let supported_actions = repo_context_supported_manifest_actions(selection);
-    if supported_actions.is_empty() {
+    let can_run_capabilities = selection_has_implemented_capabilities(selection);
+    if supported_actions.is_empty() && !can_run_capabilities {
         return false;
     }
 
     let submenu = GtkBox::new(Orientation::Vertical, 0);
+    if can_run_capabilities {
+        append_context_button(&submenu, popover, "Run Capability Checks", || {
+            run_selected_repo_capability_checks();
+        });
+    }
     for action in supported_actions {
         let label = context_action_label(action);
         append_context_button(&submenu, popover, &label, move || {
@@ -3836,6 +3910,22 @@ fn repo_context_supported_manifest_actions(
     actions
 }
 
+fn selection_has_implemented_capabilities(selection: &[RepositoryListItem]) -> bool {
+    selection.iter().any(|item| {
+        let Some(scan) = item.repo_manifest.as_ref() else {
+            return false;
+        };
+        if !matches!(scan.state, RepoManifestScanState::Valid(_)) {
+            return false;
+        }
+        load_repo_manifest(&scan.path).is_ok_and(|manifest| {
+            manifest.capabilities.iter().any(|capability| {
+                capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
+            })
+        })
+    })
+}
+
 fn context_action_label(action: StandardActionName) -> String {
     match action {
         StandardActionName::ListArtifacts => "List Artifacts".to_string(),
@@ -3851,7 +3941,7 @@ fn context_action_label(action: StandardActionName) -> String {
 
 fn selected_repo_manifest_targets(
     action: StandardActionName,
-) -> Vec<(RepositoryListItem, ronomepo_core::RepoManifest)> {
+) -> Vec<(RepositoryListItem, RepoManifest)> {
     selected_repository_items_from_state()
         .into_iter()
         .filter_map(|item| {
@@ -3866,6 +3956,60 @@ fn selected_repo_manifest_targets(
             Some((item, manifest))
         })
         .collect()
+}
+
+fn selected_repo_capability_targets() -> Vec<CapabilityRunTarget> {
+    selected_repository_items_from_state()
+        .into_iter()
+        .filter_map(|item| {
+            let scan = item.repo_manifest.as_ref()?;
+            if !matches!(scan.state, RepoManifestScanState::Valid(_)) {
+                return None;
+            }
+            let manifest = load_repo_manifest(&scan.path).ok()?;
+            if !manifest.capabilities.iter().any(|capability| {
+                capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
+            }) {
+                return None;
+            }
+            Some(CapabilityRunTarget {
+                repo_id: item.id,
+                repo_name: item.name,
+                repo_path: item.status.repo_path,
+                manifest,
+            })
+        })
+        .collect()
+}
+
+fn run_selected_repo_capability_checks() {
+    let targets = selected_repo_capability_targets();
+    if targets.is_empty() {
+        append_log(
+            "Capability checks skipped because no selected repo exposes implemented capabilities."
+                .to_string(),
+        );
+        return;
+    }
+    let workspace_root = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        app_state.workspace_root.clone()
+    };
+    let repo_count = targets.len();
+    match submit_coalesced_job(
+        JobKey::CapabilityChecks,
+        WorkerJob::CapabilityChecks {
+            workspace_root,
+            targets,
+        },
+    ) {
+        Ok(true) => append_log(format!(
+            "Running capability checks for {repo_count} selected repo(s)."
+        )),
+        Ok(false) => append_log("Capability checks are already running.".to_string()),
+        Err(message) => append_log(format!("Capability checks failed to start: {message}")),
+    }
+    refresh_views();
 }
 
 fn run_selected_repo_manifest_action(action: StandardActionName) {
@@ -4122,8 +4266,7 @@ extern "C" fn create_repo_monitor_view(
     let sort_indicator = Button::new();
     sort_indicator.add_css_class("flat");
     sort_indicator.set_tooltip_text(Some("Toggle sort direction"));
-    let sort_indicator_label =
-        Label::new(Some(monitor_sort_direction_label(sort_direction.get())));
+    let sort_indicator_label = Label::new(Some(monitor_sort_direction_label(sort_direction.get())));
     sort_indicator_label.add_css_class("title-4");
     sort_indicator_label.add_css_class("dim-label");
     sort_indicator.set_child(Some(&sort_indicator_label));
@@ -4381,6 +4524,11 @@ fn monitor_manifest_cell(scan: Option<&RepoManifestScan>) -> Label {
 
 fn manifest_presence_color(scan: Option<&RepoManifestScan>) -> &'static str {
     match scan.map(|scan| &scan.state) {
+        Some(RepoManifestScanState::Valid(summary))
+            if summary.missing_required_capability_count > 0 =>
+        {
+            "#f6c177"
+        }
         Some(RepoManifestScanState::Valid(_)) => "#7fdc8a",
         Some(RepoManifestScanState::Invalid { .. }) => "#ff6b6b",
         Some(RepoManifestScanState::Missing) => "#8f96a3",
@@ -6104,6 +6252,312 @@ fn build_line_stats_report(
             None => format!("Line stats refreshed for all time ({rows} row(s))."),
         },
     })
+}
+
+fn run_capability_checks(
+    workspace_root: &Path,
+    targets: Vec<CapabilityRunTarget>,
+) -> Result<CapabilityRunReport, String> {
+    let registry_path = default_capability_registry_path(workspace_root);
+    let mut registry =
+        load_capability_registry(&registry_path).map_err(|error| error.to_string())?;
+    let mut lines = Vec::new();
+    let mut run_count = 0usize;
+
+    for target in targets {
+        let snapshot = collect_capability_git_snapshot(&target.repo_path);
+        for capability in target.manifest.capabilities.iter().filter(|capability| {
+            capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
+        }) {
+            run_count += 1;
+            let started = Instant::now();
+            let result =
+                match plan_capability_action(&target.repo_path, &target.manifest, &capability.id) {
+                    Ok(plan) => execute_capability_plan(&target, &plan),
+                    Err(error) => CapabilityResult {
+                        status: CapabilityResultStatus::Error,
+                        summary: error.to_string(),
+                        findings: Vec::new(),
+                    },
+                };
+            let duration_ms = started.elapsed().as_millis() as u64;
+            lines.push(format!(
+                "Capability {} for {}: {} ({})",
+                capability.id,
+                target.repo_name,
+                capability_status_label(result.status),
+                result.summary
+            ));
+            upsert_capability_state(
+                &mut registry,
+                CapabilityState {
+                    repo_id: target.repo_id.clone(),
+                    capability_instance_id: capability.id.clone(),
+                    capability: capability.capability.clone(),
+                    item_id: capability.item_id.clone(),
+                    root: capability.root.clone(),
+                    status: result.status,
+                    summary: result.summary,
+                    findings: result.findings,
+                    checked_at_epoch_secs: Some(current_epoch_secs()),
+                    commit: snapshot.commit.clone(),
+                    dirty: snapshot.dirty,
+                    duration_ms: Some(duration_ms),
+                },
+            );
+        }
+    }
+
+    save_capability_registry(&registry_path, &registry).map_err(|error| error.to_string())?;
+    Ok(CapabilityRunReport {
+        lines,
+        message: format!(
+            "Capability checks completed: {run_count} check(s), registry saved to {}.",
+            registry_path.display()
+        ),
+    })
+}
+
+fn execute_capability_plan(
+    target: &CapabilityRunTarget,
+    plan: &ronomepo_core::CapabilityActionPlan,
+) -> CapabilityResult {
+    let mut aggregate = CapabilityResult {
+        status: CapabilityResultStatus::Ok,
+        summary: format!("{} step(s) completed", plan.steps.len()),
+        findings: Vec::new(),
+    };
+    let mut summaries = Vec::new();
+
+    for step in &plan.steps {
+        let result = match &step.executor {
+            RepoActionExecutor::Command(command) => execute_capability_command(command),
+            RepoActionExecutor::BuiltInInspector => {
+                execute_builtin_capability_inspector(target, step.item_id.as_deref(), plan)
+            }
+        };
+        aggregate.status = worse_capability_status(aggregate.status, result.status);
+        summaries.push(result.summary.clone());
+        aggregate.findings.extend(result.findings);
+        if matches!(
+            plan.failure_policy,
+            ronomepo_core::AggregationFailurePolicy::FailFast
+        ) && matches!(
+            result.status,
+            CapabilityResultStatus::Failed | CapabilityResultStatus::Error
+        ) {
+            break;
+        }
+    }
+
+    if summaries.len() == 1 {
+        aggregate.summary = summaries.remove(0);
+    } else if !summaries.is_empty() {
+        aggregate.summary = summaries.join("; ");
+    }
+    aggregate
+}
+
+fn execute_capability_command(command: &PlannedCommand) -> CapabilityResult {
+    match run_planned_command_to_output(command) {
+        Ok(output) => capability_result_from_command_output(command, output),
+        Err(error) => CapabilityResult {
+            status: CapabilityResultStatus::Error,
+            summary: error,
+            findings: Vec::new(),
+        },
+    }
+}
+
+fn run_planned_command_to_output(command: &PlannedCommand) -> Result<Output, String> {
+    let mut process = Command::new(&command.program);
+    process.args(&command.args);
+    process.current_dir(&command.workdir);
+    process.stdout(Stdio::piped());
+    process.stderr(Stdio::piped());
+    for (key, value) in &command.env {
+        process.env(key, value);
+    }
+
+    let mut child = process
+        .spawn()
+        .map_err(|error| format!("failed to run {}: {error}", planned_command_text(command)))?;
+
+    let Some(timeout_seconds) = command.timeout_seconds else {
+        return child.wait_with_output().map_err(|error| {
+            format!(
+                "failed to collect output from {}: {error}",
+                planned_command_text(command)
+            )
+        });
+    };
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child.wait_with_output().map_err(|error| {
+                    format!(
+                        "failed to collect output from {}: {error}",
+                        planned_command_text(command)
+                    )
+                });
+            }
+            Ok(None) if started.elapsed() >= Duration::from_secs(timeout_seconds) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{} timed out after {} second(s)",
+                    planned_command_text(command),
+                    timeout_seconds
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "failed to wait for {}: {error}",
+                    planned_command_text(command)
+                ));
+            }
+        }
+    }
+}
+
+fn capability_result_from_command_output(
+    command: &PlannedCommand,
+    output: Output,
+) -> CapabilityResult {
+    match command.output {
+        ronomepo_core::ActionOutputMode::Json => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            match parse_capability_result_json(stdout.trim()) {
+                Ok(result) => result,
+                Err(error) => CapabilityResult {
+                    status: CapabilityResultStatus::Error,
+                    summary: format!("invalid capability JSON result: {error}"),
+                    findings: Vec::new(),
+                },
+            }
+        }
+        ronomepo_core::ActionOutputMode::Text | ronomepo_core::ActionOutputMode::JsonLines => {
+            let summary = if output.status.success() {
+                format!("{} succeeded", planned_command_text(command))
+            } else {
+                command_failure_summary(command, &output.stderr)
+            };
+            text_capability_result(output.status.success(), summary)
+        }
+    }
+}
+
+fn execute_builtin_capability_inspector(
+    target: &CapabilityRunTarget,
+    item_id: Option<&str>,
+    plan: &ronomepo_core::CapabilityActionPlan,
+) -> CapabilityResult {
+    if plan.capability != "dependencies.outdated" {
+        return CapabilityResult {
+            status: CapabilityResultStatus::Error,
+            summary: "built-in inspector is not supported for this capability".to_string(),
+            findings: Vec::new(),
+        };
+    }
+
+    match verify_repo_dependencies_freshness(&target.repo_path, &target.manifest) {
+        Ok(reports) => {
+            let mut findings = Vec::new();
+            for report in reports {
+                if item_id.is_some_and(|item_id| report.item_id != item_id) {
+                    continue;
+                }
+                for finding in report.findings {
+                    findings.push(CapabilityFinding {
+                        severity: CapabilityFindingSeverity::Warning,
+                        message: finding.message,
+                        id: None,
+                        file: None,
+                        line: None,
+                        url: None,
+                        suggested_action: None,
+                    });
+                }
+            }
+            let status = if findings.is_empty() {
+                CapabilityResultStatus::Ok
+            } else {
+                CapabilityResultStatus::Warning
+            };
+            let summary = if findings.is_empty() {
+                "No dependency freshness findings".to_string()
+            } else {
+                format!("{} dependency freshness finding(s)", findings.len())
+            };
+            CapabilityResult {
+                status,
+                summary,
+                findings,
+            }
+        }
+        Err(error) => CapabilityResult {
+            status: CapabilityResultStatus::Error,
+            summary: error.to_string(),
+            findings: Vec::new(),
+        },
+    }
+}
+
+fn worse_capability_status(
+    left: CapabilityResultStatus,
+    right: CapabilityResultStatus,
+) -> CapabilityResultStatus {
+    if capability_status_rank(right) > capability_status_rank(left) {
+        right
+    } else {
+        left
+    }
+}
+
+fn capability_status_rank(status: CapabilityResultStatus) -> u8 {
+    match status {
+        CapabilityResultStatus::Ok => 0,
+        CapabilityResultStatus::Unknown => 1,
+        CapabilityResultStatus::Running => 2,
+        CapabilityResultStatus::Stale => 3,
+        CapabilityResultStatus::Warning => 4,
+        CapabilityResultStatus::Failed => 5,
+        CapabilityResultStatus::Error => 6,
+    }
+}
+
+fn capability_status_label(status: CapabilityResultStatus) -> &'static str {
+    match status {
+        CapabilityResultStatus::Ok => "ok",
+        CapabilityResultStatus::Warning => "warning",
+        CapabilityResultStatus::Failed => "failed",
+        CapabilityResultStatus::Error => "error",
+        CapabilityResultStatus::Unknown => "unknown",
+        CapabilityResultStatus::Running => "running",
+        CapabilityResultStatus::Stale => "stale",
+    }
+}
+
+fn planned_command_text(command: &PlannedCommand) -> String {
+    if command.args.is_empty() {
+        command.program.clone()
+    } else {
+        format!("{} {}", command.program, command.args.join(" "))
+    }
+}
+
+fn command_failure_summary(command: &PlannedCommand, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    if stderr.is_empty() {
+        format!("{} failed", planned_command_text(command))
+    } else {
+        format!("{} failed: {stderr}", planned_command_text(command))
+    }
 }
 
 fn save_workspace_manifest_from_inputs(

@@ -4,13 +4,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 pub const MANIFEST_FILE_NAME: &str = "ronomepo.json";
 pub const REPO_MANIFEST_FILE_NAME: &str = "ronomepo.repo.json";
-pub const REPO_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const REPO_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceManifest {
@@ -40,9 +41,78 @@ pub struct RepoManifest {
     #[serde(default)]
     pub items: Vec<RepoItem>,
     #[serde(default)]
+    pub actions: Vec<RepoActionDefinition>,
+    #[serde(default)]
+    pub capabilities: Vec<RepoCapabilityDeclaration>,
+    #[serde(default)]
     pub repo_actions: Vec<RepoActionCommand>,
     #[serde(default)]
     pub aggregation: Vec<RepoActionAggregation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoActionDefinition {
+    pub id: String,
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub workdir: Option<PathBuf>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default = "default_action_output_mode")]
+    pub output: ActionOutputMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RepoCapabilityDeclaration {
+    pub id: String,
+    pub capability: String,
+    pub status: CapabilityDeclarationStatus,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+    #[serde(default)]
+    pub action_ref: Option<RepoActionRef>,
+    #[serde(default)]
+    pub standard_action: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub schedule: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityDeclarationStatus {
+    Implemented,
+    NotApplicable,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepoActionRef {
+    Standard {
+        name: String,
+        #[serde(default)]
+        item_id: Option<String>,
+        #[serde(default)]
+        root: Option<PathBuf>,
+    },
+    RepoAction {
+        id: String,
+    },
+    Group {
+        #[serde(default)]
+        execution: AggregationExecutionMode,
+        #[serde(default)]
+        failure_policy: AggregationFailurePolicy,
+        #[serde(default)]
+        merge: AggregationMergeStrategy,
+        items: Vec<RepoActionRef>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -150,6 +220,22 @@ pub struct RepoActionPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityActionPlan {
+    pub capability_instance_id: String,
+    pub capability: String,
+    pub execution: AggregationExecutionMode,
+    pub failure_policy: AggregationFailurePolicy,
+    pub merge: AggregationMergeStrategy,
+    pub steps: Vec<RepoActionStep>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityGitSnapshot {
+    pub commit: Option<String>,
+    pub dirty: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoActionStep {
     pub item_id: Option<String>,
     pub source: RepoActionSource,
@@ -187,6 +273,126 @@ pub struct ListedArtifact {
     pub path: Option<PathBuf>,
     pub pattern: Option<String>,
     pub build_action: Option<StandardActionName>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityRequirementLevel {
+    Required,
+    Recommended,
+    Optional,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityRequirementScope {
+    Repo,
+    Item,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityDefinition {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub family: &'static str,
+    pub requirement_level: CapabilityRequirementLevel,
+    pub requirement_scope: CapabilityRequirementScope,
+    pub item_types: &'static [&'static str],
+    pub result_schema: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityResultStatus {
+    Ok,
+    Warning,
+    Failed,
+    Error,
+    Unknown,
+    Running,
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityFindingSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityFinding {
+    pub severity: CapabilityFindingSeverity,
+    pub message: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub suggested_action: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityResult {
+    pub status: CapabilityResultStatus,
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<CapabilityFinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityState {
+    pub repo_id: String,
+    pub capability_instance_id: String,
+    pub capability: String,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+    pub status: CapabilityResultStatus,
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<CapabilityFinding>,
+    #[serde(default)]
+    pub checked_at_epoch_secs: Option<u64>,
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub dirty: bool,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityRegistry {
+    #[serde(default = "capability_registry_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub states: Vec<CapabilityState>,
+}
+
+impl Default for CapabilityRegistry {
+    fn default() -> Self {
+        Self {
+            schema_version: capability_registry_schema_version(),
+            states: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityPolicyIssue {
+    pub repo_node_id: String,
+    pub capability: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoCapabilityPolicyReport {
+    pub issues: Vec<CapabilityPolicyIssue>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -254,6 +460,61 @@ fn default_action_output_mode() -> ActionOutputMode {
     ActionOutputMode::Text
 }
 
+fn capability_registry_schema_version() -> u32 {
+    1
+}
+
+pub fn capability_catalog() -> &'static [CapabilityDefinition] {
+    const ITEM_TYPES: &[&str] = &["cargo", "node", "python", "gradle", "gradle_android"];
+    &[
+        CapabilityDefinition {
+            id: "integrity.build",
+            title: "Build",
+            family: "integrity",
+            requirement_level: CapabilityRequirementLevel::Required,
+            requirement_scope: CapabilityRequirementScope::Item,
+            item_types: ITEM_TYPES,
+            result_schema: "integrity_result_v1",
+        },
+        CapabilityDefinition {
+            id: "integrity.test_build",
+            title: "Test Build",
+            family: "integrity",
+            requirement_level: CapabilityRequirementLevel::Required,
+            requirement_scope: CapabilityRequirementScope::Item,
+            item_types: ITEM_TYPES,
+            result_schema: "integrity_result_v1",
+        },
+        CapabilityDefinition {
+            id: "integrity.tests",
+            title: "Tests",
+            family: "integrity",
+            requirement_level: CapabilityRequirementLevel::Required,
+            requirement_scope: CapabilityRequirementScope::Item,
+            item_types: ITEM_TYPES,
+            result_schema: "integrity_result_v1",
+        },
+        CapabilityDefinition {
+            id: "dependencies.outdated",
+            title: "Outdated Dependencies",
+            family: "maintenance",
+            requirement_level: CapabilityRequirementLevel::Required,
+            requirement_scope: CapabilityRequirementScope::Item,
+            item_types: ITEM_TYPES,
+            result_schema: "findings_result_v1",
+        },
+        CapabilityDefinition {
+            id: "observability.production_logs",
+            title: "Production Logs",
+            family: "operations",
+            requirement_level: CapabilityRequirementLevel::Optional,
+            requirement_scope: CapabilityRequirementScope::Repo,
+            item_types: &[],
+            result_schema: "log_stream_v1",
+        },
+    ]
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceSummary {
     pub workspace_name: String,
@@ -289,6 +550,10 @@ pub struct RepoManifestSummary {
     pub item_count: usize,
     pub item_types: Vec<String>,
     pub supported_actions: Vec<StandardActionName>,
+    pub action_count: usize,
+    pub capability_count: usize,
+    pub missing_required_capability_count: usize,
+    pub unsupported_capability_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -487,21 +752,106 @@ pub fn save_repo_manifest(path: &Path, manifest: &RepoManifest) -> Result<(), Wo
     Ok(())
 }
 
+fn validate_node_id(id: &str, label: &str) -> Result<(), WorkspaceError> {
+    if id.trim().is_empty() {
+        return Err(WorkspaceError::InvalidRepoManifest(format!(
+            "{label} id cannot be empty"
+        )));
+    }
+    if id.starts_with('/') || id.ends_with('/') {
+        return Err(WorkspaceError::InvalidRepoManifest(format!(
+            "{label} id {id} must not start or end with /"
+        )));
+    }
+    if id
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(WorkspaceError::InvalidRepoManifest(format!(
+            "{label} id {id} contains an invalid path segment"
+        )));
+    }
+    Ok(())
+}
+
+fn standard_action_name(name: &str) -> Option<StandardActionName> {
+    standard_action_parts(name).map(|(_, action)| action)
+}
+
+fn standard_action_parts(name: &str) -> Option<(&str, StandardActionName)> {
+    let (item_type, action_name) = name.split_once('.')?;
+    if !matches!(
+        item_type,
+        "cargo" | "node" | "python" | "gradle" | "gradle_android"
+    ) {
+        return None;
+    }
+    let action = match action_name {
+        "build" => StandardActionName::Build,
+        "test" | "tests" => StandardActionName::Test,
+        "clean" => StandardActionName::Clean,
+        "dependencies_outdated" | "verify_dependencies_freshness" => {
+            StandardActionName::VerifyDependenciesFreshness
+        }
+        "deploy" => StandardActionName::Deploy,
+        "list_artifacts" => StandardActionName::ListArtifacts,
+        _ => return None,
+    };
+    Some((item_type, action))
+}
+
+fn validate_repo_action_ref(
+    action_ref: &RepoActionRef,
+    action_ids: &BTreeSet<&str>,
+    scope: &str,
+) -> Result<(), WorkspaceError> {
+    match action_ref {
+        RepoActionRef::Standard { name, .. } => {
+            if standard_action_name(name).is_none() {
+                return Err(WorkspaceError::InvalidRepoManifest(format!(
+                    "{scope} references unknown standard action {name}"
+                )));
+            }
+        }
+        RepoActionRef::RepoAction { id } => {
+            if !action_ids.contains(id.as_str()) {
+                return Err(WorkspaceError::InvalidRepoManifest(format!(
+                    "{scope} references unknown repo action {id}"
+                )));
+            }
+        }
+        RepoActionRef::Group { items, .. } => {
+            if items.is_empty() {
+                return Err(WorkspaceError::InvalidRepoManifest(format!(
+                    "{scope} action group must contain at least one item"
+                )));
+            }
+            for item in items {
+                validate_repo_action_ref(item, action_ids, scope)?;
+            }
+        }
+    }
+    Ok(())
+}
 pub fn validate_repo_manifest(manifest: &RepoManifest) -> Result<(), WorkspaceError> {
-    if manifest.schema_version != REPO_MANIFEST_SCHEMA_VERSION {
+    if !matches!(manifest.schema_version, 1 | REPO_MANIFEST_SCHEMA_VERSION) {
         return Err(WorkspaceError::UnsupportedRepoManifestSchemaVersion(
             manifest.schema_version,
         ));
     }
+    if manifest.schema_version == 1
+        && (!manifest.actions.is_empty() || !manifest.capabilities.is_empty())
+    {
+        return Err(WorkspaceError::InvalidRepoManifest(
+            "actions and capabilities require schema_version 2".to_string(),
+        ));
+    }
 
+    let mut seen_node_ids = BTreeSet::new();
     let mut seen_item_ids = BTreeSet::new();
     for item in &manifest.items {
-        if item.id.trim().is_empty() {
-            return Err(WorkspaceError::InvalidRepoManifest(
-                "item id cannot be empty".to_string(),
-            ));
-        }
-        if !seen_item_ids.insert(item.id.clone()) {
+        validate_node_id(&item.id, "item")?;
+        if !seen_item_ids.insert(item.id.clone()) || !seen_node_ids.insert(item.id.clone()) {
             return Err(WorkspaceError::InvalidRepoManifest(format!(
                 "duplicate item id: {}",
                 item.id
@@ -518,11 +868,113 @@ pub fn validate_repo_manifest(manifest: &RepoManifest) -> Result<(), WorkspaceEr
 
     validate_action_commands(&manifest.repo_actions, "repo")?;
 
+    let mut seen_action_ids = BTreeSet::new();
+    for action in &manifest.actions {
+        validate_node_id(&action.id, "action")?;
+        if !seen_action_ids.insert(action.id.as_str()) {
+            return Err(WorkspaceError::InvalidRepoManifest(format!(
+                "duplicate action id: {}",
+                action.id
+            )));
+        }
+        if !seen_node_ids.insert(action.id.clone()) {
+            return Err(WorkspaceError::InvalidRepoManifest(format!(
+                "action id {} collides with another repo node",
+                action.id
+            )));
+        }
+        if action.command.is_empty() || action.command[0].trim().is_empty() {
+            return Err(WorkspaceError::InvalidRepoManifest(format!(
+                "action {} command cannot be empty",
+                action.id
+            )));
+        }
+    }
+
     let item_ids = manifest
         .items
         .iter()
         .map(|item| item.id.as_str())
         .collect::<BTreeSet<_>>();
+    let mut seen_capability_ids = BTreeSet::new();
+    for capability in &manifest.capabilities {
+        validate_node_id(&capability.id, "capability")?;
+        if !seen_capability_ids.insert(capability.id.as_str()) {
+            return Err(WorkspaceError::InvalidRepoManifest(format!(
+                "duplicate capability id: {}",
+                capability.id
+            )));
+        }
+        if capability.capability.trim().is_empty() {
+            return Err(WorkspaceError::InvalidRepoManifest(format!(
+                "capability {} has an empty capability name",
+                capability.id
+            )));
+        }
+        if let Some(item_id) = &capability.item_id {
+            if !item_ids.contains(item_id.as_str()) {
+                return Err(WorkspaceError::InvalidRepoManifest(format!(
+                    "capability {} references unknown item {}",
+                    capability.id, item_id
+                )));
+            }
+        }
+        if capability
+            .root
+            .as_ref()
+            .is_some_and(|root| root.as_os_str().is_empty())
+        {
+            return Err(WorkspaceError::InvalidRepoManifest(format!(
+                "capability {} root cannot be empty",
+                capability.id
+            )));
+        }
+        match capability.status {
+            CapabilityDeclarationStatus::Implemented => {
+                match (&capability.action_ref, &capability.standard_action) {
+                    (Some(_), Some(_)) => {
+                        return Err(WorkspaceError::InvalidRepoManifest(format!(
+                            "capability {} must declare either action_ref or standard_action, not both",
+                            capability.id
+                        )));
+                    }
+                    (None, None) => {
+                        return Err(WorkspaceError::InvalidRepoManifest(format!(
+                            "implemented capability {} must declare action_ref or standard_action",
+                            capability.id
+                        )));
+                    }
+                    (Some(action_ref), None) => validate_repo_action_ref(
+                        action_ref,
+                        &seen_action_ids,
+                        &format!("capability {}", capability.id),
+                    )?,
+                    (None, Some(name)) => {
+                        if standard_action_name(name).is_none() {
+                            return Err(WorkspaceError::InvalidRepoManifest(format!(
+                                "capability {} references unknown standard action {}",
+                                capability.id, name
+                            )));
+                        }
+                    }
+                }
+            }
+            CapabilityDeclarationStatus::NotApplicable => {
+                if capability
+                    .reason
+                    .as_ref()
+                    .is_none_or(|reason| reason.trim().is_empty())
+                {
+                    return Err(WorkspaceError::InvalidRepoManifest(format!(
+                        "not_applicable capability {} must include a reason",
+                        capability.id
+                    )));
+                }
+            }
+            CapabilityDeclarationStatus::Unsupported => {}
+        }
+    }
+
     let mut seen_aggregations = BTreeSet::new();
     for aggregation in &manifest.aggregation {
         if !seen_aggregations.insert(aggregation.action) {
@@ -571,6 +1023,79 @@ fn validate_action_commands(
         }
     }
     Ok(())
+}
+
+pub fn assess_repo_capability_policy(manifest: &RepoManifest) -> RepoCapabilityPolicyReport {
+    let mut issues = Vec::new();
+    for definition in capability_catalog()
+        .iter()
+        .filter(|definition| definition.requirement_level == CapabilityRequirementLevel::Required)
+    {
+        match definition.requirement_scope {
+            CapabilityRequirementScope::Repo => {
+                assess_capability_scope(
+                    manifest,
+                    definition,
+                    None,
+                    None,
+                    "repo".to_string(),
+                    &mut issues,
+                );
+            }
+            CapabilityRequirementScope::Item => {
+                for item in manifest
+                    .items
+                    .iter()
+                    .filter(|item| definition.item_types.contains(&item.item_type.as_str()))
+                {
+                    assess_capability_scope(
+                        manifest,
+                        definition,
+                        Some(item.id.as_str()),
+                        Some(item.path.as_path()),
+                        item.id.clone(),
+                        &mut issues,
+                    );
+                }
+            }
+        }
+    }
+    RepoCapabilityPolicyReport { issues }
+}
+
+fn assess_capability_scope(
+    manifest: &RepoManifest,
+    definition: &CapabilityDefinition,
+    item_id: Option<&str>,
+    root: Option<&Path>,
+    repo_node_id: String,
+    issues: &mut Vec<CapabilityPolicyIssue>,
+) {
+    let declaration = manifest.capabilities.iter().find(|declaration| {
+        declaration.capability == definition.id
+            && match item_id {
+                Some(item_id) => {
+                    declaration.item_id.as_deref() == Some(item_id)
+                        || root.is_some_and(|root| declaration.root.as_deref() == Some(root))
+                }
+                None => declaration.item_id.is_none() && declaration.root.is_none(),
+            }
+    });
+
+    match declaration.map(|declaration| declaration.status) {
+        Some(CapabilityDeclarationStatus::Implemented)
+        | Some(CapabilityDeclarationStatus::NotApplicable) => {}
+        Some(CapabilityDeclarationStatus::Unsupported) => issues.push(CapabilityPolicyIssue {
+            repo_node_id,
+            capability: definition.id.to_string(),
+            message: format!("required capability {} is unsupported", definition.id),
+        }),
+        None => issues.push(CapabilityPolicyIssue {
+            repo_node_id,
+            capability: definition.id.to_string(),
+            message: format!("missing required capability {}", definition.id),
+        }),
+    }
 }
 
 pub fn plan_item_action(
@@ -677,6 +1202,236 @@ pub fn plan_repo_action(
         merge: aggregation.merge,
         steps,
     })
+}
+
+pub fn plan_capability_action(
+    repo_root: &Path,
+    manifest: &RepoManifest,
+    capability_instance_id: &str,
+) -> Result<CapabilityActionPlan, WorkspaceError> {
+    validate_repo_manifest(manifest)?;
+    let capability = manifest
+        .capabilities
+        .iter()
+        .find(|capability| capability.id == capability_instance_id)
+        .ok_or_else(|| {
+            WorkspaceError::InvalidRepoManifest(format!(
+                "unknown capability id: {capability_instance_id}"
+            ))
+        })?;
+
+    if capability.status != CapabilityDeclarationStatus::Implemented {
+        return Err(WorkspaceError::InvalidRepoManifest(format!(
+            "capability {} is not implemented",
+            capability.id
+        )));
+    }
+
+    let action_ref = capability_action_ref(capability)?;
+    let mut plan = CapabilityActionPlan {
+        capability_instance_id: capability.id.clone(),
+        capability: capability.capability.clone(),
+        execution: AggregationExecutionMode::Sequential,
+        failure_policy: AggregationFailurePolicy::FailFast,
+        merge: AggregationMergeStrategy::Combined,
+        steps: Vec::new(),
+    };
+    add_capability_action_ref_steps(repo_root, manifest, capability, &action_ref, &mut plan)?;
+    Ok(plan)
+}
+
+fn capability_action_ref(
+    capability: &RepoCapabilityDeclaration,
+) -> Result<RepoActionRef, WorkspaceError> {
+    match (&capability.action_ref, &capability.standard_action) {
+        (Some(action_ref), None) => Ok(action_ref.clone()),
+        (None, Some(name)) => Ok(RepoActionRef::Standard {
+            name: name.clone(),
+            item_id: capability.item_id.clone(),
+            root: capability.root.clone(),
+        }),
+        _ => Err(WorkspaceError::InvalidRepoManifest(format!(
+            "implemented capability {} must declare exactly one action reference",
+            capability.id
+        ))),
+    }
+}
+
+fn add_capability_action_ref_steps(
+    repo_root: &Path,
+    manifest: &RepoManifest,
+    capability: &RepoCapabilityDeclaration,
+    action_ref: &RepoActionRef,
+    plan: &mut CapabilityActionPlan,
+) -> Result<(), WorkspaceError> {
+    match action_ref {
+        RepoActionRef::Standard {
+            name,
+            item_id,
+            root,
+        } => {
+            let (standard_item_type, action) = standard_action_parts(name).ok_or_else(|| {
+                WorkspaceError::InvalidRepoManifest(format!(
+                    "capability {} references unknown standard action {}",
+                    capability.id, name
+                ))
+            })?;
+            let item = resolve_capability_item(
+                manifest,
+                item_id.as_deref().or(capability.item_id.as_deref()),
+                root.as_deref().or(capability.root.as_deref()),
+                &capability.id,
+            )?;
+            if item.item_type != standard_item_type {
+                return Err(WorkspaceError::InvalidRepoManifest(format!(
+                    "capability {} standard action {} expects item type {}, got {}",
+                    capability.id, name, standard_item_type, item.item_type
+                )));
+            }
+            plan.steps.push(plan_item_step(repo_root, item, action)?);
+        }
+        RepoActionRef::RepoAction { id } => {
+            let action = manifest
+                .actions
+                .iter()
+                .find(|action| &action.id == id)
+                .ok_or_else(|| {
+                    WorkspaceError::InvalidRepoManifest(format!(
+                        "capability {} references unknown repo action {}",
+                        capability.id, id
+                    ))
+                })?;
+            plan.steps.push(RepoActionStep {
+                item_id: capability.item_id.clone(),
+                source: RepoActionSource::RepoCommand,
+                executor: RepoActionExecutor::Command(command_from_repo_action_definition(
+                    repo_root, action,
+                )),
+            });
+        }
+        RepoActionRef::Group {
+            execution,
+            failure_policy,
+            merge,
+            items,
+        } => {
+            plan.execution = *execution;
+            plan.failure_policy = *failure_policy;
+            plan.merge = *merge;
+            for item in items {
+                add_capability_action_ref_steps(repo_root, manifest, capability, item, plan)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_capability_item<'a>(
+    manifest: &'a RepoManifest,
+    item_id: Option<&str>,
+    root: Option<&Path>,
+    capability_id: &str,
+) -> Result<&'a RepoItem, WorkspaceError> {
+    if let Some(item_id) = item_id {
+        return manifest
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .ok_or_else(|| {
+                WorkspaceError::InvalidRepoManifest(format!(
+                    "capability {capability_id} references unknown item {item_id}"
+                ))
+            });
+    }
+    if let Some(root) = root {
+        let matches = manifest
+            .items
+            .iter()
+            .filter(|item| item.path == root)
+            .collect::<Vec<_>>();
+        return match matches.as_slice() {
+            [item] => Ok(item),
+            [] => Err(WorkspaceError::InvalidRepoManifest(format!(
+                "capability {capability_id} root {} does not match a repo item",
+                root.display()
+            ))),
+            _ => Err(WorkspaceError::InvalidRepoManifest(format!(
+                "capability {capability_id} root {} matches multiple repo items",
+                root.display()
+            ))),
+        };
+    }
+    Err(WorkspaceError::InvalidRepoManifest(format!(
+        "capability {capability_id} standard action requires item_id or root"
+    )))
+}
+
+pub fn default_capability_registry_path(workspace_root: &Path) -> PathBuf {
+    workspace_root
+        .join(".ronomepo")
+        .join("capability-state.json")
+}
+
+pub fn load_capability_registry(path: &Path) -> Result<CapabilityRegistry, WorkspaceError> {
+    if !path.exists() {
+        return Ok(CapabilityRegistry::default());
+    }
+    let content = fs::read_to_string(path)?;
+    let registry = serde_json::from_str(&content)?;
+    Ok(registry)
+}
+
+pub fn save_capability_registry(
+    path: &Path,
+    registry: &CapabilityRegistry,
+) -> Result<(), WorkspaceError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(registry)?;
+    fs::write(path, content)?;
+    Ok(())
+}
+
+pub fn upsert_capability_state(registry: &mut CapabilityRegistry, state: CapabilityState) {
+    if let Some(existing) = registry.states.iter_mut().find(|existing| {
+        existing.repo_id == state.repo_id
+            && existing.capability_instance_id == state.capability_instance_id
+    }) {
+        *existing = state;
+    } else {
+        registry.states.push(state);
+    }
+}
+
+pub fn parse_capability_result_json(raw: &str) -> Result<CapabilityResult, WorkspaceError> {
+    Ok(serde_json::from_str(raw)?)
+}
+
+pub fn text_capability_result(success: bool, summary: impl Into<String>) -> CapabilityResult {
+    CapabilityResult {
+        status: if success {
+            CapabilityResultStatus::Ok
+        } else {
+            CapabilityResultStatus::Failed
+        },
+        summary: summary.into(),
+        findings: Vec::new(),
+    }
+}
+
+pub fn collect_capability_git_snapshot(repo_path: &Path) -> CapabilityGitSnapshot {
+    CapabilityGitSnapshot {
+        commit: git_stdout(repo_path, ["rev-parse", "HEAD"]),
+        dirty: !matches!(repository_state(repo_path), RepositoryState::Clean),
+    }
+}
+
+pub fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn plan_item_step(
@@ -1030,6 +1785,34 @@ fn command_from_definition(base: &Path, action: &RepoActionCommand) -> PlannedCo
             }
         })
         .unwrap_or_else(|| base.to_path_buf());
+
+    PlannedCommand {
+        program,
+        args,
+        workdir,
+        env: action.env.clone(),
+        timeout_seconds: action.timeout_seconds,
+        output: action.output,
+    }
+}
+
+fn command_from_repo_action_definition(
+    repo_root: &Path,
+    action: &RepoActionDefinition,
+) -> PlannedCommand {
+    let program = action.command[0].clone();
+    let args = action.command.iter().skip(1).cloned().collect();
+    let workdir = action
+        .workdir
+        .as_ref()
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                repo_root.join(path)
+            }
+        })
+        .unwrap_or_else(|| repo_root.to_path_buf());
 
     PlannedCommand {
         program,
@@ -1446,10 +2229,27 @@ fn repo_manifest_summary(repo_root: &Path, manifest: &RepoManifest) -> RepoManif
         .collect::<Vec<_>>();
     supported_actions.sort();
 
+    let policy_report = assess_repo_capability_policy(manifest);
+    let unsupported_capability_count = manifest
+        .capabilities
+        .iter()
+        .filter(|capability| capability.status == CapabilityDeclarationStatus::Unsupported)
+        .count();
+
     RepoManifestSummary {
         item_count: manifest.items.len(),
         item_types,
         supported_actions,
+        action_count: manifest.actions.len()
+            + manifest.repo_actions.len()
+            + manifest
+                .items
+                .iter()
+                .map(|item| item.actions.len())
+                .sum::<usize>(),
+        capability_count: manifest.capabilities.len(),
+        missing_required_capability_count: policy_report.issues.len(),
+        unsupported_capability_count,
     }
 }
 
@@ -1546,17 +2346,19 @@ pub fn collect_repository_details(repo_path: &Path) -> RepositoryDetails {
                     .collect()
             })
             .unwrap_or_default(),
-        last_commit: git_stdout(repo_path, ["log", "-1", "--format=%h|%s|%ct"]).and_then(|output| {
-            let mut parts = output.splitn(3, '|');
-            let short_sha = parts.next()?;
-            let subject = parts.next()?;
-            let committed_at_epoch_secs = parts.next()?.parse().ok()?;
-            Some(LastCommitInfo {
-                short_sha: short_sha.to_string(),
-                subject: subject.to_string(),
-                committed_at_epoch_secs,
-            })
-        }),
+        last_commit: git_stdout(repo_path, ["log", "-1", "--format=%h|%s|%ct"]).and_then(
+            |output| {
+                let mut parts = output.splitn(3, '|');
+                let short_sha = parts.next()?;
+                let subject = parts.next()?;
+                let committed_at_epoch_secs = parts.next()?.parse().ok()?;
+                Some(LastCommitInfo {
+                    short_sha: short_sha.to_string(),
+                    subject: subject.to_string(),
+                    committed_at_epoch_secs,
+                })
+            },
+        ),
         changed_files: git_stdout(repo_path, ["status", "--short"])
             .map(|output| {
                 output
@@ -2629,6 +3431,8 @@ mod tests {
                 }],
                 actions: Vec::new(),
             }],
+            actions: Vec::new(),
+            capabilities: Vec::new(),
             repo_actions: Vec::new(),
             aggregation: Vec::new(),
         };
@@ -2644,6 +3448,8 @@ mod tests {
             schema_version: 99,
             repo_id: None,
             items: Vec::new(),
+            actions: Vec::new(),
+            capabilities: Vec::new(),
             repo_actions: Vec::new(),
             aggregation: Vec::new(),
         };
@@ -2678,6 +3484,8 @@ mod tests {
                     actions: Vec::new(),
                 },
             ],
+            actions: Vec::new(),
+            capabilities: Vec::new(),
             repo_actions: Vec::new(),
             aggregation: Vec::new(),
         };
@@ -2707,6 +3515,8 @@ mod tests {
                 artifacts: Vec::new(),
                 actions: Vec::new(),
             }],
+            actions: Vec::new(),
+            capabilities: Vec::new(),
             repo_actions: Vec::new(),
             aggregation: Vec::new(),
         };
@@ -2767,6 +3577,8 @@ mod tests {
                     actions: Vec::new(),
                 },
             ],
+            actions: Vec::new(),
+            capabilities: Vec::new(),
             repo_actions: Vec::new(),
             aggregation: Vec::new(),
         };
@@ -2807,6 +3619,8 @@ mod tests {
                     actions: Vec::new(),
                 },
             ],
+            actions: Vec::new(),
+            capabilities: Vec::new(),
             repo_actions: Vec::new(),
             aggregation: vec![RepoActionAggregation {
                 action: StandardActionName::Test,
@@ -2848,6 +3662,8 @@ mod tests {
                     output: ActionOutputMode::Text,
                 }],
             }],
+            actions: Vec::new(),
+            capabilities: Vec::new(),
             repo_actions: Vec::new(),
             aggregation: Vec::new(),
         };
@@ -2890,6 +3706,8 @@ mod tests {
                 }],
                 actions: Vec::new(),
             }],
+            actions: Vec::new(),
+            capabilities: Vec::new(),
             repo_actions: Vec::new(),
             aggregation: Vec::new(),
         };
@@ -2923,6 +3741,8 @@ mod tests {
                 artifacts: Vec::new(),
                 actions: Vec::new(),
             }],
+            actions: Vec::new(),
+            capabilities: Vec::new(),
             repo_actions: Vec::new(),
             aggregation: Vec::new(),
         };
@@ -2951,6 +3771,8 @@ mod tests {
                 artifacts: Vec::new(),
                 actions: Vec::new(),
             }],
+            actions: Vec::new(),
+            capabilities: Vec::new(),
             repo_actions: vec![RepoActionCommand {
                 action: StandardActionName::Deploy,
                 command: vec!["./scripts/deploy.sh".to_string(), "--prod".to_string()],
@@ -3010,6 +3832,8 @@ mod tests {
                 artifacts: Vec::new(),
                 actions: Vec::new(),
             }],
+            actions: Vec::new(),
+            capabilities: Vec::new(),
             repo_actions: Vec::new(),
             aggregation: Vec::new(),
         };
@@ -3078,6 +3902,8 @@ mod tests {
                 artifacts: Vec::new(),
                 actions: Vec::new(),
             }],
+            actions: Vec::new(),
+            capabilities: Vec::new(),
             repo_actions: Vec::new(),
             aggregation: Vec::new(),
         };
@@ -3157,6 +3983,8 @@ mod tests {
                         }],
                     },
                 ],
+                actions: Vec::new(),
+                capabilities: Vec::new(),
                 repo_actions: vec![RepoActionCommand {
                     action: StandardActionName::Deploy,
                     command: vec!["./deploy.sh".to_string()],
@@ -3245,6 +4073,8 @@ mod tests {
                     artifacts: Vec::new(),
                     actions: Vec::new(),
                 }],
+                actions: Vec::new(),
+                capabilities: Vec::new(),
                 repo_actions: Vec::new(),
                 aggregation: Vec::new(),
             },
@@ -3606,6 +4436,152 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.repository_name.as_deref() == Some("(monorepo)")));
+    }
+
+    #[test]
+    fn capability_policy_reports_missing_required_item_capabilities() {
+        let manifest = RepoManifest {
+            schema_version: REPO_MANIFEST_SCHEMA_VERSION,
+            repo_id: Some("sample".to_string()),
+            items: vec![RepoItem {
+                id: "server".to_string(),
+                item_type: "cargo".to_string(),
+                path: PathBuf::from("server"),
+                config: None,
+                artifacts: Vec::new(),
+                actions: Vec::new(),
+            }],
+            actions: Vec::new(),
+            capabilities: Vec::new(),
+            repo_actions: Vec::new(),
+            aggregation: Vec::new(),
+        };
+
+        let report = assess_repo_capability_policy(&manifest);
+        assert_eq!(report.issues.len(), 4);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.capability == "dependencies.outdated"));
+    }
+
+    #[test]
+    fn not_applicable_required_capability_needs_reason() {
+        let manifest = RepoManifest {
+            schema_version: REPO_MANIFEST_SCHEMA_VERSION,
+            repo_id: Some("sample".to_string()),
+            items: vec![RepoItem {
+                id: "script".to_string(),
+                item_type: "python".to_string(),
+                path: PathBuf::from("."),
+                config: None,
+                artifacts: Vec::new(),
+                actions: Vec::new(),
+            }],
+            actions: Vec::new(),
+            capabilities: vec![RepoCapabilityDeclaration {
+                id: "script/dependencies/outdated".to_string(),
+                capability: "dependencies.outdated".to_string(),
+                status: CapabilityDeclarationStatus::NotApplicable,
+                item_id: Some("script".to_string()),
+                root: None,
+                action_ref: None,
+                standard_action: None,
+                reason: None,
+                schedule: None,
+            }],
+            repo_actions: Vec::new(),
+            aggregation: Vec::new(),
+        };
+
+        let error = validate_repo_manifest(&manifest).unwrap_err();
+        assert!(
+            matches!(error, WorkspaceError::InvalidRepoManifest(message) if message.contains("must include a reason"))
+        );
+    }
+
+    #[test]
+    fn capability_can_plan_repo_defined_action() {
+        let repo_root = temp_dir_path("capability-plan");
+        let manifest = RepoManifest {
+            schema_version: REPO_MANIFEST_SCHEMA_VERSION,
+            repo_id: Some("sample".to_string()),
+            items: vec![RepoItem {
+                id: "server".to_string(),
+                item_type: "cargo".to_string(),
+                path: PathBuf::from("server"),
+                config: None,
+                artifacts: Vec::new(),
+                actions: Vec::new(),
+            }],
+            actions: vec![RepoActionDefinition {
+                id: "server/dependencies/outdated".to_string(),
+                command: vec!["./scripts/check-deps".to_string()],
+                workdir: Some(PathBuf::from("server")),
+                env: BTreeMap::new(),
+                timeout_seconds: Some(120),
+                output: ActionOutputMode::Json,
+            }],
+            capabilities: vec![RepoCapabilityDeclaration {
+                id: "server/dependencies/outdated-capability".to_string(),
+                capability: "dependencies.outdated".to_string(),
+                status: CapabilityDeclarationStatus::Implemented,
+                item_id: Some("server".to_string()),
+                root: None,
+                action_ref: Some(RepoActionRef::RepoAction {
+                    id: "server/dependencies/outdated".to_string(),
+                }),
+                standard_action: None,
+                reason: None,
+                schedule: None,
+            }],
+            repo_actions: Vec::new(),
+            aggregation: Vec::new(),
+        };
+
+        let plan = plan_capability_action(
+            &repo_root,
+            &manifest,
+            "server/dependencies/outdated-capability",
+        )
+        .unwrap();
+        assert_eq!(plan.capability, "dependencies.outdated");
+        assert_eq!(plan.steps.len(), 1);
+        match &plan.steps[0].executor {
+            RepoActionExecutor::Command(command) => {
+                assert_eq!(command.program, "./scripts/check-deps");
+                assert_eq!(command.workdir, repo_root.join("server"));
+                assert_eq!(command.output, ActionOutputMode::Json);
+            }
+            RepoActionExecutor::BuiltInInspector => panic!("expected command executor"),
+        }
+    }
+
+    #[test]
+    fn capability_registry_round_trips_json() {
+        let path = temp_file_path("capability-registry");
+        let registry = CapabilityRegistry {
+            schema_version: 1,
+            states: vec![CapabilityState {
+                repo_id: "sample".to_string(),
+                capability_instance_id: "server/test".to_string(),
+                capability: "integrity.tests".to_string(),
+                item_id: Some("server".to_string()),
+                root: Some(PathBuf::from("server")),
+                status: CapabilityResultStatus::Ok,
+                summary: "Tests passed".to_string(),
+                findings: Vec::new(),
+                checked_at_epoch_secs: Some(1),
+                commit: Some("abc".to_string()),
+                dirty: false,
+                duration_ms: Some(42),
+            }],
+        };
+
+        save_capability_registry(&path, &registry).unwrap();
+        let loaded = load_capability_registry(&path).unwrap();
+        assert_eq!(loaded, registry);
+        fs::remove_file(path).unwrap();
     }
 
     fn init_git_repo(path: &Path) {

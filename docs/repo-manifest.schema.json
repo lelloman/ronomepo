@@ -5,12 +5,18 @@
   "description": "Versioned manifest for a managed repository exposed to Ronomepo and agents.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "items"],
+  "required": [
+    "schema_version",
+    "items"
+  ],
   "properties": {
     "schema_version": {
       "type": "integer",
-      "const": 1,
-      "description": "Manifest schema version. Only version 1 is valid."
+      "enum": [
+        1,
+        2
+      ],
+      "description": "Manifest schema version. Version 2 adds repo-defined actions and capability declarations; version 1 remains accepted for compatibility."
     },
     "repo_id": {
       "type": "string",
@@ -24,9 +30,25 @@
         "$ref": "#/$defs/item"
       }
     },
+    "actions": {
+      "type": "array",
+      "description": "Schema v2 repo-defined executable action nodes.",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/repo_action_definition"
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "description": "Schema v2 capability declarations implemented, not applicable, or unsupported by repo nodes.",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/capability_declaration"
+      }
+    },
     "repo_actions": {
       "type": "array",
-      "description": "Explicit repo-level commands for standardized actions.",
+      "description": "Legacy explicit repo-level commands for standardized actions.",
       "default": [],
       "items": {
         "$ref": "#/$defs/action_command"
@@ -42,6 +64,11 @@
     }
   },
   "$defs": {
+    "node_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.\\.?(?:/|$)).*[^/]$"
+    },
     "standard_action": {
       "type": "string",
       "enum": [
@@ -53,34 +80,71 @@
         "deploy"
       ]
     },
+    "standard_action_ref_name": {
+      "type": "string",
+      "pattern": "^(cargo|node|python|gradle|gradle_android)\\.(list_artifacts|build|test|tests|clean|verify_dependencies_freshness|dependencies_outdated|deploy)$"
+    },
     "output_mode": {
       "type": "string",
-      "enum": ["text", "json", "json_lines"],
+      "enum": [
+        "text",
+        "json",
+        "json_lines"
+      ],
       "default": "text"
     },
     "execution_mode": {
       "type": "string",
-      "enum": ["sequential", "parallel"],
+      "enum": [
+        "sequential",
+        "parallel"
+      ],
       "default": "sequential"
     },
     "failure_policy": {
       "type": "string",
-      "enum": ["fail_fast", "continue"],
+      "enum": [
+        "fail_fast",
+        "continue"
+      ],
       "default": "fail_fast"
     },
     "merge_strategy": {
       "type": "string",
-      "enum": ["combined", "per_item"],
+      "enum": [
+        "combined",
+        "per_item"
+      ],
       "default": "combined"
     },
     "relative_or_absolute_path": {
       "type": "string",
       "minLength": 1
     },
+    "env": {
+      "type": "object",
+      "description": "Environment variables for the command.",
+      "default": {},
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "argv-style command. The first item is the program."
+    },
     "artifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "kind"],
+      "required": [
+        "name",
+        "kind"
+      ],
       "properties": {
         "name": {
           "type": "string",
@@ -104,38 +168,38 @@
         }
       },
       "anyOf": [
-        { "required": ["path"] },
-        { "required": ["pattern"] }
+        {
+          "required": [
+            "path"
+          ]
+        },
+        {
+          "required": [
+            "pattern"
+          ]
+        }
       ]
     },
     "action_command": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["action", "command"],
+      "required": [
+        "action",
+        "command"
+      ],
       "properties": {
         "action": {
           "$ref": "#/$defs/standard_action"
         },
         "command": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "description": "argv-style command. The first item is the program."
+          "$ref": "#/$defs/argv"
         },
         "workdir": {
           "$ref": "#/$defs/relative_or_absolute_path",
           "description": "Working directory relative to the item or repo root."
         },
         "env": {
-          "type": "object",
-          "description": "Environment variables for the command.",
-          "default": {},
-          "additionalProperties": {
-            "type": "string"
-          }
+          "$ref": "#/$defs/env"
         },
         "timeout_seconds": {
           "type": "integer",
@@ -146,10 +210,162 @@
         }
       }
     },
+    "repo_action_definition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "command"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/node_id"
+        },
+        "command": {
+          "$ref": "#/$defs/argv"
+        },
+        "workdir": {
+          "$ref": "#/$defs/relative_or_absolute_path",
+          "description": "Working directory relative to the repository root unless absolute."
+        },
+        "env": {
+          "$ref": "#/$defs/env"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "output": {
+          "$ref": "#/$defs/output_mode"
+        }
+      }
+    },
+    "action_ref": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ],
+          "properties": {
+            "kind": {
+              "const": "standard"
+            },
+            "name": {
+              "$ref": "#/$defs/standard_action_ref_name"
+            },
+            "item_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "root": {
+              "$ref": "#/$defs/relative_or_absolute_path"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "id"
+          ],
+          "properties": {
+            "kind": {
+              "const": "repo_action"
+            },
+            "id": {
+              "$ref": "#/$defs/node_id"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "items"
+          ],
+          "properties": {
+            "kind": {
+              "const": "group"
+            },
+            "execution": {
+              "$ref": "#/$defs/execution_mode"
+            },
+            "failure_policy": {
+              "$ref": "#/$defs/failure_policy"
+            },
+            "merge": {
+              "$ref": "#/$defs/merge_strategy"
+            },
+            "items": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/action_ref"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "capability_declaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "capability",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/node_id"
+        },
+        "capability": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Catalog capability id, for example integrity.build or dependencies.outdated."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "implemented",
+            "not_applicable",
+            "unsupported"
+          ]
+        },
+        "item_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "root": {
+          "$ref": "#/$defs/relative_or_absolute_path"
+        },
+        "action_ref": {
+          "$ref": "#/$defs/action_ref"
+        },
+        "standard_action": {
+          "$ref": "#/$defs/standard_action_ref_name"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "schedule": {
+          "description": "Future scheduling policy payload; currently stored but not interpreted."
+        }
+      }
+    },
     "action_aggregation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["action", "item_ids"],
+      "required": [
+        "action",
+        "item_ids"
+      ],
       "properties": {
         "action": {
           "$ref": "#/$defs/standard_action"
@@ -176,11 +392,14 @@
     "item": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "type", "path"],
+      "required": [
+        "id",
+        "type",
+        "path"
+      ],
       "properties": {
         "id": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/node_id"
         },
         "type": {
           "type": "string",

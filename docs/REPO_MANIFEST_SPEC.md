@@ -1,6 +1,6 @@
 # Repo Manifest Specification
 
-This document defines the version `1` contract for `ronomepo.repo.json`.
+This document defines the version `2` contract for `ronomepo.repo.json`. Ronomepo still accepts version `1` manifests for compatibility, but repo-defined actions and capabilities require `schema_version: 2`.
 
 The machine-readable schema lives at [repo-manifest.schema.json](./repo-manifest.schema.json). This document defines the semantics, defaults, and invariants that repositories should follow when authoring manifests.
 
@@ -30,13 +30,21 @@ It must live at the repository root.
 
 The manifest root is a JSON object with these fields:
 
-- `schema_version`: required integer, must be `1`
+- `schema_version`: required integer, `1` or `2`; use `2` for actions and capabilities
 - `repo_id`: optional string, stable logical identifier for the repository
 - `items`: required array of item definitions
-- `repo_actions`: optional array of repo-level action commands
+- `actions`: optional array of schema v2 repo-defined action nodes
+- `capabilities`: optional array of schema v2 capability declarations
+- `repo_actions`: optional legacy array of repo-level action commands for standardized actions
 - `aggregation`: optional array of repo-level aggregation rules
 
 Unknown top-level properties are not allowed.
+
+Schema v1 compatibility rules:
+
+- `schema_version: 1` may use `items`, `repo_actions`, and `aggregation`
+- `actions` and `capabilities` require `schema_version: 2`
+- Ronomepo scans both versions, but new repositories should use version `2`
 
 ## Standardized Actions
 
@@ -49,7 +57,7 @@ Ronomepo reserves these action names:
 - `verify_dependencies_freshness`
 - `deploy`
 
-These names are the stable public contract. Repositories do not invent new action names inside the manifest.
+These names are the stable public contract. Repositories do not invent new names for legacy `items[].actions`, `repo_actions`, or `aggregation`. Schema v2 `actions[]` may use repo-local path-like ids because those are addressable action nodes, not standardized action names.
 
 ## Items
 
@@ -82,6 +90,114 @@ Current built-in item types:
 - `node`
 
 Unknown item types are allowed by the schema, but Ronomepo only provides built-in behavior for the known types above. Unknown types require explicit commands for any action that should be executable.
+
+## Addressable Repo Nodes
+
+Schema v2 introduces repo-local node ids. Node ids are path-like strings without a leading slash. They are Ronomepo addresses, not filesystem paths.
+
+Examples:
+
+- `build`
+- `server`
+- `server/build`
+- `server/dependencies/outdated`
+
+Node ids must not be empty, start or end with `/`, contain empty path segments, or contain `.` / `..` segments. Item ids and repo-defined action ids share one namespace and must not collide. Capability ids are stable capability instance ids; they identify capability state records in the registry.
+
+## Repo-Defined Actions
+
+Schema v2 `actions[]` defines executable action nodes that can be run directly or referenced by capabilities.
+
+Fields:
+
+- `id`: stable repo-local node id
+- `command`: argv array, first element is the program
+- `workdir`: optional working directory relative to the repository root unless absolute
+- `env`: optional string-to-string environment map
+- `timeout_seconds`: optional positive integer timeout
+- `output`: optional output mode, defaulting to `text`
+
+Repo-defined actions are for concrete execution mechanics. They do not carry capability policy by themselves.
+
+## Capabilities
+
+Schema v2 `capabilities[]` declares what operational contracts a repo exposes. A capability declaration is an instance, so a repository may declare multiple `integrity.build`, `integrity.tests`, or `dependencies.outdated` capabilities for different items or roots.
+
+Fields:
+
+- `id`: stable capability instance id inside the repo
+- `capability`: catalog capability id, such as `integrity.build` or `dependencies.outdated`
+- `status`: `implemented`, `not_applicable`, or `unsupported`
+- `item_id`: optional item this capability applies to
+- `root`: optional project root, relative to the repository root unless absolute
+- `action_ref`: optional action reference used when `status` is `implemented`
+- `standard_action`: optional shorthand for a standard action reference
+- `reason`: required when `status` is `not_applicable`
+- `schedule`: optional future scheduling policy payload; currently stored but not interpreted
+
+Implemented capabilities must declare exactly one of `action_ref` or `standard_action`. `not_applicable` satisfies required capability policy only when it includes a reason. `unsupported` is valid syntax but remains a policy issue because the repo explicitly says the required automation is not available.
+
+Built-in required capability catalog for item types `cargo`, `node`, `python`, `gradle`, and `gradle_android`:
+
+- `integrity.build`
+- `integrity.test_build`
+- `integrity.tests`
+- `dependencies.outdated`
+
+Optional built-in capability:
+
+- `observability.production_logs`
+
+Custom capability ids are allowed so repo manifests can evolve before Ronomepo has a built-in catalog entry. Custom capabilities are not required by default.
+
+## Action References
+
+Capabilities reference executable actions through one of these forms.
+
+Standard action reference:
+
+```json
+{ "kind": "standard", "name": "cargo.test", "item_id": "server" }
+```
+
+Repo-defined action reference:
+
+```json
+{ "kind": "repo_action", "id": "server/dependencies/outdated" }
+```
+
+Group reference:
+
+```json
+{
+  "kind": "group",
+  "execution": "parallel",
+  "failure_policy": "fail_fast",
+  "merge": "combined",
+  "items": [
+    { "kind": "standard", "name": "cargo.build", "item_id": "server" },
+    { "kind": "standard", "name": "gradle_android.build", "item_id": "android" }
+  ]
+}
+```
+
+Supported standard action reference names are `<item-type>.<action>`, where item type is one of `cargo`, `node`, `python`, `gradle`, or `gradle_android`. Supported action suffixes are `list_artifacts`, `build`, `test`, `tests`, `clean`, `verify_dependencies_freshness`, `dependencies_outdated`, and `deploy`.
+
+## Capability Results And Registry
+
+Actions referenced by capabilities may emit JSON using the minimum result schema:
+
+```json
+{
+  "status": "ok",
+  "summary": "Tests passed",
+  "findings": []
+}
+```
+
+Valid result statuses are `ok`, `warning`, `failed`, `error`, `unknown`, `running`, and `stale`. A finding must include `severity` and `message`; optional fields include `id`, `file`, `line`, `url`, and `suggested_action`.
+
+Ronomepo stores latest capability state in `.ronomepo/capability-state.json` under the workspace root. The registry stores capability-dependent observed state only. The repo manifest and Git state remain observed from their source files/worktrees.
 
 ## Action Commands
 
@@ -304,7 +420,7 @@ Ronomepo semantic validation additionally enforces:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "repo_id": "sample-product",
   "items": [
     {
@@ -331,6 +447,76 @@ Ronomepo semantic validation additionally enforces:
           "timeout_seconds": 120
         }
       ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "python-tools/dependencies/outdated",
+      "command": ["python", "scripts/check_outdated_dependencies.py"],
+      "workdir": "tools",
+      "output": "json",
+      "timeout_seconds": 120
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "desktop-app/build",
+      "capability": "integrity.build",
+      "status": "implemented",
+      "item_id": "desktop-app",
+      "standard_action": "cargo.build"
+    },
+    {
+      "id": "desktop-app/test-build",
+      "capability": "integrity.test_build",
+      "status": "implemented",
+      "item_id": "desktop-app",
+      "standard_action": "cargo.test"
+    },
+    {
+      "id": "desktop-app/tests",
+      "capability": "integrity.tests",
+      "status": "implemented",
+      "item_id": "desktop-app",
+      "standard_action": "cargo.test"
+    },
+    {
+      "id": "desktop-app/dependencies/outdated",
+      "capability": "dependencies.outdated",
+      "status": "implemented",
+      "item_id": "desktop-app",
+      "standard_action": "cargo.dependencies_outdated"
+    },
+    {
+      "id": "python-tools/build",
+      "capability": "integrity.build",
+      "status": "not_applicable",
+      "item_id": "python-tools",
+      "reason": "The tools package is script-only and has no build step."
+    },
+    {
+      "id": "python-tools/test-build",
+      "capability": "integrity.test_build",
+      "status": "not_applicable",
+      "item_id": "python-tools",
+      "reason": "Python tests are interpreted and do not have a separate compile step."
+    },
+    {
+      "id": "python-tools/tests",
+      "capability": "integrity.tests",
+      "status": "implemented",
+      "item_id": "python-tools",
+      "standard_action": "python.test"
+    },
+    {
+      "id": "python-tools/dependencies/outdated-capability",
+      "capability": "dependencies.outdated",
+      "status": "implemented",
+      "item_id": "python-tools",
+      "action_ref": {
+        "kind": "repo_action",
+        "id": "python-tools/dependencies/outdated"
+      }
     }
   ],
   "repo_actions": [

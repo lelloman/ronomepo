@@ -1,8 +1,10 @@
 # Capabilities, Registry, And Attention ProposalThis document captures the proposed direction for expanding Ronomepo from a
 Git-state monitor into a broader repository operations hub.
 
-It is a design note, not the current `ronomepo.repo.json` contract. The current
-repo manifest remains defined by `REPO_MANIFEST_SPEC.md`.
+It started as a design note. The first implementation slice is now reflected in
+`REPO_MANIFEST_SPEC.md`: schema v2 repo-defined actions, capability declarations,
+capability policy assessment, and a JSON capability-state registry. Scheduling,
+custom reactions, and richer attention modelling remain future work.
 
 ## Motivation
 
