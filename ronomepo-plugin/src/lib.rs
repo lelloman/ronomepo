@@ -4001,11 +4001,27 @@ fn capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'static 
     }
 }
 
-fn run_selected_repo_capability_checks() {
-    let (targets, scope) = capability_check_targets_from_state();
+fn stale_capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'static str) {
+    let snapshot = snapshot();
+    let items = repository_items(&snapshot);
+    let selected = selected_repository_items(&snapshot, &items);
+    let scope = if selected.is_empty() {
+        "workspace"
+    } else {
+        "selected"
+    };
+    let source_items = if selected.is_empty() { items } else { selected };
+    let stale_items = source_items
+        .into_iter()
+        .filter(|item| repo_has_stale_or_unknown_capability_result(&snapshot, item))
+        .collect::<Vec<_>>();
+    (repo_capability_targets_from_items(stale_items), scope)
+}
+
+fn submit_capability_check_targets(targets: Vec<CapabilityRunTarget>, scope: &str, mode: &str) {
     if targets.is_empty() {
         append_log(format!(
-            "Capability checks skipped because no {scope} repo exposes implemented capabilities."
+            "Capability checks skipped because no {scope} repo has {mode} implemented capabilities."
         ));
         return;
     }
@@ -4022,12 +4038,22 @@ fn run_selected_repo_capability_checks() {
         },
     ) {
         Ok(true) => append_log(format!(
-            "Running capability checks for {repo_count} {scope} repo(s)."
+            "Running {mode} capability checks for {repo_count} {scope} repo(s)."
         )),
         Ok(false) => append_log("Capability checks are already running.".to_string()),
         Err(message) => append_log(format!("Capability checks failed to start: {message}")),
     }
     refresh_views();
+}
+
+fn run_selected_repo_capability_checks() {
+    let (targets, scope) = capability_check_targets_from_state();
+    submit_capability_check_targets(targets, scope, "all");
+}
+
+fn run_stale_repo_capability_checks() {
+    let (targets, scope) = stale_capability_check_targets_from_state();
+    submit_capability_check_targets(targets, scope, "stale");
 }
 
 fn run_selected_repo_manifest_action(action: StandardActionName) {
@@ -4598,17 +4624,42 @@ fn capability_monitor_summary(
     summary
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapabilityStaleReason {
+    DirtyWorktree,
+    CommitChanged,
+}
+
+fn capability_stale_reason(
+    item: &RepositoryListItem,
+    state: &CapabilityState,
+    dirty_now: bool,
+) -> Option<CapabilityStaleReason> {
+    if dirty_now {
+        return Some(CapabilityStaleReason::DirtyWorktree);
+    }
+    state
+        .commit
+        .as_ref()
+        .zip(item.status.head_commit.as_ref())
+        .and_then(|(recorded, current)| {
+            (recorded != current).then_some(CapabilityStaleReason::CommitChanged)
+        })
+}
+
 fn capability_state_is_stale(
     item: &RepositoryListItem,
     state: &CapabilityState,
     dirty_now: bool,
 ) -> bool {
-    dirty_now
-        || state
-            .commit
-            .as_ref()
-            .zip(item.status.head_commit.as_ref())
-            .is_some_and(|(recorded, current)| recorded != current)
+    capability_stale_reason(item, state, dirty_now).is_some()
+}
+
+fn capability_stale_reason_label(reason: CapabilityStaleReason) -> &'static str {
+    match reason {
+        CapabilityStaleReason::DirtyWorktree => "dirty worktree",
+        CapabilityStaleReason::CommitChanged => "commit changed",
+    }
 }
 
 fn capability_monitor_label(summary: &CapabilityMonitorSummary) -> &'static str {
@@ -4743,17 +4794,27 @@ fn repo_capability_detail_lines(
         match capability.status {
             ronomepo_core::CapabilityDeclarationStatus::Implemented => {
                 if let Some(state) = state {
-                    let status = if dirty_now {
+                    let stale_reason = capability_stale_reason(item, state, dirty_now);
+                    let status = if stale_reason.is_some() {
                         CapabilityResultStatus::Stale
                     } else {
                         state.status
                     };
+                    let summary = stale_reason
+                        .map(|reason| {
+                            format!(
+                                "{} (stale: {})",
+                                state.summary,
+                                capability_stale_reason_label(reason)
+                            )
+                        })
+                        .unwrap_or_else(|| state.summary.clone());
                     lines.push(format!(
                         "{} | {} | {} | {}",
                         capability.id,
                         capability.capability,
                         capability_status_label(status),
-                        state.summary
+                        summary
                     ));
                     for finding in state.findings.iter().take(3) {
                         lines.push(format!(
@@ -4820,12 +4881,31 @@ fn capability_registry_only_lines(
         .iter()
         .filter(|state| state.repo_id == item.id)
         .map(|state| {
+            let dirty_now = matches!(
+                item.status.state,
+                ronomepo_core::RepositoryState::Dirty | ronomepo_core::RepositoryState::Untracked
+            );
+            let stale_reason = capability_stale_reason(item, state, dirty_now);
+            let status = if stale_reason.is_some() {
+                CapabilityResultStatus::Stale
+            } else {
+                state.status
+            };
+            let summary = stale_reason
+                .map(|reason| {
+                    format!(
+                        "{} (stale: {})",
+                        state.summary,
+                        capability_stale_reason_label(reason)
+                    )
+                })
+                .unwrap_or_else(|| state.summary.clone());
             format!(
                 "{} | {} | {} | {}",
                 state.capability_instance_id,
                 state.capability,
-                capability_status_label(state.status),
-                state.summary
+                capability_status_label(status),
+                summary
             )
         })
         .collect()
@@ -4847,6 +4927,14 @@ fn capability_finding_severity_label(severity: CapabilityFindingSeverity) -> &'s
         CapabilityFindingSeverity::Warning => "warning",
         CapabilityFindingSeverity::Error => "error",
     }
+}
+
+fn repo_has_stale_or_unknown_capability_result(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+) -> bool {
+    let summary = capability_monitor_summary(item, snapshot);
+    summary.stale > 0 || summary.unknown > 0
 }
 
 fn repo_needs_capability_attention(snapshot: &StateSnapshot, item: &RepositoryListItem) -> bool {
@@ -7902,6 +7990,12 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
         run_selected_repo_capability_checks();
     });
     actions.append(&capability_checks);
+
+    let stale_capability_checks = Button::with_label("Stale Cap Checks");
+    stale_capability_checks.connect_clicked(|_| {
+        run_stale_repo_capability_checks();
+    });
+    actions.append(&stale_capability_checks);
 
     let all_time = Button::with_label("All Time");
     all_time.set_sensitive(!snapshot.line_stats_loading);
