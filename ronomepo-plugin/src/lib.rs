@@ -38,14 +38,14 @@ use maruzzella_sdk::{
 };
 use notify::{Config as NotifyConfig, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use ronomepo_core::{
-    build_repository_list, collect_capability_git_snapshot, collect_commit_check_report,
-    collect_repository_details, collect_workspace_line_stats, current_epoch_secs,
-    default_capability_registry_path, default_commit_check_rules, default_manifest_path,
-    derive_dir_name, ensure_commit_check_rules_initialized, format_sync_label, import_repos_txt,
-    list_repo_artifacts, load_capability_registry, load_manifest, load_repo_manifest,
-    normalize_workspace_root, parse_capability_result_json, plan_capability_action,
-    plan_repo_action, run_workspace_operation, save_capability_registry, save_manifest,
-    scan_repo_manifest, text_capability_result, upsert_capability_state,
+    assess_repo_capability_policy, build_repository_list, collect_capability_git_snapshot,
+    collect_commit_check_report, collect_repository_details, collect_workspace_line_stats,
+    current_epoch_secs, default_capability_registry_path, default_commit_check_rules,
+    default_manifest_path, derive_dir_name, ensure_commit_check_rules_initialized,
+    format_sync_label, import_repos_txt, list_repo_artifacts, load_capability_registry,
+    load_manifest, load_repo_manifest, normalize_workspace_root, parse_capability_result_json,
+    plan_capability_action, plan_repo_action, run_workspace_operation, save_capability_registry,
+    save_manifest, scan_repo_manifest, text_capability_result, upsert_capability_state,
     verify_repo_dependencies_freshness, workspace_summary, CapabilityFinding,
     CapabilityFindingSeverity, CapabilityRegistry, CapabilityResult, CapabilityResultStatus,
     CapabilityState, CommitCheckRule, CommitCheckRuleEffect, CommitCheckRuleMatcher,
@@ -4654,6 +4654,177 @@ fn capability_monitor_search_text(item: &RepositoryListItem, snapshot: &StateSna
     )
 }
 
+fn workspace_capability_attention_lines(
+    snapshot: &StateSnapshot,
+    items: &[RepositoryListItem],
+) -> Vec<String> {
+    let mut lines = items
+        .iter()
+        .filter(|item| repo_needs_capability_attention(snapshot, item))
+        .map(|item| {
+            let summary = capability_monitor_summary(item, snapshot);
+            format!(
+                "{} | {} | policy {} | unsupported {} | failed {} | error {} | warning {} | stale {} | unknown {}",
+                item.name,
+                capability_monitor_label(&summary),
+                summary.policy_issues,
+                summary.unsupported,
+                summary.failed,
+                summary.error,
+                summary.warning,
+                summary.stale,
+                summary.unknown
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.sort();
+    lines
+}
+
+fn repo_capability_detail_lines(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some(scan) = item.repo_manifest.as_ref() else {
+        return capability_registry_only_lines(snapshot, item);
+    };
+    let RepoManifestScanState::Valid(_) = &scan.state else {
+        return capability_registry_only_lines(snapshot, item);
+    };
+
+    let manifest = match load_repo_manifest(&scan.path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            lines.push(format!("Manifest could not be loaded: {error}"));
+            lines.extend(capability_registry_only_lines(snapshot, item));
+            return lines;
+        }
+    };
+
+    let policy = assess_repo_capability_policy(&manifest);
+    for issue in policy.issues {
+        lines.push(format!(
+            "policy | {} | {} | {}",
+            issue.repo_node_id, issue.capability, issue.message
+        ));
+    }
+
+    let dirty_now = matches!(
+        item.status.state,
+        ronomepo_core::RepositoryState::Dirty | ronomepo_core::RepositoryState::Untracked
+    );
+    for capability in &manifest.capabilities {
+        let state = capability_registry_state(snapshot, &item.id, &capability.id);
+        match capability.status {
+            ronomepo_core::CapabilityDeclarationStatus::Implemented => {
+                if let Some(state) = state {
+                    let status = if dirty_now {
+                        CapabilityResultStatus::Stale
+                    } else {
+                        state.status
+                    };
+                    lines.push(format!(
+                        "{} | {} | {} | {}",
+                        capability.id,
+                        capability.capability,
+                        capability_status_label(status),
+                        state.summary
+                    ));
+                    for finding in state.findings.iter().take(3) {
+                        lines.push(format!(
+                            "  finding | {} | {}",
+                            capability_finding_severity_label(finding.severity),
+                            finding.message
+                        ));
+                    }
+                    if state.findings.len() > 3 {
+                        lines.push(format!("  finding | +{} more", state.findings.len() - 3));
+                    }
+                } else {
+                    lines.push(format!(
+                        "{} | {} | unknown | no recorded result",
+                        capability.id, capability.capability
+                    ));
+                }
+            }
+            ronomepo_core::CapabilityDeclarationStatus::NotApplicable => lines.push(format!(
+                "{} | {} | not_applicable | {}",
+                capability.id,
+                capability.capability,
+                capability.reason.as_deref().unwrap_or("no reason recorded")
+            )),
+            ronomepo_core::CapabilityDeclarationStatus::Unsupported => lines.push(format!(
+                "{} | {} | unsupported | {}",
+                capability.id,
+                capability.capability,
+                capability.reason.as_deref().unwrap_or("no reason recorded")
+            )),
+        }
+    }
+
+    let declared_ids = manifest
+        .capabilities
+        .iter()
+        .map(|capability| capability.id.as_str())
+        .collect::<HashSet<_>>();
+    for state in snapshot
+        .capability_registry
+        .states
+        .iter()
+        .filter(|state| state.repo_id == item.id)
+        .filter(|state| !declared_ids.contains(state.capability_instance_id.as_str()))
+    {
+        lines.push(format!(
+            "{} | {} | {} | registry state has no current manifest declaration",
+            state.capability_instance_id,
+            state.capability,
+            capability_status_label(state.status)
+        ));
+    }
+
+    lines
+}
+
+fn capability_registry_only_lines(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+) -> Vec<String> {
+    snapshot
+        .capability_registry
+        .states
+        .iter()
+        .filter(|state| state.repo_id == item.id)
+        .map(|state| {
+            format!(
+                "{} | {} | {} | {}",
+                state.capability_instance_id,
+                state.capability,
+                capability_status_label(state.status),
+                state.summary
+            )
+        })
+        .collect()
+}
+
+fn capability_registry_state<'a>(
+    snapshot: &'a StateSnapshot,
+    repo_id: &str,
+    capability_instance_id: &str,
+) -> Option<&'a CapabilityState> {
+    snapshot.capability_registry.states.iter().find(|state| {
+        state.repo_id == repo_id && state.capability_instance_id == capability_instance_id
+    })
+}
+
+fn capability_finding_severity_label(severity: CapabilityFindingSeverity) -> &'static str {
+    match severity {
+        CapabilityFindingSeverity::Info => "info",
+        CapabilityFindingSeverity::Warning => "warning",
+        CapabilityFindingSeverity::Error => "error",
+    }
+}
+
 fn repo_needs_capability_attention(snapshot: &StateSnapshot, item: &RepositoryListItem) -> bool {
     let summary = capability_monitor_summary(item, snapshot);
     summary.policy_issues > 0
@@ -4912,6 +5083,10 @@ fn render_monorepo_overview_into(
         .iter()
         .filter(|item| repo_attention_rank(snapshot, item) < 7)
         .count();
+    let capability_attention = items
+        .iter()
+        .filter(|item| repo_needs_capability_attention(snapshot, item))
+        .count();
     let selected = selected_repository_items(snapshot, &items);
 
     let hero = GtkBox::new(Orientation::Vertical, 8);
@@ -4937,6 +5112,7 @@ fn render_monorepo_overview_into(
         ("Behind", behind),
         ("Diverged", diverged),
         ("No Upstream", no_upstream),
+        ("Cap Issues", capability_attention),
     ] {
         stats.append(&stat_card(label, &value.to_string()));
     }
@@ -4997,6 +5173,12 @@ fn render_monorepo_overview_into(
         &selected,
         Some(8),
         host_ptr,
+    );
+    append_lines_section(
+        &sections,
+        "Capability Attention",
+        &workspace_capability_attention_lines(snapshot, &items),
+        "No capability policy or check result needs attention.",
     );
     append_lines_section(
         &sections,
@@ -6957,6 +7139,10 @@ fn render_repo_overview_into(
         ("State", status_label(&item.status.state).to_string()),
         ("Sync", format_sync_label(&item.status.sync)),
         (
+            "Caps",
+            capability_monitor_label(&capability_monitor_summary(item, snapshot)).to_string(),
+        ),
+        (
             "Selected",
             if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
                 "Yes".to_string()
@@ -6993,6 +7179,12 @@ fn render_repo_overview_into(
         &sections,
         "Action Eligibility",
         &repo_action_eligibility(item),
+    );
+    append_lines_section(
+        &sections,
+        "Capabilities",
+        &repo_capability_detail_lines(snapshot, item),
+        "No capabilities declared or recorded for this repository.",
     );
     append_overview_section(
         &sections,
@@ -7511,6 +7703,7 @@ fn repo_overview_actions(
         ("Open In Editor", None),
         ("Edit README", None),
         ("Edit .git/config", None),
+        ("Run Cap Checks", None),
         ("Clone Repo", Some(OperationKind::CloneMissing)),
         ("Pull Repo", Some(OperationKind::Pull)),
         ("Push Repo", Some(OperationKind::Push)),
@@ -7540,6 +7733,10 @@ fn repo_overview_actions(
             }
             "Edit .git/config" => {
                 open_text_editor_for_path(host_ptr, &repo_path.join(".git/config"));
+            }
+            "Run Cap Checks" => {
+                set_selected_repo_ids(vec![repo_id.clone()]);
+                run_selected_repo_capability_checks();
             }
             _ => {
                 set_selected_repo_ids(vec![repo_id.clone()]);
@@ -7675,6 +7872,12 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
         snapshot.line_stats_loading,
         command_line_stats,
     ));
+
+    let capability_checks = Button::with_label("Capability Checks");
+    capability_checks.connect_clicked(|_| {
+        run_selected_repo_capability_checks();
+    });
+    actions.append(&capability_checks);
 
     let all_time = Button::with_label("All Time");
     all_time.set_sensitive(!snapshot.line_stats_loading);
