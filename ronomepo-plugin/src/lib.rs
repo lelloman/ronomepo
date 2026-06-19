@@ -901,6 +901,7 @@ fn empty_repository_status(repo_path: PathBuf) -> ronomepo_core::RepositoryStatu
         state: ronomepo_core::RepositoryState::Unknown,
         branch: None,
         sync: ronomepo_core::RepositorySync::Unknown,
+        head_commit: None,
         repo_path,
     }
 }
@@ -4577,7 +4578,7 @@ fn capability_monitor_summary(
         .filter(|state| state.repo_id == item.id)
     {
         summary.stored += 1;
-        let status = if dirty_now {
+        let status = if capability_state_is_stale(item, state, dirty_now) {
             CapabilityResultStatus::Stale
         } else {
             state.status
@@ -4595,6 +4596,19 @@ fn capability_monitor_summary(
 
     summary.unknown += declared.saturating_sub(summary.stored);
     summary
+}
+
+fn capability_state_is_stale(
+    item: &RepositoryListItem,
+    state: &CapabilityState,
+    dirty_now: bool,
+) -> bool {
+    dirty_now
+        || state
+            .commit
+            .as_ref()
+            .zip(item.status.head_commit.as_ref())
+            .is_some_and(|(recorded, current)| recorded != current)
 }
 
 fn capability_monitor_label(summary: &CapabilityMonitorSummary) -> &'static str {
@@ -8893,6 +8907,7 @@ mod tests {
                 state,
                 branch: Some("main".to_string()),
                 sync,
+                head_commit: Some("abc123".to_string()),
                 repo_path: PathBuf::from(name),
             },
             repo_manifest: None,
@@ -9071,6 +9086,7 @@ mod tests {
                 state: RepositoryState::Clean,
                 branch: Some("main".to_string()),
                 sync: RepositorySync::UpToDate,
+                head_commit: Some("abc123".to_string()),
                 repo_path: repo_path.clone(),
             },
             repo_manifest: Some(RepoManifestScan {

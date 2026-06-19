@@ -561,6 +561,7 @@ pub struct RepositoryStatus {
     pub state: RepositoryState,
     pub branch: Option<String>,
     pub sync: RepositorySync,
+    pub head_commit: Option<String>,
     pub repo_path: PathBuf,
 }
 
@@ -2299,6 +2300,7 @@ pub fn collect_repository_status(repo_path: &Path) -> RepositoryStatus {
             state: RepositoryState::Missing,
             branch: None,
             sync: RepositorySync::NoUpstream,
+            head_commit: None,
             repo_path: repo_path.to_path_buf(),
         };
     }
@@ -2306,11 +2308,13 @@ pub fn collect_repository_status(repo_path: &Path) -> RepositoryStatus {
     let branch = current_branch(repo_path);
     let state = repository_state(repo_path);
     let sync = repository_sync(repo_path);
+    let head_commit = git_stdout(repo_path, ["rev-parse", "HEAD"]);
 
     RepositoryStatus {
         state,
         branch,
         sync,
+        head_commit,
         repo_path: repo_path.to_path_buf(),
     }
 }
@@ -4101,6 +4105,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status.state, RepositoryState::Clean);
         assert_eq!(items[0].status.branch.as_deref(), Some("main"));
+        assert!(items[0].status.head_commit.is_some());
         assert!(matches!(
             items[0].repo_manifest.as_ref().map(|scan| &scan.state),
             Some(RepoManifestScanState::Valid(_))
@@ -4113,6 +4118,7 @@ mod tests {
         let status = collect_repository_status(&path);
         assert_eq!(status.state, RepositoryState::Missing);
         assert_eq!(status.branch, None);
+        assert_eq!(status.head_commit, None);
     }
 
     #[test]
@@ -4123,6 +4129,7 @@ mod tests {
 
         let status = collect_repository_status(&repo_path);
         assert_eq!(status.state, RepositoryState::Untracked);
+        assert!(status.head_commit.is_some());
     }
 
     #[test]
