@@ -3965,8 +3965,8 @@ fn selected_repo_manifest_targets(
         .collect()
 }
 
-fn selected_repo_capability_targets() -> Vec<CapabilityRunTarget> {
-    selected_repository_items_from_state()
+fn repo_capability_targets_from_items(items: Vec<RepositoryListItem>) -> Vec<CapabilityRunTarget> {
+    items
         .into_iter()
         .filter_map(|item| {
             let scan = item.repo_manifest.as_ref()?;
@@ -3989,13 +3989,23 @@ fn selected_repo_capability_targets() -> Vec<CapabilityRunTarget> {
         .collect()
 }
 
+fn capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'static str) {
+    let snapshot = snapshot();
+    let items = repository_items(&snapshot);
+    let selected = selected_repository_items(&snapshot, &items);
+    if selected.is_empty() {
+        (repo_capability_targets_from_items(items), "workspace")
+    } else {
+        (repo_capability_targets_from_items(selected), "selected")
+    }
+}
+
 fn run_selected_repo_capability_checks() {
-    let targets = selected_repo_capability_targets();
+    let (targets, scope) = capability_check_targets_from_state();
     if targets.is_empty() {
-        append_log(
-            "Capability checks skipped because no selected repo exposes implemented capabilities."
-                .to_string(),
-        );
+        append_log(format!(
+            "Capability checks skipped because no {scope} repo exposes implemented capabilities."
+        ));
         return;
     }
     let workspace_root = {
@@ -4011,7 +4021,7 @@ fn run_selected_repo_capability_checks() {
         },
     ) {
         Ok(true) => append_log(format!(
-            "Running capability checks for {repo_count} selected repo(s)."
+            "Running capability checks for {repo_count} {scope} repo(s)."
         )),
         Ok(false) => append_log("Capability checks are already running.".to_string()),
         Err(message) => append_log(format!("Capability checks failed to start: {message}")),
