@@ -47,11 +47,11 @@ use ronomepo_core::{
     plan_repo_action, run_workspace_operation, save_capability_registry, save_manifest,
     scan_repo_manifest, text_capability_result, upsert_capability_state,
     verify_repo_dependencies_freshness, workspace_summary, CapabilityFinding,
-    CapabilityFindingSeverity, CapabilityResult, CapabilityResultStatus, CapabilityState,
-    CommitCheckRule, CommitCheckRuleEffect, CommitCheckRuleMatcher, CommitCheckRuleScope,
-    OperationEvent, OperationEventKind, OperationKind, PlannedCommand, RepoActionExecutor,
-    RepoManifest, RepoManifestScan, RepoManifestScanState, RepositoryDetails, RepositoryEntry,
-    RepositoryListItem, RepositoryStatus, StandardActionName, WorkspaceManifest,
+    CapabilityFindingSeverity, CapabilityRegistry, CapabilityResult, CapabilityResultStatus,
+    CapabilityState, CommitCheckRule, CommitCheckRuleEffect, CommitCheckRuleMatcher,
+    CommitCheckRuleScope, OperationEvent, OperationEventKind, OperationKind, PlannedCommand,
+    RepoActionExecutor, RepoManifest, RepoManifestScan, RepoManifestScanState, RepositoryDetails,
+    RepositoryEntry, RepositoryListItem, RepositoryStatus, StandardActionName, WorkspaceManifest,
     MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
@@ -81,10 +81,12 @@ const MONITOR_NAME_COL_CHARS: i32 = 28;
 const MONITOR_BRANCH_COL_CHARS: i32 = 14;
 const MONITOR_MANIFEST_COL_CHARS: i32 = 12;
 const MONITOR_STATE_COL_CHARS: i32 = 12;
+const MONITOR_CAPABILITY_COL_CHARS: i32 = 10;
 const MONITOR_NAME_COL_WIDTH: i32 = 300;
 const MONITOR_BRANCH_COL_WIDTH: i32 = 120;
 const MONITOR_MANIFEST_COL_WIDTH: i32 = 120;
 const MONITOR_STATE_COL_WIDTH: i32 = 120;
+const MONITOR_CAPABILITY_COL_WIDTH: i32 = 96;
 const WORKER_POOL_SIZE: usize = 4;
 const LOCAL_RESCAN_INTERVAL_SECS: u32 = 5 * 60;
 const REMOTE_FETCH_TICK_SECS: u32 = 30;
@@ -2150,6 +2152,7 @@ struct StateSnapshot {
     line_stats_report: Vec<String>,
     line_stats_loading: bool,
     line_stats_since: String,
+    capability_registry: CapabilityRegistry,
 }
 
 fn snapshot() -> StateSnapshot {
@@ -2174,6 +2177,10 @@ fn snapshot() -> StateSnapshot {
         line_stats_report: app_state.line_stats_report.clone(),
         line_stats_loading: app_state.line_stats_loading,
         line_stats_since: app_state.line_stats_since.clone(),
+        capability_registry: load_capability_registry(&default_capability_registry_path(
+            &app_state.workspace_root,
+        ))
+        .unwrap_or_default(),
     }
 }
 
@@ -2383,7 +2390,7 @@ fn repo_item_from_object(object: &glib::Object) -> Option<RepositoryListItem> {
 }
 
 fn repo_monitor_filter_matches(item: &RepositoryListItem, snapshot: &StateSnapshot) -> bool {
-    if !matches_filter_mode(item, snapshot.monitor_filter_mode) {
+    if !matches_filter_mode(item, snapshot.monitor_filter_mode, snapshot) {
         return false;
     }
     let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
@@ -2394,6 +2401,7 @@ fn repo_monitor_filter_matches(item: &RepositoryListItem, snapshot: &StateSnapsh
     let sync = format_sync_label(&item.status.sync).to_ascii_lowercase();
     let state = status_label(&item.status.state).to_ascii_lowercase();
     let manifest = manifest_presence_search_text(item.repo_manifest.as_ref()).to_ascii_lowercase();
+    let capability = capability_monitor_search_text(item, snapshot).to_ascii_lowercase();
     item.name.to_ascii_lowercase().contains(&filter)
         || item.dir_name.to_ascii_lowercase().contains(&filter)
         || item.remote_url.to_ascii_lowercase().contains(&filter)
@@ -2401,6 +2409,7 @@ fn repo_monitor_filter_matches(item: &RepositoryListItem, snapshot: &StateSnapsh
         || sync.contains(&filter)
         || state.contains(&filter)
         || manifest.contains(&filter)
+        || capability.contains(&filter)
 }
 
 fn build_repo_monitor_row(
@@ -2433,6 +2442,8 @@ fn build_repo_monitor_row(
         false,
     );
     let manifest = monitor_manifest_cell(item.repo_manifest.as_ref());
+    let current_snapshot = snapshot();
+    let capability = monitor_capability_cell(item, &current_snapshot);
     let status = monitor_state_cell(&item.status.state);
 
     let sync = monitor_sync_cell(&item.status.sync);
@@ -2440,6 +2451,7 @@ fn build_repo_monitor_row(
     content.append(&name);
     content.append(&branch);
     content.append(&manifest);
+    content.append(&capability);
     content.append(&status);
     content.append(&sync);
     attach_repo_monitor_context_menu(&content, host_ptr);
@@ -2474,7 +2486,7 @@ fn filtered_repository_items(
     items.sort_by(|left, right| repo_monitor_sort_cmp(snapshot, left, right));
 
     let mode = snapshot.monitor_filter_mode;
-    items.retain(|item| matches_filter_mode(item, mode));
+    items.retain(|item| matches_filter_mode(item, mode, snapshot));
 
     let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
     if filter.is_empty() {
@@ -2573,12 +2585,16 @@ fn repo_last_activity_sort_key(
         .unwrap_or(i64::MIN);
     (
         committed_at_epoch_secs,
-        repo_attention_rank(item),
+        repo_attention_rank(snapshot, item),
         item.name.to_ascii_lowercase(),
     )
 }
 
-fn matches_filter_mode(item: &RepositoryListItem, mode: MonitorFilterMode) -> bool {
+fn matches_filter_mode(
+    item: &RepositoryListItem,
+    mode: MonitorFilterMode,
+    snapshot: &StateSnapshot,
+) -> bool {
     use ronomepo_core::{RepositoryState, RepositorySync};
 
     match mode {
@@ -2603,12 +2619,12 @@ fn matches_filter_mode(item: &RepositoryListItem, mode: MonitorFilterMode) -> bo
                 RepositorySync::Diverged { .. }
                     | RepositorySync::NoUpstream
                     | RepositorySync::Unknown
-            ) || repo_manifest_has_policy_issues(item)
+            ) || repo_needs_capability_attention(snapshot, item)
         }
     }
 }
 
-fn repo_attention_rank(item: &RepositoryListItem) -> u8 {
+fn repo_attention_rank(snapshot: &StateSnapshot, item: &RepositoryListItem) -> u8 {
     use ronomepo_core::{RepositoryState, RepositorySync};
 
     match (&item.status.state, &item.status.sync) {
@@ -2619,18 +2635,9 @@ fn repo_attention_rank(item: &RepositoryListItem) -> u8 {
         (_, RepositorySync::Ahead(_)) => 4,
         (RepositoryState::Unknown, _) | (_, RepositorySync::Unknown) => 5,
         (_, RepositorySync::NoUpstream) => 6,
-        _ if repo_manifest_has_policy_issues(item) => 6,
+        _ if repo_needs_capability_attention(snapshot, item) => 6,
         _ => 7,
     }
-}
-
-fn repo_manifest_has_policy_issues(item: &RepositoryListItem) -> bool {
-    matches!(
-        item.repo_manifest.as_ref().map(|scan| &scan.state),
-        Some(RepoManifestScanState::Valid(summary))
-            if summary.missing_required_capability_count > 0
-                || summary.unsupported_capability_count > 0
-    )
 }
 
 fn repo_sync_state_sort_key(item: &RepositoryListItem) -> (u8, usize, u8, String) {
@@ -4473,6 +4480,12 @@ fn repo_monitor_header() -> GtkBox {
         MONITOR_MANIFEST_COL_WIDTH,
         false,
     );
+    let capability = monitor_text_cell(
+        "Caps",
+        MONITOR_CAPABILITY_COL_CHARS,
+        MONITOR_CAPABILITY_COL_WIDTH,
+        false,
+    );
     let state = monitor_text_cell(
         "State",
         MONITOR_STATE_COL_CHARS,
@@ -4484,7 +4497,7 @@ fn repo_monitor_header() -> GtkBox {
     sync.set_hexpand(true);
     sync.set_ellipsize(EllipsizeMode::End);
 
-    for label in [&name, &branch, &manifest, &state, &sync] {
+    for label in [&name, &branch, &manifest, &capability, &state, &sync] {
         label.add_css_class("dim-label");
         header.append(label);
     }
@@ -4501,6 +4514,172 @@ fn monitor_text_cell(text: &str, width_chars: i32, width_px: i32, expand: bool) 
     label.set_size_request(width_px, -1);
     label.set_ellipsize(EllipsizeMode::End);
     label.set_hexpand(expand);
+    label
+}
+
+#[derive(Clone, Debug, Default)]
+struct CapabilityMonitorSummary {
+    declared: usize,
+    stored: usize,
+    ok: usize,
+    warning: usize,
+    failed: usize,
+    error: usize,
+    unknown: usize,
+    running: usize,
+    stale: usize,
+    policy_issues: usize,
+    unsupported: usize,
+}
+
+fn capability_monitor_summary(
+    item: &RepositoryListItem,
+    snapshot: &StateSnapshot,
+) -> CapabilityMonitorSummary {
+    if item.id == MONOREPO_ROW_ID {
+        return CapabilityMonitorSummary::default();
+    }
+
+    let (declared, policy_issues, unsupported) =
+        match item.repo_manifest.as_ref().map(|scan| &scan.state) {
+            Some(RepoManifestScanState::Valid(summary)) => (
+                summary.capability_count,
+                summary.missing_required_capability_count,
+                summary.unsupported_capability_count,
+            ),
+            _ => (0, 0, 0),
+        };
+    let mut summary = CapabilityMonitorSummary {
+        declared,
+        policy_issues,
+        unsupported,
+        ..CapabilityMonitorSummary::default()
+    };
+    let dirty_now = matches!(
+        item.status.state,
+        ronomepo_core::RepositoryState::Dirty | ronomepo_core::RepositoryState::Untracked
+    );
+
+    for state in snapshot
+        .capability_registry
+        .states
+        .iter()
+        .filter(|state| state.repo_id == item.id)
+    {
+        summary.stored += 1;
+        let status = if dirty_now {
+            CapabilityResultStatus::Stale
+        } else {
+            state.status
+        };
+        match status {
+            CapabilityResultStatus::Ok => summary.ok += 1,
+            CapabilityResultStatus::Warning => summary.warning += 1,
+            CapabilityResultStatus::Failed => summary.failed += 1,
+            CapabilityResultStatus::Error => summary.error += 1,
+            CapabilityResultStatus::Unknown => summary.unknown += 1,
+            CapabilityResultStatus::Running => summary.running += 1,
+            CapabilityResultStatus::Stale => summary.stale += 1,
+        }
+    }
+
+    summary.unknown += declared.saturating_sub(summary.stored);
+    summary
+}
+
+fn capability_monitor_label(summary: &CapabilityMonitorSummary) -> &'static str {
+    if summary.policy_issues > 0 || summary.unsupported > 0 {
+        "Policy!"
+    } else if summary.declared == 0 && summary.stored == 0 {
+        "-"
+    } else if summary.error > 0 {
+        "Error"
+    } else if summary.failed > 0 {
+        "Fail"
+    } else if summary.stale > 0 {
+        "Stale"
+    } else if summary.warning > 0 {
+        "Warn"
+    } else if summary.running > 0 {
+        "Run"
+    } else if summary.unknown > 0 {
+        "Unknown"
+    } else {
+        "OK"
+    }
+}
+
+fn capability_monitor_color(summary: &CapabilityMonitorSummary) -> &'static str {
+    if summary.policy_issues > 0 || summary.unsupported > 0 {
+        "#f6c177"
+    } else if summary.error > 0 || summary.failed > 0 {
+        "#ff6b6b"
+    } else if summary.stale > 0 || summary.warning > 0 || summary.unknown > 0 {
+        "#ff8e5f"
+    } else if summary.declared > 0 || summary.stored > 0 {
+        "#7fdc8a"
+    } else {
+        "#8f96a3"
+    }
+}
+
+fn capability_monitor_tooltip(summary: &CapabilityMonitorSummary) -> String {
+    format!(
+        "Capabilities: {} declared, {} stored result(s)\nOK: {} | Warning: {} | Failed: {} | Error: {} | Stale: {} | Unknown: {}\nPolicy issues: {} | Unsupported: {}",
+        summary.declared,
+        summary.stored,
+        summary.ok,
+        summary.warning,
+        summary.failed,
+        summary.error,
+        summary.stale,
+        summary.unknown,
+        summary.policy_issues,
+        summary.unsupported
+    )
+}
+
+fn capability_monitor_search_text(item: &RepositoryListItem, snapshot: &StateSnapshot) -> String {
+    let summary = capability_monitor_summary(item, snapshot);
+    format!(
+        "capabilities {} policy {} unsupported {} stale {} warning {} failed {} error {} unknown {}",
+        capability_monitor_label(&summary),
+        summary.policy_issues,
+        summary.unsupported,
+        summary.stale,
+        summary.warning,
+        summary.failed,
+        summary.error,
+        summary.unknown
+    )
+}
+
+fn repo_needs_capability_attention(snapshot: &StateSnapshot, item: &RepositoryListItem) -> bool {
+    let summary = capability_monitor_summary(item, snapshot);
+    summary.policy_issues > 0
+        || summary.unsupported > 0
+        || summary.error > 0
+        || summary.failed > 0
+        || summary.warning > 0
+        || summary.stale > 0
+        || summary.unknown > 0
+}
+
+fn monitor_capability_cell(item: &RepositoryListItem, snapshot: &StateSnapshot) -> Label {
+    let summary = capability_monitor_summary(item, snapshot);
+    let text = capability_monitor_label(&summary);
+    let label = monitor_text_cell(
+        text,
+        MONITOR_CAPABILITY_COL_CHARS,
+        MONITOR_CAPABILITY_COL_WIDTH,
+        false,
+    );
+    attach_text_tooltip(&label, capability_monitor_tooltip(&summary));
+    let escaped = glib::markup_escape_text(text);
+    label.set_markup(&format!(
+        "<span foreground=\"{}\">{escaped}</span>",
+        capability_monitor_color(&summary)
+    ));
     label
 }
 
@@ -4731,7 +4910,7 @@ fn render_monorepo_overview_into(
         .count();
     let attention = items
         .iter()
-        .filter(|item| repo_attention_rank(item) < 7)
+        .filter(|item| repo_attention_rank(snapshot, item) < 7)
         .count();
     let selected = selected_repository_items(snapshot, &items);
 
@@ -7409,13 +7588,15 @@ fn monorepo_selection_actions(
     let scope_row = GtkBox::new(Orientation::Horizontal, 8);
 
     let current_snapshot = snapshot();
-    let selected_ids = current_snapshot.selected_repo_ids;
+    let selected_ids = current_snapshot.selected_repo_ids.clone();
     let selected_count = selected_ids.len();
 
     for button in [
         select_repo_bucket(
             "Select Attention",
-            collect_repo_ids(items, |item| repo_attention_rank(item) < 7),
+            collect_repo_ids(items, |item| {
+                repo_attention_rank(&current_snapshot, item) < 7
+            }),
         ),
         select_repo_bucket(
             "Select Dirty",
@@ -7650,9 +7831,10 @@ fn append_log_section(container: &GtkBox, heading: &str, logs: &[String], limit:
 }
 
 fn attention_items(items: &[RepositoryListItem]) -> Vec<RepositoryListItem> {
+    let current_snapshot = snapshot();
     let mut attention = items
         .iter()
-        .filter(|item| repo_attention_rank(item) < 7)
+        .filter(|item| repo_attention_rank(&current_snapshot, item) < 7)
         .cloned()
         .collect::<Vec<_>>();
     attention.sort_by_key(repo_monitor_sort_key);
