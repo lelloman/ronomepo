@@ -47,8 +47,8 @@ use ronomepo_core::{
     normalize_workspace_root, parse_capability_result_json, plan_capability_action,
     plan_repo_action, run_workspace_operation, save_capability_registry, save_manifest,
     scan_repo_manifest, text_capability_result, upsert_capability_state,
-    verify_repo_dependencies_freshness, workspace_summary, AttentionKind, AttentionLevel,
-    AttentionSignal, AttentionSource, AttentionUrgency, CapabilityFinding,
+    verify_repo_dependencies_freshness, workspace_summary, AttentionImpact, AttentionKind,
+    AttentionLevel, AttentionSignal, AttentionSource, AttentionUrgency, CapabilityFinding,
     CapabilityFindingSeverity, CapabilityRegistry, CapabilityResult, CapabilityResultStatus,
     CapabilityState, CommitCheckRule, CommitCheckRuleEffect, CommitCheckRuleMatcher,
     CommitCheckRuleScope, OperationEvent, OperationEventKind, OperationKind, PlannedCommand,
@@ -84,11 +84,13 @@ const MONITOR_BRANCH_COL_CHARS: i32 = 14;
 const MONITOR_MANIFEST_COL_CHARS: i32 = 12;
 const MONITOR_STATE_COL_CHARS: i32 = 12;
 const MONITOR_CAPABILITY_COL_CHARS: i32 = 10;
+const MONITOR_ATTENTION_COL_CHARS: i32 = 12;
 const MONITOR_NAME_COL_WIDTH: i32 = 300;
 const MONITOR_BRANCH_COL_WIDTH: i32 = 120;
 const MONITOR_MANIFEST_COL_WIDTH: i32 = 120;
 const MONITOR_STATE_COL_WIDTH: i32 = 120;
 const MONITOR_CAPABILITY_COL_WIDTH: i32 = 96;
+const MONITOR_ATTENTION_COL_WIDTH: i32 = 112;
 const WORKER_POOL_SIZE: usize = 4;
 const LOCAL_RESCAN_INTERVAL_SECS: u32 = 5 * 60;
 const REMOTE_FETCH_TICK_SECS: u32 = 30;
@@ -2405,6 +2407,8 @@ fn repo_monitor_filter_matches(item: &RepositoryListItem, snapshot: &StateSnapsh
     let state = status_label(&item.status.state).to_ascii_lowercase();
     let manifest = manifest_presence_search_text(item.repo_manifest.as_ref()).to_ascii_lowercase();
     let capability = capability_monitor_search_text(item, snapshot).to_ascii_lowercase();
+    let attention =
+        attention_monitor_search_text(&repo_attention_signals(snapshot, item)).to_ascii_lowercase();
     item.name.to_ascii_lowercase().contains(&filter)
         || item.dir_name.to_ascii_lowercase().contains(&filter)
         || item.remote_url.to_ascii_lowercase().contains(&filter)
@@ -2413,6 +2417,7 @@ fn repo_monitor_filter_matches(item: &RepositoryListItem, snapshot: &StateSnapsh
         || state.contains(&filter)
         || manifest.contains(&filter)
         || capability.contains(&filter)
+        || attention.contains(&filter)
 }
 
 fn build_repo_monitor_row(
@@ -2447,6 +2452,7 @@ fn build_repo_monitor_row(
     let manifest = monitor_manifest_cell(item.repo_manifest.as_ref());
     let current_snapshot = snapshot();
     let capability = monitor_capability_cell(item, &current_snapshot);
+    let attention = monitor_attention_cell(&current_snapshot, item);
     let status = monitor_state_cell(&item.status.state);
 
     let sync = monitor_sync_cell(&item.status.sync);
@@ -2455,6 +2461,7 @@ fn build_repo_monitor_row(
     content.append(&branch);
     content.append(&manifest);
     content.append(&capability);
+    content.append(&attention);
     content.append(&status);
     content.append(&sync);
     attach_repo_monitor_context_menu(&content, host_ptr);
@@ -4515,6 +4522,12 @@ fn repo_monitor_header() -> GtkBox {
         MONITOR_CAPABILITY_COL_WIDTH,
         false,
     );
+    let attention = monitor_text_cell(
+        "Attention",
+        MONITOR_ATTENTION_COL_CHARS,
+        MONITOR_ATTENTION_COL_WIDTH,
+        false,
+    );
     let state = monitor_text_cell(
         "State",
         MONITOR_STATE_COL_CHARS,
@@ -4526,7 +4539,15 @@ fn repo_monitor_header() -> GtkBox {
     sync.set_hexpand(true);
     sync.set_ellipsize(EllipsizeMode::End);
 
-    for label in [&name, &branch, &manifest, &capability, &state, &sync] {
+    for label in [
+        &name,
+        &branch,
+        &manifest,
+        &capability,
+        &attention,
+        &state,
+        &sync,
+    ] {
         label.add_css_class("dim-label");
         header.append(label);
     }
@@ -4740,6 +4761,83 @@ fn repo_attention_detail_signals(
     derive_attention_signals(item, manifest.as_ref(), &snapshot.capability_registry)
 }
 
+fn attention_monitor_label(signals: &[AttentionSignal]) -> &'static str {
+    match attention_rank(signals) {
+        0 => "Blocked",
+        1 => "Urgent",
+        2 => "Should",
+        3 => "Maybe",
+        4 => "Info",
+        _ => "OK",
+    }
+}
+
+fn attention_monitor_color(signals: &[AttentionSignal]) -> &'static str {
+    match attention_rank(signals) {
+        0 | 1 => "#ff6b6b",
+        2 => "#ff8e5f",
+        3 | 4 => "#f6c177",
+        _ => "#7fdc8a",
+    }
+}
+
+fn attention_monitor_tooltip(signals: &[AttentionSignal]) -> String {
+    if signals.is_empty() {
+        return "No open attention signals.".to_string();
+    }
+
+    let mut lines = vec![format!("{} open attention signal(s)", signals.len())];
+    for signal in signals.iter().take(8) {
+        lines.push(format!(
+            "{} | {} | {} | {} | impact {} | {}",
+            attention_level_label(signal.level),
+            attention_kind_label(signal.kind),
+            attention_source_label(signal.source),
+            attention_urgency_label(signal.urgency),
+            attention_impact_label(signal.impact),
+            signal.summary
+        ));
+    }
+    if signals.len() > 8 {
+        lines.push(format!("+{} more", signals.len() - 8));
+    }
+    lines.join("\n")
+}
+
+fn attention_monitor_search_text(signals: &[AttentionSignal]) -> String {
+    let mut text = format!("attention {}", attention_monitor_label(signals));
+    for signal in signals {
+        let _ = write!(
+            text,
+            " {} {} {} {} {}",
+            attention_level_label(signal.level),
+            attention_kind_label(signal.kind),
+            attention_source_label(signal.source),
+            attention_urgency_label(signal.urgency),
+            signal.summary
+        );
+    }
+    text
+}
+
+fn monitor_attention_cell(snapshot: &StateSnapshot, item: &RepositoryListItem) -> Label {
+    let signals = repo_attention_signals(snapshot, item);
+    let text = attention_monitor_label(&signals);
+    let label = monitor_text_cell(
+        text,
+        MONITOR_ATTENTION_COL_CHARS,
+        MONITOR_ATTENTION_COL_WIDTH,
+        false,
+    );
+    attach_text_tooltip(&label, attention_monitor_tooltip(&signals));
+    let escaped = glib::markup_escape_text(text);
+    label.set_markup(&format!(
+        "<span foreground=\"{}\">{escaped}</span>",
+        attention_monitor_color(&signals)
+    ));
+    label
+}
+
 fn workspace_attention_lines(
     snapshot: &StateSnapshot,
     items: &[RepositoryListItem],
@@ -4763,6 +4861,23 @@ fn workspace_attention_lines(
     lines
 }
 
+fn repo_attention_lines(signals: &[AttentionSignal]) -> Vec<String> {
+    signals
+        .iter()
+        .map(|signal| {
+            format!(
+                "{} | {} | {} | urgency {} | impact {} | {}",
+                attention_level_label(signal.level),
+                attention_kind_label(signal.kind),
+                attention_source_label(signal.source),
+                attention_urgency_label(signal.urgency),
+                attention_impact_label(signal.impact),
+                signal.summary
+            )
+        })
+        .collect()
+}
+
 fn attention_level_label(level: AttentionLevel) -> &'static str {
     match level {
         AttentionLevel::Info => "info",
@@ -4778,6 +4893,14 @@ fn attention_urgency_label(urgency: AttentionUrgency) -> &'static str {
         AttentionUrgency::Low => "low",
         AttentionUrgency::Medium => "medium",
         AttentionUrgency::High => "high",
+    }
+}
+
+fn attention_impact_label(impact: AttentionImpact) -> &'static str {
+    match impact {
+        AttentionImpact::Low => "low",
+        AttentionImpact::Medium => "medium",
+        AttentionImpact::High => "high",
     }
 }
 
@@ -7290,11 +7413,16 @@ fn render_repo_overview_into(
     root.append(&overview_actions(true));
     root.append(&overview_file_actions(snapshot, host_ptr));
 
+    let attention_signals = repo_attention_detail_signals(snapshot, item);
     let status_cards = GtkBox::new(Orientation::Horizontal, 12);
     for (label, value) in [
         ("Branch", branch_label(item).to_string()),
         ("State", status_label(&item.status.state).to_string()),
         ("Sync", format_sync_label(&item.status.sync)),
+        (
+            "Attention",
+            attention_monitor_label(&attention_signals).to_string(),
+        ),
         (
             "Caps",
             capability_monitor_label(&capability_monitor_summary(item, snapshot)).to_string(),
@@ -7327,6 +7455,12 @@ fn render_repo_overview_into(
     append_overview_section(&sections, "Directory", &item.dir_name);
     append_overview_section(&sections, "State", status_label(&item.status.state));
     append_overview_section(&sections, "Sync", &format_sync_label(&item.status.sync));
+    append_lines_section(
+        &sections,
+        "Attention Signals",
+        &repo_attention_lines(&attention_signals),
+        "No open attention signals.",
+    );
     append_overview_section(
         &sections,
         "Current Selection Scope",
