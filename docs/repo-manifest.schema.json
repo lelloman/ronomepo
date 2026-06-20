@@ -355,7 +355,34 @@
           "minLength": 1
         },
         "schedule": {
-          "description": "Future scheduling policy payload; currently stored but not interpreted."
+          "description": "Optional scheduling policy used for manual due detection. Supported forms include manual, interval_seconds, and on_commit_change.",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": ["manual", "on_commit_change"]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": ["manual", "interval", "on_commit_change"]
+                },
+                "mode": {
+                  "type": "string",
+                  "enum": ["manual", "interval", "on_commit_change"]
+                },
+                "interval_seconds": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "on_commit_change": {
+                  "type": "boolean"
+                }
+              }
+            }
+          ]
         }
       }
     },

@@ -364,6 +364,39 @@ pub struct CapabilityState {
     pub dirty: bool,
     #[serde(default)]
     pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub next_due_at_epoch_secs: Option<u64>,
+    #[serde(default)]
+    pub last_scheduled_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilitySchedule {
+    pub mode: CapabilityScheduleMode,
+    pub interval_seconds: Option<u64>,
+}
+
+impl CapabilitySchedule {
+    pub fn manual() -> Self {
+        Self {
+            mode: CapabilityScheduleMode::Manual,
+            interval_seconds: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityScheduleMode {
+    Manual,
+    Interval,
+    OnCommitChange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityDueReason {
+    NeverChecked,
+    IntervalElapsed,
+    CommitChanged,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1015,6 +1048,7 @@ pub fn validate_repo_manifest(manifest: &RepoManifest) -> Result<(), WorkspaceEr
                 capability.id
             )));
         }
+        parse_capability_schedule(capability.schedule.as_ref())?;
         match capability.status {
             CapabilityDeclarationStatus::Implemented => {
                 match (&capability.action_ref, &capability.standard_action) {
@@ -1556,6 +1590,139 @@ pub fn capability_effective_status(
     } else {
         state.status
     }
+}
+
+pub fn parse_capability_schedule(
+    value: Option<&serde_json::Value>,
+) -> Result<CapabilitySchedule, WorkspaceError> {
+    let Some(value) = value else {
+        return Ok(CapabilitySchedule::manual());
+    };
+
+    match value {
+        serde_json::Value::String(raw) => parse_capability_schedule_kind(raw, None),
+        serde_json::Value::Object(object) => {
+            let kind = object
+                .get("kind")
+                .or_else(|| object.get("mode"))
+                .and_then(serde_json::Value::as_str);
+            let interval_seconds = object
+                .get("interval_seconds")
+                .and_then(serde_json::Value::as_u64);
+            let on_commit_change = object
+                .get("on_commit_change")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+
+            if let Some(kind) = kind {
+                parse_capability_schedule_kind(kind, interval_seconds)
+            } else if let Some(interval_seconds) = interval_seconds {
+                interval_capability_schedule(interval_seconds)
+            } else if on_commit_change {
+                Ok(CapabilitySchedule {
+                    mode: CapabilityScheduleMode::OnCommitChange,
+                    interval_seconds: None,
+                })
+            } else {
+                Ok(CapabilitySchedule::manual())
+            }
+        }
+        _ => Err(WorkspaceError::InvalidRepoManifest(
+            "capability schedule must be a string or object".to_string(),
+        )),
+    }
+}
+
+pub fn capability_next_due_at_epoch_secs(
+    capability: &RepoCapabilityDeclaration,
+    state: Option<&CapabilityState>,
+) -> Result<Option<u64>, WorkspaceError> {
+    let schedule = parse_capability_schedule(capability.schedule.as_ref())?;
+    if schedule.mode != CapabilityScheduleMode::Interval {
+        return Ok(None);
+    }
+    Ok(state
+        .and_then(|state| state.checked_at_epoch_secs)
+        .zip(schedule.interval_seconds)
+        .map(|(checked_at, interval)| checked_at.saturating_add(interval)))
+}
+
+pub fn capability_due_reason(
+    item: &RepositoryListItem,
+    capability: &RepoCapabilityDeclaration,
+    state: Option<&CapabilityState>,
+    now_epoch_secs: u64,
+) -> Result<Option<CapabilityDueReason>, WorkspaceError> {
+    if capability.status != CapabilityDeclarationStatus::Implemented {
+        return Ok(None);
+    }
+
+    let schedule = parse_capability_schedule(capability.schedule.as_ref())?;
+    match schedule.mode {
+        CapabilityScheduleMode::Manual => Ok(None),
+        CapabilityScheduleMode::Interval => {
+            let Some(interval_seconds) = schedule.interval_seconds else {
+                return Ok(None);
+            };
+            let Some(state) = state else {
+                return Ok(Some(CapabilityDueReason::NeverChecked));
+            };
+            let Some(checked_at) = state.checked_at_epoch_secs else {
+                return Ok(Some(CapabilityDueReason::NeverChecked));
+            };
+            Ok(
+                (checked_at.saturating_add(interval_seconds) <= now_epoch_secs)
+                    .then_some(CapabilityDueReason::IntervalElapsed),
+            )
+        }
+        CapabilityScheduleMode::OnCommitChange => {
+            let Some(state) = state else {
+                return Ok(Some(CapabilityDueReason::NeverChecked));
+            };
+            Ok(state
+                .commit
+                .as_ref()
+                .zip(item.status.head_commit.as_ref())
+                .and_then(|(recorded, current)| {
+                    (recorded != current).then_some(CapabilityDueReason::CommitChanged)
+                }))
+        }
+    }
+}
+
+fn parse_capability_schedule_kind(
+    kind: &str,
+    interval_seconds: Option<u64>,
+) -> Result<CapabilitySchedule, WorkspaceError> {
+    match kind {
+        "manual" => Ok(CapabilitySchedule::manual()),
+        "interval" => interval_capability_schedule(interval_seconds.ok_or_else(|| {
+            WorkspaceError::InvalidRepoManifest(
+                "interval capability schedule requires interval_seconds".to_string(),
+            )
+        })?),
+        "on_commit_change" => Ok(CapabilitySchedule {
+            mode: CapabilityScheduleMode::OnCommitChange,
+            interval_seconds: None,
+        }),
+        _ => Err(WorkspaceError::InvalidRepoManifest(format!(
+            "unknown capability schedule kind: {kind}"
+        ))),
+    }
+}
+
+fn interval_capability_schedule(
+    interval_seconds: u64,
+) -> Result<CapabilitySchedule, WorkspaceError> {
+    if interval_seconds == 0 {
+        return Err(WorkspaceError::InvalidRepoManifest(
+            "capability schedule interval_seconds must be greater than zero".to_string(),
+        ));
+    }
+    Ok(CapabilitySchedule {
+        mode: CapabilityScheduleMode::Interval,
+        interval_seconds: Some(interval_seconds),
+    })
 }
 
 pub fn attention_rank(signals: &[AttentionSignal]) -> u8 {
@@ -5099,6 +5266,8 @@ mod tests {
                 commit: Some("abc".to_string()),
                 dirty: false,
                 duration_ms: Some(42),
+                next_due_at_epoch_secs: None,
+                last_scheduled_reason: None,
             }],
         };
 
@@ -5164,6 +5333,8 @@ mod tests {
                 commit: Some("old".to_string()),
                 dirty: false,
                 duration_ms: Some(100),
+                next_due_at_epoch_secs: None,
+                last_scheduled_reason: None,
             }],
         };
 
@@ -5180,6 +5351,103 @@ mod tests {
         assert!(stale.stale);
         assert!(stale.summary.contains("commit changed"));
         assert_eq!(stale.suggested_actions, vec!["run_capability_check"]);
+    }
+
+    #[test]
+    fn capability_interval_schedule_reports_due_and_next_due() {
+        let mut capability = implemented_capability("server/tests", "integrity.tests");
+        capability.schedule = Some(serde_json::json!({
+            "kind": "interval",
+            "interval_seconds": 60
+        }));
+        let manifest = cargo_repo_manifest(vec![capability.clone()]);
+        validate_repo_manifest(&manifest).unwrap();
+        let item = attention_test_item(
+            RepositoryState::Clean,
+            RepositorySync::UpToDate,
+            Some("abc"),
+            Some(&manifest),
+        );
+        let state = CapabilityState {
+            repo_id: "sample".to_string(),
+            capability_instance_id: "server/tests".to_string(),
+            capability: "integrity.tests".to_string(),
+            item_id: Some("server".to_string()),
+            root: Some(PathBuf::from("server")),
+            status: CapabilityResultStatus::Ok,
+            summary: "tests passed".to_string(),
+            findings: Vec::new(),
+            checked_at_epoch_secs: Some(100),
+            commit: Some("abc".to_string()),
+            dirty: false,
+            duration_ms: Some(10),
+            next_due_at_epoch_secs: None,
+            last_scheduled_reason: None,
+        };
+
+        assert_eq!(
+            capability_next_due_at_epoch_secs(&capability, Some(&state)).unwrap(),
+            Some(160)
+        );
+        assert_eq!(
+            capability_due_reason(&item, &capability, Some(&state), 159).unwrap(),
+            None
+        );
+        assert_eq!(
+            capability_due_reason(&item, &capability, Some(&state), 160).unwrap(),
+            Some(CapabilityDueReason::IntervalElapsed)
+        );
+    }
+
+    #[test]
+    fn capability_on_commit_change_schedule_reports_due_after_new_head() {
+        let mut capability = implemented_capability("server/build", "integrity.build");
+        capability.schedule = Some(serde_json::json!({ "kind": "on_commit_change" }));
+        let manifest = cargo_repo_manifest(vec![capability.clone()]);
+        validate_repo_manifest(&manifest).unwrap();
+        let item = attention_test_item(
+            RepositoryState::Clean,
+            RepositorySync::UpToDate,
+            Some("new"),
+            Some(&manifest),
+        );
+        let state = CapabilityState {
+            repo_id: "sample".to_string(),
+            capability_instance_id: "server/build".to_string(),
+            capability: "integrity.build".to_string(),
+            item_id: Some("server".to_string()),
+            root: Some(PathBuf::from("server")),
+            status: CapabilityResultStatus::Ok,
+            summary: "build passed".to_string(),
+            findings: Vec::new(),
+            checked_at_epoch_secs: Some(100),
+            commit: Some("old".to_string()),
+            dirty: false,
+            duration_ms: Some(10),
+            next_due_at_epoch_secs: None,
+            last_scheduled_reason: None,
+        };
+
+        assert_eq!(
+            capability_due_reason(&item, &capability, Some(&state), 100).unwrap(),
+            Some(CapabilityDueReason::CommitChanged)
+        );
+    }
+
+    #[test]
+    fn invalid_capability_schedule_is_rejected() {
+        let mut capability = implemented_capability("server/tests", "integrity.tests");
+        capability.schedule = Some(serde_json::json!({
+            "kind": "interval",
+            "interval_seconds": 0
+        }));
+        let manifest = cargo_repo_manifest(vec![capability]);
+        let error = validate_repo_manifest(&manifest).unwrap_err();
+        assert!(matches!(
+            error,
+            WorkspaceError::InvalidRepoManifest(message)
+                if message.contains("interval_seconds must be greater than zero")
+        ));
     }
 
     #[test]

@@ -133,7 +133,7 @@ Fields:
 - `action_ref`: optional action reference used when `status` is `implemented`
 - `standard_action`: optional shorthand for a standard action reference
 - `reason`: required when `status` is `not_applicable`
-- `schedule`: optional future scheduling policy payload; currently stored but not interpreted
+- `schedule`: optional scheduling policy for manual due detection; supported forms are `"manual"`, `{ "kind": "manual" }`, `{ "kind": "interval", "interval_seconds": 86400 }`, `{ "interval_seconds": 86400 }`, `{ "kind": "on_commit_change" }`, or `{ "on_commit_change": true }`
 
 Implemented capabilities must declare exactly one of `action_ref` or `standard_action`. `not_applicable` satisfies required capability policy only when it includes a reason. `unsupported` is valid syntax but remains a policy issue because the repo explicitly says the required automation is not available.
 
@@ -149,6 +149,27 @@ Optional built-in capability:
 - `observability.production_logs`
 
 Custom capability ids are allowed so repo manifests can evolve before Ronomepo has a built-in catalog entry. Custom capabilities are not required by default.
+
+
+## Capability Scheduling
+
+Capability schedules are interpreted only for due detection. Ronomepo does not automatically run scheduled checks yet; it can identify due capability instances and run them through the manual Due Cap Checks action.
+
+Supported schedule forms:
+
+```json
+{ "kind": "manual" }
+```
+
+```json
+{ "kind": "interval", "interval_seconds": 86400 }
+```
+
+```json
+{ "kind": "on_commit_change" }
+```
+
+Missing `schedule` is equivalent to `manual`. Interval schedules require `interval_seconds` greater than zero. `on_commit_change` schedules become due when the recorded capability result commit differs from the repo head commit.
 
 ## Action References
 

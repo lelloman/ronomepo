@@ -38,10 +38,11 @@ use maruzzella_sdk::{
 };
 use notify::{Config as NotifyConfig, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use ronomepo_core::{
-    assess_repo_capability_policy, attention_rank, build_repository_list,
-    collect_capability_git_snapshot, collect_commit_check_report, collect_repository_details,
-    collect_workspace_line_stats, current_epoch_secs, default_capability_registry_path,
-    default_commit_check_rules, default_manifest_path, derive_attention_signals, derive_dir_name,
+    assess_repo_capability_policy, attention_rank, build_repository_list, capability_due_reason,
+    capability_next_due_at_epoch_secs, collect_capability_git_snapshot,
+    collect_commit_check_report, collect_repository_details, collect_workspace_line_stats,
+    current_epoch_secs, default_capability_registry_path, default_commit_check_rules,
+    default_manifest_path, derive_attention_signals, derive_dir_name,
     ensure_commit_check_rules_initialized, format_sync_label, import_repos_txt,
     list_repo_artifacts, load_capability_registry, load_manifest, load_repo_manifest,
     normalize_workspace_root, parse_capability_result_json, plan_capability_action,
@@ -326,6 +327,7 @@ enum WorkerJob {
     CapabilityChecks {
         workspace_root: PathBuf,
         targets: Vec<CapabilityRunTarget>,
+        run_reason: String,
     },
     SaveManifestFromEditor {
         host_ptr: usize,
@@ -424,6 +426,7 @@ struct CapabilityRunTarget {
     repo_name: String,
     repo_path: PathBuf,
     manifest: RepoManifest,
+    capability_ids: Option<Vec<String>>,
 }
 
 struct CapabilityRunReport {
@@ -844,8 +847,9 @@ fn run_worker_job(queued_job: QueuedJob) {
         WorkerJob::CapabilityChecks {
             workspace_root,
             targets,
+            run_reason,
         } => {
-            let result = run_capability_checks(&workspace_root, targets);
+            let result = run_capability_checks(&workspace_root, targets, &run_reason);
             dispatch_worker_result(WorkerResult::CapabilityChecksCompleted { result });
         }
         WorkerJob::SaveManifestFromEditor {
@@ -3968,25 +3972,34 @@ fn selected_repo_manifest_targets(
 fn repo_capability_targets_from_items(items: Vec<RepositoryListItem>) -> Vec<CapabilityRunTarget> {
     items
         .into_iter()
-        .filter_map(|item| {
-            let scan = item.repo_manifest.as_ref()?;
-            if !matches!(scan.state, RepoManifestScanState::Valid(_)) {
-                return None;
-            }
-            let manifest = load_repo_manifest(&scan.path).ok()?;
-            if !manifest.capabilities.iter().any(|capability| {
-                capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
-            }) {
-                return None;
-            }
-            Some(CapabilityRunTarget {
-                repo_id: item.id,
-                repo_name: item.name,
-                repo_path: item.status.repo_path,
-                manifest,
-            })
-        })
+        .filter_map(|item| repo_capability_target_from_item(item, None))
         .collect()
+}
+
+fn repo_capability_target_from_item(
+    item: RepositoryListItem,
+    capability_ids: Option<Vec<String>>,
+) -> Option<CapabilityRunTarget> {
+    let scan = item.repo_manifest.as_ref()?;
+    if !matches!(scan.state, RepoManifestScanState::Valid(_)) {
+        return None;
+    }
+    let manifest = load_repo_manifest(&scan.path).ok()?;
+    if !manifest.capabilities.iter().any(|capability| {
+        capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
+            && capability_ids
+                .as_ref()
+                .is_none_or(|ids| ids.iter().any(|id| id == &capability.id))
+    }) {
+        return None;
+    }
+    Some(CapabilityRunTarget {
+        repo_id: item.id,
+        repo_name: item.name,
+        repo_path: item.status.repo_path,
+        manifest,
+        capability_ids,
+    })
 }
 
 fn capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'static str) {
@@ -4010,11 +4023,108 @@ fn stale_capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'s
         "selected"
     };
     let source_items = if selected.is_empty() { items } else { selected };
-    let stale_items = source_items
+    let targets = source_items
         .into_iter()
-        .filter(|item| repo_has_stale_or_unknown_capability_result(&snapshot, item))
-        .collect::<Vec<_>>();
-    (repo_capability_targets_from_items(stale_items), scope)
+        .filter_map(|item| {
+            let manifest = item
+                .repo_manifest
+                .as_ref()
+                .and_then(|scan| {
+                    matches!(scan.state, RepoManifestScanState::Valid(_)).then_some(scan)
+                })
+                .and_then(|scan| load_repo_manifest(&scan.path).ok())?;
+            let dirty_now = matches!(
+                item.status.state,
+                ronomepo_core::RepositoryState::Dirty | ronomepo_core::RepositoryState::Untracked
+            );
+            let capability_ids = manifest
+                .capabilities
+                .iter()
+                .filter(|capability| {
+                    capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
+                })
+                .filter(|capability| {
+                    capability_registry_state(&snapshot, &item.id, &capability.id)
+                        .is_none_or(|state| capability_state_is_stale(&item, state, dirty_now))
+                })
+                .map(|capability| capability.id.clone())
+                .collect::<Vec<_>>();
+            repo_capability_target_from_item(item, Some(capability_ids))
+        })
+        .collect();
+    (targets, scope)
+}
+
+fn repo_due_capability_count(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+    now_epoch_secs: u64,
+) -> usize {
+    let Some(manifest) = item
+        .repo_manifest
+        .as_ref()
+        .and_then(|scan| matches!(scan.state, RepoManifestScanState::Valid(_)).then_some(scan))
+        .and_then(|scan| load_repo_manifest(&scan.path).ok())
+    else {
+        return 0;
+    };
+
+    manifest
+        .capabilities
+        .iter()
+        .filter(|capability| {
+            capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
+        })
+        .filter(|capability| {
+            let state = capability_registry_state(snapshot, &item.id, &capability.id);
+            capability_due_reason(item, capability, state, now_epoch_secs)
+                .ok()
+                .flatten()
+                .is_some()
+        })
+        .count()
+}
+
+fn due_capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'static str) {
+    let snapshot = snapshot();
+    let items = repository_items(&snapshot);
+    let selected = selected_repository_items(&snapshot, &items);
+    let scope = if selected.is_empty() {
+        "workspace"
+    } else {
+        "selected"
+    };
+    let source_items = if selected.is_empty() { items } else { selected };
+    let now = current_epoch_secs();
+    let targets = source_items
+        .into_iter()
+        .filter_map(|item| {
+            let manifest = item
+                .repo_manifest
+                .as_ref()
+                .and_then(|scan| {
+                    matches!(scan.state, RepoManifestScanState::Valid(_)).then_some(scan)
+                })
+                .and_then(|scan| load_repo_manifest(&scan.path).ok())?;
+            let capability_ids = manifest
+                .capabilities
+                .iter()
+                .filter(|capability| {
+                    capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
+                })
+                .filter(|capability| {
+                    let state = capability_registry_state(&snapshot, &item.id, &capability.id);
+                    capability_due_reason(&item, capability, state, now)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                })
+                .map(|capability| capability.id.clone())
+                .collect::<Vec<_>>();
+            repo_capability_target_from_item(item, Some(capability_ids))
+        })
+        .collect();
+    (targets, scope)
 }
 
 fn submit_capability_check_targets(targets: Vec<CapabilityRunTarget>, scope: &str, mode: &str) {
@@ -4034,6 +4144,7 @@ fn submit_capability_check_targets(targets: Vec<CapabilityRunTarget>, scope: &st
         WorkerJob::CapabilityChecks {
             workspace_root,
             targets,
+            run_reason: mode.to_string(),
         },
     ) {
         Ok(true) => append_log(format!(
@@ -4053,6 +4164,11 @@ fn run_selected_repo_capability_checks() {
 fn run_stale_repo_capability_checks() {
     let (targets, scope) = stale_capability_check_targets_from_state();
     submit_capability_check_targets(targets, scope, "stale");
+}
+
+fn run_due_repo_capability_checks() {
+    let (targets, scope) = due_capability_check_targets_from_state();
+    submit_capability_check_targets(targets, scope, "due");
 }
 
 fn run_selected_repo_manifest_action(action: StandardActionName) {
@@ -5097,14 +5213,6 @@ fn capability_finding_severity_label(severity: CapabilityFindingSeverity) -> &'s
     }
 }
 
-fn repo_has_stale_or_unknown_capability_result(
-    snapshot: &StateSnapshot,
-    item: &RepositoryListItem,
-) -> bool {
-    let summary = capability_monitor_summary(item, snapshot);
-    summary.stale > 0 || summary.unknown > 0
-}
-
 fn repo_needs_capability_attention(snapshot: &StateSnapshot, item: &RepositoryListItem) -> bool {
     let summary = capability_monitor_summary(item, snapshot);
     summary.policy_issues > 0
@@ -5367,6 +5475,11 @@ fn render_monorepo_overview_into(
         .iter()
         .filter(|item| repo_needs_capability_attention(snapshot, item))
         .count();
+    let now = current_epoch_secs();
+    let capability_due = items
+        .iter()
+        .filter(|item| repo_due_capability_count(snapshot, item, now) > 0)
+        .count();
     let selected = selected_repository_items(snapshot, &items);
 
     let hero = GtkBox::new(Orientation::Vertical, 8);
@@ -5393,6 +5506,7 @@ fn render_monorepo_overview_into(
         ("Diverged", diverged),
         ("No Upstream", no_upstream),
         ("Cap Issues", capability_attention),
+        ("Cap Due", capability_due),
     ] {
         stats.append(&stat_card(label, &value.to_string()));
     }
@@ -6898,6 +7012,7 @@ fn build_line_stats_report(
 fn run_capability_checks(
     workspace_root: &Path,
     targets: Vec<CapabilityRunTarget>,
+    run_reason: &str,
 ) -> Result<CapabilityRunReport, String> {
     let registry_path = default_capability_registry_path(workspace_root);
     let mut registry =
@@ -6909,6 +7024,10 @@ fn run_capability_checks(
         let snapshot = collect_capability_git_snapshot(&target.repo_path);
         for capability in target.manifest.capabilities.iter().filter(|capability| {
             capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
+                && target
+                    .capability_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.iter().any(|id| id == &capability.id))
         }) {
             run_count += 1;
             let started = Instant::now();
@@ -6929,23 +7048,27 @@ fn run_capability_checks(
                 capability_status_label(result.status),
                 result.summary
             ));
-            upsert_capability_state(
-                &mut registry,
-                CapabilityState {
-                    repo_id: target.repo_id.clone(),
-                    capability_instance_id: capability.id.clone(),
-                    capability: capability.capability.clone(),
-                    item_id: capability.item_id.clone(),
-                    root: capability.root.clone(),
-                    status: result.status,
-                    summary: result.summary,
-                    findings: result.findings,
-                    checked_at_epoch_secs: Some(current_epoch_secs()),
-                    commit: snapshot.commit.clone(),
-                    dirty: snapshot.dirty,
-                    duration_ms: Some(duration_ms),
-                },
-            );
+            let checked_at_epoch_secs = current_epoch_secs();
+            let mut state = CapabilityState {
+                repo_id: target.repo_id.clone(),
+                capability_instance_id: capability.id.clone(),
+                capability: capability.capability.clone(),
+                item_id: capability.item_id.clone(),
+                root: capability.root.clone(),
+                status: result.status,
+                summary: result.summary,
+                findings: result.findings,
+                checked_at_epoch_secs: Some(checked_at_epoch_secs),
+                commit: snapshot.commit.clone(),
+                dirty: snapshot.dirty,
+                duration_ms: Some(duration_ms),
+                next_due_at_epoch_secs: None,
+                last_scheduled_reason: Some(run_reason.to_string()),
+            };
+            state.next_due_at_epoch_secs =
+                capability_next_due_at_epoch_secs(capability, Some(&state))
+                    .map_err(|error| error.to_string())?;
+            upsert_capability_state(&mut registry, state);
         }
     }
 
@@ -7414,6 +7537,7 @@ fn render_repo_overview_into(
     root.append(&overview_file_actions(snapshot, host_ptr));
 
     let attention_signals = repo_attention_detail_signals(snapshot, item);
+    let due_capability_count = repo_due_capability_count(snapshot, item, current_epoch_secs());
     let status_cards = GtkBox::new(Orientation::Horizontal, 12);
     for (label, value) in [
         ("Branch", branch_label(item).to_string()),
@@ -7427,6 +7551,7 @@ fn render_repo_overview_into(
             "Caps",
             capability_monitor_label(&capability_monitor_summary(item, snapshot)).to_string(),
         ),
+        ("Due Caps", due_capability_count.to_string()),
         (
             "Selected",
             if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
@@ -8175,6 +8300,12 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
         run_stale_repo_capability_checks();
     });
     actions.append(&stale_capability_checks);
+
+    let due_capability_checks = Button::with_label("Due Cap Checks");
+    due_capability_checks.connect_clicked(|_| {
+        run_due_repo_capability_checks();
+    });
+    actions.append(&due_capability_checks);
 
     let all_time = Button::with_label("All Time");
     all_time.set_sensitive(!snapshot.line_stats_loading);
