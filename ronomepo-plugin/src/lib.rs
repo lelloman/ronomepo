@@ -38,15 +38,17 @@ use maruzzella_sdk::{
 };
 use notify::{Config as NotifyConfig, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use ronomepo_core::{
-    assess_repo_capability_policy, build_repository_list, collect_capability_git_snapshot,
-    collect_commit_check_report, collect_repository_details, collect_workspace_line_stats,
-    current_epoch_secs, default_capability_registry_path, default_commit_check_rules,
-    default_manifest_path, derive_dir_name, ensure_commit_check_rules_initialized,
-    format_sync_label, import_repos_txt, list_repo_artifacts, load_capability_registry,
-    load_manifest, load_repo_manifest, normalize_workspace_root, parse_capability_result_json,
-    plan_capability_action, plan_repo_action, run_workspace_operation, save_capability_registry,
-    save_manifest, scan_repo_manifest, text_capability_result, upsert_capability_state,
-    verify_repo_dependencies_freshness, workspace_summary, CapabilityFinding,
+    assess_repo_capability_policy, attention_rank, build_repository_list,
+    collect_capability_git_snapshot, collect_commit_check_report, collect_repository_details,
+    collect_workspace_line_stats, current_epoch_secs, default_capability_registry_path,
+    default_commit_check_rules, default_manifest_path, derive_attention_signals, derive_dir_name,
+    ensure_commit_check_rules_initialized, format_sync_label, import_repos_txt,
+    list_repo_artifacts, load_capability_registry, load_manifest, load_repo_manifest,
+    normalize_workspace_root, parse_capability_result_json, plan_capability_action,
+    plan_repo_action, run_workspace_operation, save_capability_registry, save_manifest,
+    scan_repo_manifest, text_capability_result, upsert_capability_state,
+    verify_repo_dependencies_freshness, workspace_summary, AttentionKind, AttentionLevel,
+    AttentionSignal, AttentionSource, AttentionUrgency, CapabilityFinding,
     CapabilityFindingSeverity, CapabilityRegistry, CapabilityResult, CapabilityResultStatus,
     CapabilityState, CommitCheckRule, CommitCheckRuleEffect, CommitCheckRuleMatcher,
     CommitCheckRuleScope, OperationEvent, OperationEventKind, OperationKind, PlannedCommand,
@@ -2611,32 +2613,22 @@ fn matches_filter_mode(
             item.status.sync,
             RepositorySync::UpToDate | RepositorySync::NoUpstream
         ),
-        MonitorFilterMode::Issues => {
-            matches!(
-                item.status.state,
-                RepositoryState::Missing | RepositoryState::Unknown
-            ) || matches!(
-                item.status.sync,
-                RepositorySync::Diverged { .. }
-                    | RepositorySync::NoUpstream
-                    | RepositorySync::Unknown
-            ) || repo_needs_capability_attention(snapshot, item)
-        }
+        MonitorFilterMode::Issues => !repo_attention_signals(snapshot, item).is_empty(),
     }
 }
 
 fn repo_attention_rank(snapshot: &StateSnapshot, item: &RepositoryListItem) -> u8 {
-    use ronomepo_core::{RepositoryState, RepositorySync};
+    let signals = repo_attention_signals(snapshot, item);
+    if signals.is_empty() {
+        return 7;
+    }
 
-    match (&item.status.state, &item.status.sync) {
-        (RepositoryState::Missing, _) => 0,
-        (RepositoryState::Dirty, _) | (RepositoryState::Untracked, _) => 1,
-        (_, RepositorySync::Diverged { .. }) => 2,
-        (_, RepositorySync::Behind(_)) => 3,
-        (_, RepositorySync::Ahead(_)) => 4,
-        (RepositoryState::Unknown, _) | (_, RepositorySync::Unknown) => 5,
-        (_, RepositorySync::NoUpstream) => 6,
-        _ if repo_needs_capability_attention(snapshot, item) => 6,
+    match attention_rank(&signals) {
+        0 => 0,
+        1 => 1,
+        2 => 3,
+        3 => 4,
+        4 => 6,
         _ => 7,
     }
 }
@@ -4729,31 +4721,84 @@ fn capability_monitor_search_text(item: &RepositoryListItem, snapshot: &StateSna
     )
 }
 
-fn workspace_capability_attention_lines(
+fn repo_attention_signals(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+) -> Vec<AttentionSignal> {
+    derive_attention_signals(item, None, &snapshot.capability_registry)
+}
+
+fn repo_attention_detail_signals(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+) -> Vec<AttentionSignal> {
+    let manifest = item
+        .repo_manifest
+        .as_ref()
+        .and_then(|scan| matches!(scan.state, RepoManifestScanState::Valid(_)).then_some(scan))
+        .and_then(|scan| load_repo_manifest(&scan.path).ok());
+    derive_attention_signals(item, manifest.as_ref(), &snapshot.capability_registry)
+}
+
+fn workspace_attention_lines(
     snapshot: &StateSnapshot,
     items: &[RepositoryListItem],
 ) -> Vec<String> {
     let mut lines = items
         .iter()
-        .filter(|item| repo_needs_capability_attention(snapshot, item))
-        .map(|item| {
-            let summary = capability_monitor_summary(item, snapshot);
+        .flat_map(|item| repo_attention_detail_signals(snapshot, item))
+        .map(|signal| {
             format!(
-                "{} | {} | policy {} | unsupported {} | failed {} | error {} | warning {} | stale {} | unknown {}",
-                item.name,
-                capability_monitor_label(&summary),
-                summary.policy_issues,
-                summary.unsupported,
-                summary.failed,
-                summary.error,
-                summary.warning,
-                summary.stale,
-                summary.unknown
+                "{} | {} | {} | {} | {} | {}",
+                signal.repo_name,
+                attention_level_label(signal.level),
+                attention_kind_label(signal.kind),
+                attention_source_label(signal.source),
+                attention_urgency_label(signal.urgency),
+                signal.summary
             )
         })
         .collect::<Vec<_>>();
     lines.sort();
     lines
+}
+
+fn attention_level_label(level: AttentionLevel) -> &'static str {
+    match level {
+        AttentionLevel::Info => "info",
+        AttentionLevel::Opportunity => "opportunity",
+        AttentionLevel::ShouldDo => "should do",
+        AttentionLevel::Urgent => "urgent",
+        AttentionLevel::Blocked => "blocked",
+    }
+}
+
+fn attention_urgency_label(urgency: AttentionUrgency) -> &'static str {
+    match urgency {
+        AttentionUrgency::Low => "low",
+        AttentionUrgency::Medium => "medium",
+        AttentionUrgency::High => "high",
+    }
+}
+
+fn attention_kind_label(kind: AttentionKind) -> &'static str {
+    match kind {
+        AttentionKind::Git => "git",
+        AttentionKind::Integrity => "integrity",
+        AttentionKind::Maintenance => "maintenance",
+        AttentionKind::Security => "security",
+        AttentionKind::Operations => "operations",
+        AttentionKind::Planning => "planning",
+        AttentionKind::Configuration => "configuration",
+    }
+}
+
+fn attention_source_label(source: AttentionSource) -> &'static str {
+    match source {
+        AttentionSource::Git => "git",
+        AttentionSource::Manifest => "manifest",
+        AttentionSource::Capability => "capability",
+    }
 }
 
 fn repo_capability_detail_lines(
@@ -5273,7 +5318,7 @@ fn render_monorepo_overview_into(
     append_repo_group_section(
         &sections,
         "Needs Attention",
-        "Repos that are missing, dirty, behind, diverged, ahead, or missing an upstream.",
+        "Repos with open git, manifest, or capability attention signals.",
         &attention_items(&items),
         Some(8),
         host_ptr,
@@ -5288,9 +5333,9 @@ fn render_monorepo_overview_into(
     );
     append_lines_section(
         &sections,
-        "Capability Attention",
-        &workspace_capability_attention_lines(snapshot, &items),
-        "No capability policy or check result needs attention.",
+        "Attention Signals",
+        &workspace_attention_lines(snapshot, &items),
+        "No open attention signals.",
     );
     append_lines_section(
         &sections,

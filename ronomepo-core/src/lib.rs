@@ -395,6 +395,91 @@ pub struct RepoCapabilityPolicyReport {
     pub issues: Vec<CapabilityPolicyIssue>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionLevel {
+    Info,
+    Opportunity,
+    ShouldDo,
+    Urgent,
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionUrgency {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionImpact {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionKind {
+    Git,
+    Integrity,
+    Maintenance,
+    Security,
+    Operations,
+    Planning,
+    Configuration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionSource {
+    Git,
+    Manifest,
+    Capability,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionStatus {
+    Open,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionSignal {
+    pub id: String,
+    pub repo_id: String,
+    pub repo_name: String,
+    pub source: AttentionSource,
+    pub source_id: String,
+    pub kind: AttentionKind,
+    pub status: AttentionStatus,
+    pub level: AttentionLevel,
+    pub urgency: AttentionUrgency,
+    pub impact: AttentionImpact,
+    pub summary: String,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    #[serde(default)]
+    pub capability_instance_id: Option<String>,
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+    #[serde(default)]
+    pub suggested_actions: Vec<String>,
+    #[serde(default)]
+    pub observed_at_epoch_secs: Option<u64>,
+    #[serde(default)]
+    pub stale: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityStaleReason {
+    DirtyWorktree,
+    CommitChanged,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DependencyFreshnessReport {
     pub item_id: String,
@@ -1425,6 +1510,438 @@ pub fn collect_capability_git_snapshot(repo_path: &Path) -> CapabilityGitSnapsho
     CapabilityGitSnapshot {
         commit: git_stdout(repo_path, ["rev-parse", "HEAD"]),
         dirty: !matches!(repository_state(repo_path), RepositoryState::Clean),
+    }
+}
+
+pub fn derive_attention_signals(
+    item: &RepositoryListItem,
+    manifest: Option<&RepoManifest>,
+    registry: &CapabilityRegistry,
+) -> Vec<AttentionSignal> {
+    let mut signals = Vec::new();
+    signals.extend(derive_git_attention_signals(item));
+    signals.extend(derive_manifest_attention_signals(item, manifest));
+    signals.extend(derive_capability_attention_signals(
+        item, manifest, registry,
+    ));
+    signals
+}
+
+pub fn capability_stale_reason(
+    item: &RepositoryListItem,
+    state: &CapabilityState,
+) -> Option<CapabilityStaleReason> {
+    if matches!(
+        item.status.state,
+        RepositoryState::Dirty | RepositoryState::Untracked
+    ) {
+        return Some(CapabilityStaleReason::DirtyWorktree);
+    }
+
+    state
+        .commit
+        .as_ref()
+        .zip(item.status.head_commit.as_ref())
+        .and_then(|(recorded, current)| {
+            (recorded != current).then_some(CapabilityStaleReason::CommitChanged)
+        })
+}
+
+pub fn capability_effective_status(
+    item: &RepositoryListItem,
+    state: &CapabilityState,
+) -> CapabilityResultStatus {
+    if capability_stale_reason(item, state).is_some() {
+        CapabilityResultStatus::Stale
+    } else {
+        state.status
+    }
+}
+
+pub fn attention_rank(signals: &[AttentionSignal]) -> u8 {
+    if signals
+        .iter()
+        .any(|signal| signal.level == AttentionLevel::Blocked)
+    {
+        0
+    } else if signals
+        .iter()
+        .any(|signal| signal.level == AttentionLevel::Urgent)
+    {
+        1
+    } else if signals
+        .iter()
+        .any(|signal| signal.level == AttentionLevel::ShouldDo)
+    {
+        2
+    } else if signals
+        .iter()
+        .any(|signal| signal.level == AttentionLevel::Opportunity)
+    {
+        3
+    } else if signals
+        .iter()
+        .any(|signal| signal.level == AttentionLevel::Info)
+    {
+        4
+    } else {
+        5
+    }
+}
+
+fn derive_git_attention_signals(item: &RepositoryListItem) -> Vec<AttentionSignal> {
+    let mut signals = Vec::new();
+    match item.status.state {
+        RepositoryState::Missing => signals.push(attention_signal(
+            item,
+            AttentionSource::Git,
+            "missing",
+            AttentionKind::Git,
+            AttentionLevel::Blocked,
+            AttentionUrgency::High,
+            AttentionImpact::High,
+            "repository is missing locally".to_string(),
+        )),
+        RepositoryState::Unknown => signals.push(attention_signal(
+            item,
+            AttentionSource::Git,
+            "state_unknown",
+            AttentionKind::Git,
+            AttentionLevel::Urgent,
+            AttentionUrgency::Medium,
+            AttentionImpact::Medium,
+            "repository state could not be determined".to_string(),
+        )),
+        RepositoryState::Dirty => signals.push(attention_signal(
+            item,
+            AttentionSource::Git,
+            "dirty",
+            AttentionKind::Git,
+            AttentionLevel::Opportunity,
+            AttentionUrgency::Low,
+            AttentionImpact::Medium,
+            "working tree has modified files".to_string(),
+        )),
+        RepositoryState::Untracked => signals.push(attention_signal(
+            item,
+            AttentionSource::Git,
+            "untracked",
+            AttentionKind::Git,
+            AttentionLevel::Opportunity,
+            AttentionUrgency::Low,
+            AttentionImpact::Medium,
+            "working tree has untracked files".to_string(),
+        )),
+        RepositoryState::Clean => {}
+    }
+
+    match item.status.sync {
+        RepositorySync::Unknown => signals.push(attention_signal(
+            item,
+            AttentionSource::Git,
+            "sync_unknown",
+            AttentionKind::Git,
+            AttentionLevel::Urgent,
+            AttentionUrgency::Medium,
+            AttentionImpact::Medium,
+            "repository sync state could not be determined".to_string(),
+        )),
+        RepositorySync::NoUpstream => signals.push(attention_signal(
+            item,
+            AttentionSource::Git,
+            "no_upstream",
+            AttentionKind::Git,
+            AttentionLevel::ShouldDo,
+            AttentionUrgency::Medium,
+            AttentionImpact::Medium,
+            "branch has no upstream configured".to_string(),
+        )),
+        RepositorySync::Ahead(count) => signals.push(attention_signal(
+            item,
+            AttentionSource::Git,
+            "ahead",
+            AttentionKind::Git,
+            AttentionLevel::Opportunity,
+            AttentionUrgency::Low,
+            AttentionImpact::Medium,
+            format!("branch is ahead by {count} commit(s)"),
+        )),
+        RepositorySync::Behind(count) => signals.push(attention_signal(
+            item,
+            AttentionSource::Git,
+            "behind",
+            AttentionKind::Git,
+            AttentionLevel::ShouldDo,
+            AttentionUrgency::Medium,
+            AttentionImpact::Medium,
+            format!("branch is behind by {count} commit(s)"),
+        )),
+        RepositorySync::Diverged { ahead, behind } => signals.push(attention_signal(
+            item,
+            AttentionSource::Git,
+            "diverged",
+            AttentionKind::Git,
+            AttentionLevel::Urgent,
+            AttentionUrgency::High,
+            AttentionImpact::High,
+            format!("branch diverged: {ahead} ahead, {behind} behind"),
+        )),
+        RepositorySync::UpToDate => {}
+    }
+    signals
+}
+
+fn derive_manifest_attention_signals(
+    item: &RepositoryListItem,
+    manifest: Option<&RepoManifest>,
+) -> Vec<AttentionSignal> {
+    let Some(scan) = &item.repo_manifest else {
+        return Vec::new();
+    };
+
+    match &scan.state {
+        RepoManifestScanState::Missing => vec![attention_signal(
+            item,
+            AttentionSource::Manifest,
+            "missing",
+            AttentionKind::Configuration,
+            AttentionLevel::ShouldDo,
+            AttentionUrgency::Medium,
+            AttentionImpact::Medium,
+            format!("missing {REPO_MANIFEST_FILE_NAME}"),
+        )],
+        RepoManifestScanState::Invalid { message } => vec![attention_signal(
+            item,
+            AttentionSource::Manifest,
+            "invalid",
+            AttentionKind::Configuration,
+            AttentionLevel::Blocked,
+            AttentionUrgency::High,
+            AttentionImpact::High,
+            format!("repo manifest is invalid: {message}"),
+        )],
+        RepoManifestScanState::Valid(summary) => {
+            if let Some(manifest) = manifest {
+                assess_repo_capability_policy(manifest)
+                    .issues
+                    .into_iter()
+                    .map(|issue| {
+                        let mut signal = attention_signal(
+                            item,
+                            AttentionSource::Manifest,
+                            &format!("policy:{}:{}", issue.repo_node_id, issue.capability),
+                            attention_kind_for_capability(&issue.capability),
+                            AttentionLevel::ShouldDo,
+                            AttentionUrgency::Medium,
+                            AttentionImpact::Medium,
+                            issue.message,
+                        );
+                        signal.item_id = Some(issue.repo_node_id);
+                        signal.suggested_actions = vec!["update_repo_manifest".to_string()];
+                        signal
+                    })
+                    .collect()
+            } else if summary.missing_required_capability_count > 0 {
+                let mut signal = attention_signal(
+                    item,
+                    AttentionSource::Manifest,
+                    "policy",
+                    AttentionKind::Configuration,
+                    AttentionLevel::ShouldDo,
+                    AttentionUrgency::Medium,
+                    AttentionImpact::Medium,
+                    format!(
+                        "{} required capability declaration(s) need attention",
+                        summary.missing_required_capability_count
+                    ),
+                );
+                signal.suggested_actions = vec!["update_repo_manifest".to_string()];
+                vec![signal]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
+fn derive_capability_attention_signals(
+    item: &RepositoryListItem,
+    manifest: Option<&RepoManifest>,
+    registry: &CapabilityRegistry,
+) -> Vec<AttentionSignal> {
+    let states = registry
+        .states
+        .iter()
+        .filter(|state| state.repo_id == item.id)
+        .collect::<Vec<_>>();
+    let mut signals = states
+        .iter()
+        .filter_map(|state| capability_state_attention_signal(item, state))
+        .collect::<Vec<_>>();
+
+    if let Some(manifest) = manifest {
+        let recorded_ids = states
+            .iter()
+            .map(|state| state.capability_instance_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for capability in manifest.capabilities.iter().filter(|capability| {
+            capability.status == CapabilityDeclarationStatus::Implemented
+                && !recorded_ids.contains(capability.id.as_str())
+        }) {
+            let mut signal = attention_signal(
+                item,
+                AttentionSource::Capability,
+                &capability.capability,
+                attention_kind_for_capability(&capability.capability),
+                AttentionLevel::ShouldDo,
+                AttentionUrgency::Medium,
+                AttentionImpact::Medium,
+                format!("{} has no recorded result", capability.capability),
+            );
+            signal.id = format!("{}:{}:unknown", item.id, capability.id);
+            signal.item_id = capability.item_id.clone();
+            signal.capability_instance_id = Some(capability.id.clone());
+            signal.root = capability.root.clone();
+            signal.suggested_actions = vec!["run_capability_check".to_string()];
+            signals.push(signal);
+        }
+    }
+
+    signals
+}
+
+fn capability_state_attention_signal(
+    item: &RepositoryListItem,
+    state: &CapabilityState,
+) -> Option<AttentionSignal> {
+    let stale_reason = capability_stale_reason(item, state);
+    let status = if stale_reason.is_some() {
+        CapabilityResultStatus::Stale
+    } else {
+        state.status
+    };
+
+    let (level, urgency, impact, summary, stale) = match status {
+        CapabilityResultStatus::Ok | CapabilityResultStatus::Running => return None,
+        CapabilityResultStatus::Warning => (
+            AttentionLevel::ShouldDo,
+            AttentionUrgency::Medium,
+            AttentionImpact::Medium,
+            state.summary.clone(),
+            false,
+        ),
+        CapabilityResultStatus::Failed => (
+            AttentionLevel::Urgent,
+            AttentionUrgency::High,
+            AttentionImpact::High,
+            state.summary.clone(),
+            false,
+        ),
+        CapabilityResultStatus::Error => (
+            AttentionLevel::Urgent,
+            AttentionUrgency::High,
+            AttentionImpact::Medium,
+            state.summary.clone(),
+            false,
+        ),
+        CapabilityResultStatus::Unknown => (
+            AttentionLevel::ShouldDo,
+            AttentionUrgency::Medium,
+            AttentionImpact::Medium,
+            state.summary.clone(),
+            false,
+        ),
+        CapabilityResultStatus::Stale => {
+            let reason = match stale_reason {
+                Some(CapabilityStaleReason::DirtyWorktree) => "dirty worktree",
+                Some(CapabilityStaleReason::CommitChanged) => "commit changed",
+                None => "stale result",
+            };
+            (
+                AttentionLevel::ShouldDo,
+                AttentionUrgency::Medium,
+                AttentionImpact::Medium,
+                format!("{} (stale: {reason})", state.summary),
+                true,
+            )
+        }
+    };
+
+    let mut signal = attention_signal(
+        item,
+        AttentionSource::Capability,
+        &state.capability,
+        attention_kind_for_capability(&state.capability),
+        level,
+        urgency,
+        impact,
+        summary,
+    );
+    signal.id = format!("{}:{}", item.id, state.capability_instance_id);
+    signal.item_id = state.item_id.clone();
+    signal.capability_instance_id = Some(state.capability_instance_id.clone());
+    signal.root = state.root.clone();
+    signal.observed_at_epoch_secs = state.checked_at_epoch_secs;
+    signal.stale = stale;
+    signal.suggested_actions = capability_suggested_actions(&state.capability, status);
+    Some(signal)
+}
+
+fn attention_signal(
+    item: &RepositoryListItem,
+    source: AttentionSource,
+    source_id: &str,
+    kind: AttentionKind,
+    level: AttentionLevel,
+    urgency: AttentionUrgency,
+    impact: AttentionImpact,
+    summary: String,
+) -> AttentionSignal {
+    AttentionSignal {
+        id: format!("{}:{source_id}", item.id),
+        repo_id: item.id.clone(),
+        repo_name: item.name.clone(),
+        source,
+        source_id: source_id.to_string(),
+        kind,
+        status: AttentionStatus::Open,
+        level,
+        urgency,
+        impact,
+        summary,
+        item_id: None,
+        capability_instance_id: None,
+        root: None,
+        suggested_actions: Vec::new(),
+        observed_at_epoch_secs: None,
+        stale: false,
+    }
+}
+
+fn attention_kind_for_capability(capability: &str) -> AttentionKind {
+    if capability.starts_with("integrity.") {
+        AttentionKind::Integrity
+    } else if capability.starts_with("dependencies.") {
+        AttentionKind::Maintenance
+    } else if capability.contains("security") {
+        AttentionKind::Security
+    } else if capability.starts_with("observability.") {
+        AttentionKind::Operations
+    } else {
+        AttentionKind::Operations
+    }
+}
+
+fn capability_suggested_actions(capability: &str, status: CapabilityResultStatus) -> Vec<String> {
+    match status {
+        CapabilityResultStatus::Stale | CapabilityResultStatus::Unknown => {
+            vec!["run_capability_check".to_string()]
+        }
+        _ if capability == "dependencies.outdated" => vec!["update_dependencies".to_string()],
+        _ if capability == "integrity.build" => vec!["fix_build".to_string()],
+        _ if capability == "integrity.tests" => vec!["fix_tests".to_string()],
+        _ if capability == "integrity.test_build" => vec!["fix_test_build".to_string()],
+        _ => vec!["inspect_capability".to_string()],
     }
 }
 
@@ -4589,6 +5106,166 @@ mod tests {
         let loaded = load_capability_registry(&path).unwrap();
         assert_eq!(loaded, registry);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn attention_signals_include_git_and_required_capability_policy() {
+        let manifest = cargo_repo_manifest(Vec::new());
+        let item = attention_test_item(
+            RepositoryState::Clean,
+            RepositorySync::Behind(2),
+            Some("abc"),
+            Some(&manifest),
+        );
+
+        let signals =
+            derive_attention_signals(&item, Some(&manifest), &CapabilityRegistry::default());
+
+        assert!(signals.iter().any(|signal| {
+            signal.source == AttentionSource::Git
+                && signal.source_id == "behind"
+                && signal.level == AttentionLevel::ShouldDo
+        }));
+        let policy_signals = signals
+            .iter()
+            .filter(|signal| signal.source == AttentionSource::Manifest)
+            .collect::<Vec<_>>();
+        assert_eq!(policy_signals.len(), 4);
+        assert!(policy_signals
+            .iter()
+            .any(|signal| signal.source_id.contains("dependencies.outdated")));
+        assert_eq!(attention_rank(&signals), 2);
+    }
+
+    #[test]
+    fn attention_signals_mark_capability_results_stale_after_commit_change() {
+        let manifest = cargo_repo_manifest(vec![implemented_capability(
+            "server/dependencies/outdated",
+            "dependencies.outdated",
+        )]);
+        let item = attention_test_item(
+            RepositoryState::Clean,
+            RepositorySync::UpToDate,
+            Some("new"),
+            Some(&manifest),
+        );
+        let registry = CapabilityRegistry {
+            schema_version: 1,
+            states: vec![CapabilityState {
+                repo_id: "sample".to_string(),
+                capability_instance_id: "server/dependencies/outdated".to_string(),
+                capability: "dependencies.outdated".to_string(),
+                item_id: Some("server".to_string()),
+                root: Some(PathBuf::from("server")),
+                status: CapabilityResultStatus::Ok,
+                summary: "dependencies are current".to_string(),
+                findings: Vec::new(),
+                checked_at_epoch_secs: Some(10),
+                commit: Some("old".to_string()),
+                dirty: false,
+                duration_ms: Some(100),
+            }],
+        };
+
+        let signals = derive_attention_signals(&item, Some(&manifest), &registry);
+        let stale = signals
+            .iter()
+            .find(|signal| {
+                signal.capability_instance_id.as_deref() == Some("server/dependencies/outdated")
+            })
+            .unwrap();
+        assert_eq!(stale.source, AttentionSource::Capability);
+        assert_eq!(stale.kind, AttentionKind::Maintenance);
+        assert_eq!(stale.level, AttentionLevel::ShouldDo);
+        assert!(stale.stale);
+        assert!(stale.summary.contains("commit changed"));
+        assert_eq!(stale.suggested_actions, vec!["run_capability_check"]);
+    }
+
+    #[test]
+    fn attention_signals_report_unknown_implemented_capabilities() {
+        let manifest = cargo_repo_manifest(vec![implemented_capability(
+            "server/build",
+            "integrity.build",
+        )]);
+        let item = attention_test_item(
+            RepositoryState::Clean,
+            RepositorySync::UpToDate,
+            Some("abc"),
+            Some(&manifest),
+        );
+
+        let signals =
+            derive_attention_signals(&item, Some(&manifest), &CapabilityRegistry::default());
+        let unknown = signals
+            .iter()
+            .find(|signal| signal.capability_instance_id.as_deref() == Some("server/build"))
+            .unwrap();
+        assert_eq!(unknown.source, AttentionSource::Capability);
+        assert_eq!(unknown.kind, AttentionKind::Integrity);
+        assert_eq!(unknown.level, AttentionLevel::ShouldDo);
+        assert_eq!(unknown.suggested_actions, vec!["run_capability_check"]);
+    }
+
+    fn cargo_repo_manifest(capabilities: Vec<RepoCapabilityDeclaration>) -> RepoManifest {
+        RepoManifest {
+            schema_version: REPO_MANIFEST_SCHEMA_VERSION,
+            repo_id: Some("sample".to_string()),
+            items: vec![RepoItem {
+                id: "server".to_string(),
+                item_type: "cargo".to_string(),
+                path: PathBuf::from("server"),
+                config: None,
+                artifacts: Vec::new(),
+                actions: Vec::new(),
+            }],
+            actions: Vec::new(),
+            capabilities,
+            repo_actions: Vec::new(),
+            aggregation: Vec::new(),
+        }
+    }
+
+    fn implemented_capability(id: &str, capability: &str) -> RepoCapabilityDeclaration {
+        RepoCapabilityDeclaration {
+            id: id.to_string(),
+            capability: capability.to_string(),
+            status: CapabilityDeclarationStatus::Implemented,
+            item_id: Some("server".to_string()),
+            root: None,
+            action_ref: None,
+            standard_action: Some("cargo.test".to_string()),
+            reason: None,
+            schedule: None,
+        }
+    }
+
+    fn attention_test_item(
+        state: RepositoryState,
+        sync: RepositorySync,
+        head_commit: Option<&str>,
+        manifest: Option<&RepoManifest>,
+    ) -> RepositoryListItem {
+        RepositoryListItem {
+            id: "sample".to_string(),
+            name: "Sample".to_string(),
+            dir_name: "sample".to_string(),
+            remote_url: "git@example.com:sample.git".to_string(),
+            status: RepositoryStatus {
+                state,
+                branch: Some("main".to_string()),
+                sync,
+                head_commit: head_commit.map(str::to_string),
+                repo_path: PathBuf::from("/tmp/sample"),
+            },
+            repo_manifest: manifest.map(|manifest| RepoManifestScan {
+                path: PathBuf::from("/tmp/sample/ronomepo.repo.json"),
+                state: RepoManifestScanState::Valid(repo_manifest_summary(
+                    Path::new("/tmp/sample"),
+                    manifest,
+                )),
+            }),
+        }
     }
 
     fn init_git_repo(path: &Path) {
