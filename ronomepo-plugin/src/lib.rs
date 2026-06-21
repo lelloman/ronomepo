@@ -5063,23 +5063,6 @@ fn workspace_attention_lines(
     lines
 }
 
-fn repo_attention_lines(signals: &[AttentionSignal]) -> Vec<String> {
-    signals
-        .iter()
-        .map(|signal| {
-            format!(
-                "{} | {} | {} | urgency {} | impact {} | {}",
-                attention_level_label(signal.level),
-                attention_kind_label(signal.kind),
-                attention_source_label(signal.source),
-                attention_urgency_label(signal.urgency),
-                attention_impact_label(signal.impact),
-                signal.summary
-            )
-        })
-        .collect()
-}
-
 fn attention_level_label(level: AttentionLevel) -> &'static str {
     match level {
         AttentionLevel::Info => "info",
@@ -7575,13 +7558,9 @@ fn render_repo_overview_into(
 ) {
     clear_box(root);
 
-    let title = Label::new(Some("Repo Overview"));
-    title.set_xalign(0.0);
-    title.add_css_class("title-2");
-    root.append(&title);
-
     let target_repo_id = instance_key.or(snapshot.active_repo_id.as_deref());
     let Some(active_repo_id) = target_repo_id else {
+        append_repo_overview_empty_title(root);
         let body = Label::new(Some(
             "No repo target was provided. Open repo overviews from the left monitor.",
         ));
@@ -7596,6 +7575,7 @@ fn render_repo_overview_into(
 
     let items = repository_items(snapshot);
     let Some(item) = items.iter().find(|item| item.id == active_repo_id) else {
+        append_repo_overview_empty_title(root);
         let body = Label::new(Some(
             "The active repo overview target is no longer present in the current manifest.",
         ));
@@ -7608,117 +7588,229 @@ fn render_repo_overview_into(
         return;
     };
 
-    let subtitle = Label::new(Some(&format!(
-        "{} | {} | {}",
-        item.name,
-        branch_label(item),
-        format_sync_label(&item.status.sync)
-    )));
-    subtitle.set_xalign(0.0);
-    subtitle.add_css_class("muted");
-    subtitle.set_wrap(true);
-    root.append(&subtitle);
-    root.append(&repo_overview_actions(item, host_ptr));
-    root.append(&overview_actions(true));
-    root.append(&overview_file_actions(snapshot, host_ptr));
-
-    let attention_signals = repo_attention_detail_signals(snapshot, item);
-    let due_capability_count = repo_due_capability_count(snapshot, item, current_epoch_secs());
-    let status_cards = GtkBox::new(Orientation::Horizontal, 12);
-    for (label, value) in [
-        ("Branch", branch_label(item).to_string()),
-        ("State", status_label(&item.status.state).to_string()),
-        ("Sync", format_sync_label(&item.status.sync)),
-        (
-            "Attention",
-            attention_monitor_label(&attention_signals).to_string(),
-        ),
-        (
-            "Caps",
-            capability_monitor_label(&capability_monitor_summary(item, snapshot)).to_string(),
-        ),
-        ("Due Caps", due_capability_count.to_string()),
-        (
-            "Selected",
-            if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
-                "Yes".to_string()
-            } else {
-                "No".to_string()
-            },
-        ),
-    ] {
-        status_cards.append(&stat_card(label, &value));
-    }
-
-    let sections = GtkBox::new(Orientation::Vertical, 12);
     if !snapshot.repo_details_cache.contains_key(&item.id)
         && !snapshot.repo_details_loading.contains(&item.id)
     {
         schedule_repo_details_load(&item.id, &item.status.repo_path);
     }
+
+    let attention_signals = repo_attention_detail_signals(snapshot, item);
     let details = snapshot.repo_details_cache.get(&item.id);
-    append_overview_section(
-        &sections,
-        "Path",
-        &item.status.repo_path.display().to_string(),
-    );
-    append_overview_section(&sections, "Remote", &item.remote_url);
-    append_overview_section(&sections, "Directory", &item.dir_name);
-    append_overview_section(&sections, "State", status_label(&item.status.state));
-    append_overview_section(&sections, "Sync", &format_sync_label(&item.status.sync));
-    append_lines_section(
-        &sections,
-        "Attention Signals",
-        &repo_attention_lines(&attention_signals),
-        "No open attention signals.",
-    );
-    append_overview_section(
-        &sections,
-        "Current Selection Scope",
-        &repo_selection_scope_label(snapshot, item),
-    );
-    append_overview_section(
-        &sections,
-        "Action Eligibility",
-        &repo_action_eligibility(item),
-    );
-    append_lines_section(
-        &sections,
-        "Capabilities",
-        &repo_capability_detail_lines(snapshot, item),
+
+    root.append(&repo_overview_context(item, snapshot, &attention_signals));
+
+    let content = GtkBox::new(Orientation::Horizontal, 24);
+    content.set_hexpand(true);
+
+    let main = GtkBox::new(Orientation::Vertical, 16);
+    main.set_hexpand(true);
+    main.append(&repo_overview_attention_section(&attention_signals));
+    main.append(&repo_overview_capabilities_section(snapshot, item));
+    main.append(&repo_overview_activity_section(
+        &repo_recent_logs(snapshot, item),
+        6,
+    ));
+
+    let side = GtkBox::new(Orientation::Vertical, 16);
+    side.set_width_request(380);
+    side.append(&repo_overview_actions_section(item, host_ptr));
+    side.append(&repo_overview_git_section(snapshot, item, details));
+    side.append(&repo_overview_workspace_section(snapshot, host_ptr));
+
+    content.append(&main);
+    content.append(&side);
+    root.append(&content);
+}
+
+fn append_repo_overview_empty_title(root: &GtkBox) {
+    let title = Label::new(Some("Repo Overview"));
+    title.set_xalign(0.0);
+    title.add_css_class("title-2");
+    root.append(&title);
+}
+
+fn repo_overview_context(
+    item: &RepositoryListItem,
+    snapshot: &StateSnapshot,
+    attention_signals: &[AttentionSignal],
+) -> GtkBox {
+    let block = GtkBox::new(Orientation::Vertical, 4);
+
+    let context = Label::new(Some(&format!(
+        "{}   {}   {}",
+        item.status.repo_path.display(),
+        branch_label(item),
+        format_sync_label(&item.status.sync)
+    )));
+    context.set_xalign(0.0);
+    context.add_css_class("muted");
+    context.set_wrap(true);
+    block.append(&context);
+
+    let status = Label::new(Some(&format!(
+        "{} · attention {} · caps {} · due {} · {}",
+        status_label(&item.status.state),
+        attention_monitor_label(attention_signals),
+        capability_monitor_label(&capability_monitor_summary(item, snapshot)),
+        repo_due_capability_count(snapshot, item, current_epoch_secs()),
+        if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
+            "selected"
+        } else {
+            "not selected"
+        }
+    )));
+    status.set_xalign(0.0);
+    status.add_css_class("dim-label");
+    status.set_wrap(true);
+    block.append(&status);
+
+    block
+}
+
+fn repo_overview_section(title: &str, child: &impl IsA<gtk::Widget>) -> GtkBox {
+    let block = GtkBox::new(Orientation::Vertical, 8);
+
+    let heading = Label::new(Some(title));
+    heading.set_xalign(0.0);
+    heading.add_css_class("title-4");
+    block.append(&heading);
+    block.append(child);
+
+    block
+}
+
+fn repo_overview_attention_section(signals: &[AttentionSignal]) -> GtkBox {
+    let body = GtkBox::new(Orientation::Vertical, 8);
+    if signals.is_empty() {
+        let empty = Label::new(Some("No open attention signals."));
+        empty.set_xalign(0.0);
+        empty.add_css_class("muted");
+        body.append(&empty);
+    } else {
+        for signal in signals {
+            body.append(&repo_overview_attention_row(signal));
+        }
+    }
+    repo_overview_section("Needs Attention", &body)
+}
+
+fn repo_overview_attention_row(signal: &AttentionSignal) -> GtkBox {
+    let row = GtkBox::new(Orientation::Vertical, 2);
+
+    let summary = Label::new(Some(&signal.summary));
+    summary.set_xalign(0.0);
+    summary.set_wrap(true);
+    row.append(&summary);
+
+    let meta = Label::new(Some(&format!(
+        "{} · {} · {} · urgency {} · impact {}",
+        attention_level_label(signal.level),
+        attention_kind_label(signal.kind),
+        attention_source_label(signal.source),
+        attention_urgency_label(signal.urgency),
+        attention_impact_label(signal.impact)
+    )));
+    meta.set_xalign(0.0);
+    meta.set_wrap(true);
+    meta.add_css_class("dim-label");
+    row.append(&meta);
+
+    row
+}
+
+fn repo_overview_capabilities_section(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+) -> GtkBox {
+    let lines = repo_capability_detail_lines(snapshot, item);
+    let body = repo_overview_lines_body(
+        &lines,
         "No capabilities declared or recorded for this repository.",
+        false,
     );
-    append_overview_section(
-        &sections,
-        "Last Commit",
-        &details
-            .and_then(|details| details.last_commit.as_ref())
-            .map(|commit| format!("{} {}", commit.short_sha, commit.subject))
-            .unwrap_or_else(|| {
-                if snapshot.repo_details_loading.contains(&item.id) {
-                    "Loading commit information...".to_string()
-                } else {
-                    "No commit information available.".to_string()
-                }
-            }),
-    );
-    append_lines_section(
-        &sections,
-        "Remotes",
-        &details
-            .map(|details| details.remotes.clone())
-            .unwrap_or_else(|| {
-                if snapshot.repo_details_loading.contains(&item.id) {
-                    vec!["Loading remotes...".to_string()]
-                } else {
-                    Vec::new()
-                }
-            }),
-        "No remotes reported for this repository.",
-    );
-    append_lines_section(
-        &sections,
-        "Changed Files",
+    repo_overview_section("Capabilities", &body)
+}
+
+fn repo_overview_actions_section(
+    item: &RepositoryListItem,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) -> GtkBox {
+    let body = GtkBox::new(Orientation::Vertical, 10);
+
+    let primary = GtkBox::new(Orientation::Horizontal, 8);
+    for label in ["Run Cap Checks", "Edit Repo Manifest"] {
+        primary.append(&repo_overview_action_button(item, host_ptr, label, None));
+    }
+    body.append(&primary);
+
+    let open = GtkBox::new(Orientation::Horizontal, 8);
+    for label in ["Open Terminal", "Open In Editor", "Open Folder"] {
+        open.append(&repo_overview_action_button(item, host_ptr, label, None));
+    }
+    body.append(&open);
+
+    let config = GtkBox::new(Orientation::Horizontal, 8);
+    for label in ["Edit README", "Edit .git/config"] {
+        config.append(&repo_overview_action_button(item, host_ptr, label, None));
+    }
+    body.append(&config);
+
+    let git = GtkBox::new(Orientation::Horizontal, 8);
+    for (label, kind) in [
+        ("Target This Repo", None),
+        ("Pull Repo", Some(OperationKind::Pull)),
+        ("Push Repo", Some(OperationKind::Push)),
+    ] {
+        git.append(&repo_overview_action_button(item, host_ptr, label, kind));
+    }
+    body.append(&git);
+
+    let risky = GtkBox::new(Orientation::Horizontal, 8);
+    for (label, kind) in [
+        ("Clone Repo", OperationKind::CloneMissing),
+        ("Push Repo Force", OperationKind::PushForce),
+        ("Apply Hooks", OperationKind::ApplyHooks),
+    ] {
+        risky.append(&repo_overview_action_button(
+            item,
+            host_ptr,
+            label,
+            Some(kind),
+        ));
+    }
+    body.append(&risky);
+
+    repo_overview_section("Actions", &body)
+}
+
+fn repo_overview_git_section(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+    details: Option<&RepositoryDetails>,
+) -> GtkBox {
+    let body = GtkBox::new(Orientation::Vertical, 10);
+    body.append(&repo_overview_facts_body(&[
+        ("State", status_label(&item.status.state).to_string()),
+        ("Sync", format_sync_label(&item.status.sync)),
+        ("Selection", repo_selection_scope_label(snapshot, item)),
+        (
+            "Commit",
+            details
+                .and_then(|details| details.last_commit.as_ref())
+                .map(|commit| format!("{} {}", commit.short_sha, commit.subject))
+                .unwrap_or_else(|| {
+                    if snapshot.repo_details_loading.contains(&item.id) {
+                        "Loading commit information...".to_string()
+                    } else {
+                        "No commit information available.".to_string()
+                    }
+                }),
+        ),
+        ("Remote", item.remote_url.clone()),
+    ]));
+
+    body.append(&repo_overview_subsection_label("Changed Files"));
+    body.append(&repo_overview_lines_body(
         &details
             .map(|details| details.changed_files.clone())
             .unwrap_or_else(|| {
@@ -7729,16 +7821,99 @@ fn render_repo_overview_into(
                 }
             }),
         "Working tree is clean.",
-    );
-    append_log_section(
-        &sections,
-        "Recent Repo Activity",
-        &repo_recent_logs(snapshot, item),
-        6,
-    );
+        true,
+    ));
 
-    root.append(&status_cards);
-    root.append(&sections);
+    body.append(&repo_overview_subsection_label("Remotes"));
+    body.append(&repo_overview_lines_body(
+        &details
+            .map(|details| details.remotes.clone())
+            .unwrap_or_else(|| {
+                if snapshot.repo_details_loading.contains(&item.id) {
+                    vec!["Loading remotes...".to_string()]
+                } else {
+                    Vec::new()
+                }
+            }),
+        "No remotes reported for this repository.",
+        true,
+    ));
+
+    repo_overview_section("Git", &body)
+}
+
+fn repo_overview_workspace_section(
+    snapshot: &StateSnapshot,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) -> GtkBox {
+    let body = GtkBox::new(Orientation::Vertical, 8);
+    body.append(&overview_command_group("Actions", overview_actions(true)));
+    body.append(&overview_command_group(
+        "Files",
+        overview_file_actions(snapshot, host_ptr),
+    ));
+    repo_overview_section("Workspace", &body)
+}
+
+fn repo_overview_activity_section(logs: &[String], limit: usize) -> GtkBox {
+    let visible = logs.iter().rev().take(limit).cloned().collect::<Vec<_>>();
+    let mut visible = visible.into_iter().rev().collect::<Vec<_>>();
+    if visible.is_empty() {
+        visible.push("No operations recorded yet.".to_string());
+    }
+    let body = repo_overview_lines_body(&visible, "No operations recorded yet.", true);
+    repo_overview_section("Activity", &body)
+}
+
+fn repo_overview_subsection_label(text: &str) -> Label {
+    let label = Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.add_css_class("dim-label");
+    label
+}
+
+fn repo_overview_lines_body(lines: &[String], empty_message: &str, mono: bool) -> GtkBox {
+    let block = GtkBox::new(Orientation::Vertical, 6);
+    if lines.is_empty() {
+        let empty = Label::new(Some(empty_message));
+        empty.set_xalign(0.0);
+        empty.add_css_class("muted");
+        block.append(&empty);
+    } else {
+        for line in lines {
+            let row = Label::new(Some(line));
+            row.set_xalign(0.0);
+            row.set_wrap(true);
+            if mono {
+                row.add_css_class("mono");
+            }
+            block.append(&row);
+        }
+    }
+    block
+}
+
+fn repo_overview_facts_body(facts: &[(&str, String)]) -> GtkBox {
+    let block = GtkBox::new(Orientation::Vertical, 6);
+    for (label, value) in facts {
+        let row = GtkBox::new(Orientation::Horizontal, 10);
+        row.set_hexpand(true);
+
+        let key = Label::new(Some(label));
+        key.set_xalign(0.0);
+        key.set_width_chars(9);
+        key.add_css_class("dim-label");
+
+        let value_label = Label::new(Some(value));
+        value_label.set_xalign(0.0);
+        value_label.set_hexpand(true);
+        value_label.set_wrap(true);
+
+        row.append(&key);
+        row.append(&value_label);
+        block.append(&row);
+    }
+    block
 }
 
 fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str>) -> GtkBox {
@@ -8193,69 +8368,53 @@ fn sync_bucket_ids(items: &[RepositoryListItem], sync_label: &str) -> Vec<String
     })
 }
 
-fn repo_overview_actions(
+fn repo_overview_action_button(
     item: &RepositoryListItem,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-) -> GtkBox {
-    let actions = GtkBox::new(Orientation::Horizontal, 8);
-    for (label, kind) in [
-        ("Target This Repo", None),
-        ("Open Folder", None),
-        ("Open Terminal", None),
-        ("Open In Editor", None),
-        ("Edit Repo Manifest", None),
-        ("Edit README", None),
-        ("Edit .git/config", None),
-        ("Run Cap Checks", None),
-        ("Clone Repo", Some(OperationKind::CloneMissing)),
-        ("Pull Repo", Some(OperationKind::Pull)),
-        ("Push Repo", Some(OperationKind::Push)),
-        ("Push Repo Force", Some(OperationKind::PushForce)),
-        ("Apply Hooks", Some(OperationKind::ApplyHooks)),
-    ] {
-        let button = Button::with_label(label);
-        let repo_id = item.id.clone();
-        let repo_name = item.name.clone();
-        let repo_path = item.status.repo_path.clone();
-        button.connect_clicked(move |_| match label {
-            "Target This Repo" => {
-                set_selected_repo_ids(vec![repo_id.clone()]);
-                append_log(format!("Targeted {repo_id} as the active selection."));
+    label: &'static str,
+    kind: Option<OperationKind>,
+) -> Button {
+    let button = Button::with_label(label);
+    let repo_id = item.id.clone();
+    let repo_name = item.name.clone();
+    let repo_path = item.status.repo_path.clone();
+    button.connect_clicked(move |_| match label {
+        "Target This Repo" => {
+            set_selected_repo_ids(vec![repo_id.clone()]);
+            append_log(format!("Targeted {repo_id} as the active selection."));
+        }
+        "Open Folder" => {
+            open_path_in_file_manager(&repo_path, &repo_name);
+        }
+        "Open Terminal" => {
+            open_path_in_terminal(&repo_path, &repo_name);
+        }
+        "Open In Editor" => {
+            open_path_in_editor(&repo_path, &repo_name);
+        }
+        "Edit Repo Manifest" => {
+            if let Err(message) = open_repo_manifest_editor(host_ptr, &repo_id, &repo_name) {
+                append_log(message);
             }
-            "Open Folder" => {
-                open_path_in_file_manager(&repo_path, &repo_name);
+        }
+        "Edit README" => {
+            open_text_editor_for_path(host_ptr, &repo_path.join("README.md"));
+        }
+        "Edit .git/config" => {
+            open_text_editor_for_path(host_ptr, &repo_path.join(".git/config"));
+        }
+        "Run Cap Checks" => {
+            set_selected_repo_ids(vec![repo_id.clone()]);
+            run_selected_repo_capability_checks();
+        }
+        _ => {
+            set_selected_repo_ids(vec![repo_id.clone()]);
+            if let Some(kind) = kind {
+                launch_operation(kind);
             }
-            "Open Terminal" => {
-                open_path_in_terminal(&repo_path, &repo_name);
-            }
-            "Open In Editor" => {
-                open_path_in_editor(&repo_path, &repo_name);
-            }
-            "Edit Repo Manifest" => {
-                if let Err(message) = open_repo_manifest_editor(host_ptr, &repo_id, &repo_name) {
-                    append_log(message);
-                }
-            }
-            "Edit README" => {
-                open_text_editor_for_path(host_ptr, &repo_path.join("README.md"));
-            }
-            "Edit .git/config" => {
-                open_text_editor_for_path(host_ptr, &repo_path.join(".git/config"));
-            }
-            "Run Cap Checks" => {
-                set_selected_repo_ids(vec![repo_id.clone()]);
-                run_selected_repo_capability_checks();
-            }
-            _ => {
-                set_selected_repo_ids(vec![repo_id.clone()]);
-                if let Some(kind) = kind {
-                    launch_operation(kind);
-                }
-            }
-        });
-        actions.append(&button);
-    }
-    actions
+        }
+    });
+    button
 }
 
 fn overview_file_actions(
@@ -8437,21 +8596,6 @@ fn stat_card(label: &str, value: &str) -> GtkBox {
     card
 }
 
-fn append_overview_section(container: &GtkBox, heading: &str, body: &str) {
-    let block = GtkBox::new(Orientation::Vertical, 4);
-    let heading_label = Label::new(Some(heading));
-    heading_label.set_xalign(0.0);
-    heading_label.add_css_class("title-4");
-    let body_label = Label::new(Some(body));
-    body_label.set_xalign(0.0);
-    body_label.set_wrap(true);
-    body_label.add_css_class("muted");
-    block.append(&heading_label);
-    block.append(&body_label);
-    container.append(&block);
-    container.append(&Separator::new(Orientation::Horizontal));
-}
-
 fn append_lines_section(container: &GtkBox, heading: &str, lines: &[String], empty_message: &str) {
     let block = GtkBox::new(Orientation::Vertical, 6);
     let heading_label = Label::new(Some(heading));
@@ -8598,45 +8742,6 @@ fn repo_selection_scope_label(snapshot: &StateSnapshot, item: &RepositoryListIte
             snapshot.selected_repo_ids.len()
         )
     }
-}
-
-fn repo_action_eligibility(item: &RepositoryListItem) -> String {
-    use ronomepo_core::{RepositoryState, RepositorySync};
-
-    let clone = if matches!(item.status.state, RepositoryState::Missing) {
-        "Clone is available."
-    } else {
-        "Clone will be skipped because the repo already exists locally."
-    };
-    let pull = match item.status.state {
-        RepositoryState::Missing => "Pull will be skipped until the repo is cloned.",
-        RepositoryState::Dirty => "Pull will be skipped because the working tree is dirty.",
-        RepositoryState::Untracked => "Pull is allowed, but untracked files are present.",
-        _ => "Pull is allowed if the repo has a valid remote.",
-    };
-    let push = match &item.status.sync {
-        RepositorySync::Ahead(count) => {
-            format!("Push is available with {count} local commit(s) ahead.")
-        }
-        RepositorySync::Diverged { ahead, behind } => {
-            format!("Push is risky: the branch diverged (+{ahead}/-{behind}).")
-        }
-        RepositorySync::NoUpstream => {
-            "Push will be skipped because no upstream is configured.".to_string()
-        }
-        RepositorySync::Behind(count) => {
-            format!("Push is not useful yet because the branch is behind by {count} commit(s).")
-        }
-        RepositorySync::UpToDate => {
-            "Push will be skipped because the repo is already up to date.".to_string()
-        }
-        RepositorySync::Unknown => {
-            "Push eligibility is unknown because Git sync state could not be determined."
-                .to_string()
-        }
-    };
-
-    format!("{clone} {pull} {push}")
 }
 
 fn repo_recent_logs(snapshot: &StateSnapshot, item: &RepositoryListItem) -> Vec<String> {
