@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -42,12 +42,12 @@ use ronomepo_core::{
     capability_next_due_at_epoch_secs, collect_capability_git_snapshot,
     collect_commit_check_report, collect_repository_details, collect_workspace_line_stats,
     current_epoch_secs, default_capability_registry_path, default_commit_check_rules,
-    default_manifest_path, derive_attention_signals, derive_dir_name,
+    default_manifest_path, default_repo_manifest_path, derive_attention_signals, derive_dir_name,
     ensure_commit_check_rules_initialized, format_sync_label, import_repos_txt,
     list_repo_artifacts, load_capability_registry, load_manifest, load_repo_manifest,
     normalize_workspace_root, parse_capability_result_json, plan_capability_action,
     plan_repo_action, run_workspace_operation, save_capability_registry, save_manifest,
-    scan_repo_manifest, text_capability_result, upsert_capability_state,
+    save_repo_manifest, scan_repo_manifest, text_capability_result, upsert_capability_state,
     verify_repo_dependencies_freshness, workspace_summary, AttentionImpact, AttentionKind,
     AttentionLevel, AttentionSignal, AttentionSource, AttentionUrgency, CapabilityFinding,
     CapabilityFindingSeverity, CapabilityRegistry, CapabilityResult, CapabilityResultStatus,
@@ -66,6 +66,7 @@ const PLUGIN_ID: &str = "com.lelloman.ronomepo";
 const VIEW_REPO_MONITOR: &str = "com.lelloman.ronomepo.repo_monitor";
 const VIEW_MONOREPO_OVERVIEW: &str = "com.lelloman.ronomepo.monorepo_overview";
 const VIEW_REPO_OVERVIEW: &str = "com.lelloman.ronomepo.repo_overview";
+const VIEW_REPO_MANIFEST_EDITOR: &str = "com.lelloman.ronomepo.repo_manifest_editor";
 const VIEW_COMMIT_CHECK: &str = "com.lelloman.ronomepo.commit_check";
 const VIEW_WORKSPACE_SETTINGS: &str = "com.lelloman.ronomepo.workspace_settings";
 const VIEW_TEXT_EDITOR: &str = "com.lelloman.ronomepo.text_editor";
@@ -450,6 +451,45 @@ struct RepoEditorRowInput {
     name: String,
     dir_name: String,
     remote_url: String,
+}
+
+#[derive(Clone)]
+struct RepoManifestItemRowHandle {
+    row: GtkBox,
+    id: Entry,
+    item_type: Entry,
+    path: Entry,
+    config: Option<Value>,
+    artifacts: Vec<ronomepo_core::RepoArtifactDefinition>,
+    actions: Vec<ronomepo_core::RepoActionCommand>,
+}
+
+#[derive(Clone)]
+struct RepoManifestActionRowHandle {
+    row: GtkBox,
+    id: Entry,
+    command: Entry,
+    workdir: Entry,
+    timeout_seconds: Entry,
+    output: DropDown,
+    env: BTreeMap<String, String>,
+}
+
+#[derive(Clone)]
+struct RepoManifestCapabilityRowHandle {
+    row: GtkBox,
+    id: Entry,
+    capability: Entry,
+    status: DropDown,
+    item_id: Entry,
+    root: Entry,
+    action_kind: DropDown,
+    action_value: Entry,
+    schedule_kind: DropDown,
+    interval_seconds: Entry,
+    reason: Entry,
+    preserved_action_ref: Option<ronomepo_core::RepoActionRef>,
+    preserved_standard_action: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1034,6 +1074,13 @@ impl Plugin for RonomepoPlugin {
             "Repo Overview",
             MzViewPlacement::Workbench,
             create_repo_overview_view,
+        ))?;
+        host.register_view_factory(ViewFactorySpec::new(
+            PLUGIN_ID,
+            VIEW_REPO_MANIFEST_EDITOR,
+            "Repo Manifest Editor",
+            MzViewPlacement::Workbench,
+            create_repo_manifest_editor_view,
         ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
@@ -3426,6 +3473,45 @@ fn fetch_repository_remote(repo_path: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn open_repo_manifest_editor(
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    repo_id: &str,
+    repo_name: &str,
+) -> Result<(), String> {
+    if host_ptr.is_null() {
+        return Err(
+            "Cannot open Repo Manifest Editor because the host handle is unavailable.".to_string(),
+        );
+    }
+    let host = unsafe { HostApi::from_raw(&*host_ptr) };
+    let instance_key = repo_id.to_string();
+    let title = format!("{repo_name} Manifest");
+    let mut request = OpenViewRequest::new(
+        PLUGIN_ID,
+        VIEW_REPO_MANIFEST_EDITOR,
+        MzViewPlacement::Workbench,
+    );
+    request.instance_key = Some(&instance_key);
+    request.requested_title = Some(&title);
+    request.payload = instance_key.as_bytes();
+
+    match host.open_view(&request) {
+        Ok(MzViewOpenDisposition::Opened) => {
+            append_log(format!("Opened repo manifest editor for {repo_name}."));
+            Ok(())
+        }
+        Ok(MzViewOpenDisposition::FocusedExisting) => {
+            append_log(format!(
+                "Focused existing repo manifest editor for {repo_name}."
+            ));
+            Ok(())
+        }
+        Err(status) => Err(format!(
+            "Failed to open repo manifest editor for {repo_name}: {status:?}"
+        )),
     }
 }
 
@@ -8117,6 +8203,7 @@ fn repo_overview_actions(
         ("Open Folder", None),
         ("Open Terminal", None),
         ("Open In Editor", None),
+        ("Edit Repo Manifest", None),
         ("Edit README", None),
         ("Edit .git/config", None),
         ("Run Cap Checks", None),
@@ -8143,6 +8230,11 @@ fn repo_overview_actions(
             }
             "Open In Editor" => {
                 open_path_in_editor(&repo_path, &repo_name);
+            }
+            "Edit Repo Manifest" => {
+                if let Err(message) = open_repo_manifest_editor(host_ptr, &repo_id, &repo_name) {
+                    append_log(message);
+                }
             }
             "Edit README" => {
                 open_text_editor_for_path(host_ptr, &repo_path.join("README.md"));
@@ -8742,6 +8834,843 @@ fn open_path_in_editor(path: &Path, label: &str) {
             "Failed to open {label} in an editor at {}: {error}",
             path.display()
         )),
+    }
+}
+
+extern "C" fn create_repo_manifest_editor_view(
+    host: *const maruzzella_sdk::ffi::MzHostApi,
+    request: *const maruzzella_sdk::ffi::MzViewRequest,
+) -> *mut std::ffi::c_void {
+    if !gtk::is_initialized_main_thread() && gtk::init().is_err() {
+        return std::ptr::null_mut();
+    }
+
+    remember_host_ptr(host);
+
+    let repo_id = unsafe { request.as_ref() }
+        .and_then(|request| decode_mzstr(request.instance_key))
+        .or_else(|| {
+            unsafe { request.as_ref() }.and_then(|request| {
+                if request.payload.ptr.is_null() || request.payload.len == 0 {
+                    None
+                } else {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(request.payload.ptr, request.payload.len)
+                    };
+                    let text = String::from_utf8_lossy(bytes).trim().to_string();
+                    (!text.is_empty()).then_some(text)
+                }
+            })
+        });
+
+    let root = GtkBox::new(Orientation::Vertical, 14);
+    root.set_margin_top(18);
+    root.set_margin_bottom(18);
+    root.set_margin_start(18);
+    root.set_margin_end(18);
+
+    let snapshot = snapshot();
+    let Some(repo_id) = repo_id else {
+        let title = Label::new(Some("Repo Manifest Editor"));
+        title.set_xalign(0.0);
+        title.add_css_class("title-2");
+        let body = Label::new(Some("No repository id was provided for this editor tab."));
+        body.set_xalign(0.0);
+        body.set_wrap(true);
+        body.add_css_class("muted");
+        root.append(&title);
+        root.append(&body);
+        return unsafe {
+            <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+                as *mut std::ffi::c_void
+        };
+    };
+
+    render_repo_manifest_editor_into(&root, &snapshot, &repo_id, host);
+
+    let scroller = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(0)
+        .child(&root)
+        .build();
+    scroller.set_valign(Align::Fill);
+    scroller.set_propagate_natural_height(false);
+
+    unsafe {
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
+            as *mut std::ffi::c_void
+    }
+}
+
+fn render_repo_manifest_editor_into(
+    root: &GtkBox,
+    snapshot: &StateSnapshot,
+    repo_id: &str,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) {
+    clear_box(root);
+
+    let Some(item) = repository_items(snapshot)
+        .into_iter()
+        .find(|item| item.id == repo_id)
+    else {
+        let title = Label::new(Some("Repo Manifest Editor"));
+        title.set_xalign(0.0);
+        title.add_css_class("title-2");
+        let body = Label::new(Some(&format!(
+            "Repository {repo_id} is not present in the current workspace manifest."
+        )));
+        body.set_xalign(0.0);
+        body.set_wrap(true);
+        body.add_css_class("muted");
+        root.append(&title);
+        root.append(&body);
+        return;
+    };
+
+    let manifest_path = default_repo_manifest_path(&item.status.repo_path);
+    let manifest = load_repo_manifest(&manifest_path).unwrap_or_else(|_| RepoManifest {
+        schema_version: ronomepo_core::REPO_MANIFEST_SCHEMA_VERSION,
+        repo_id: Some(item.id.clone()),
+        items: Vec::new(),
+        actions: Vec::new(),
+        capabilities: Vec::new(),
+        repo_actions: Vec::new(),
+        aggregation: Vec::new(),
+    });
+
+    let title = Label::new(Some(&format!("{} Manifest", item.name)));
+    title.set_xalign(0.0);
+    title.add_css_class("title-2");
+    let subtitle = Label::new(Some(&format!("Editing {}", manifest_path.display())));
+    subtitle.set_xalign(0.0);
+    subtitle.set_wrap(true);
+    subtitle.add_css_class("muted");
+
+    let preserved_repo_actions = Rc::new(manifest.repo_actions.clone());
+    let preserved_aggregation = Rc::new(manifest.aggregation.clone());
+
+    let repo_id_entry = Entry::new();
+    repo_id_entry.set_text(manifest.repo_id.as_deref().unwrap_or(&item.id));
+
+    let item_rows_box = GtkBox::new(Orientation::Vertical, 8);
+    let item_rows = Rc::new(RefCell::new(Vec::<RepoManifestItemRowHandle>::new()));
+    for manifest_item in &manifest.items {
+        append_repo_manifest_item_row(&item_rows_box, &item_rows, Some(manifest_item));
+    }
+
+    let action_rows_box = GtkBox::new(Orientation::Vertical, 8);
+    let action_rows = Rc::new(RefCell::new(Vec::<RepoManifestActionRowHandle>::new()));
+    for action in &manifest.actions {
+        append_repo_manifest_action_row(&action_rows_box, &action_rows, Some(action));
+    }
+
+    let capability_rows_box = GtkBox::new(Orientation::Vertical, 8);
+    let capability_rows = Rc::new(RefCell::new(Vec::<RepoManifestCapabilityRowHandle>::new()));
+    for capability in &manifest.capabilities {
+        append_repo_manifest_capability_row(
+            &capability_rows_box,
+            &capability_rows,
+            Some(capability),
+        );
+    }
+
+    let status = Label::new(Some(
+        "Edit rows, preview JSON, then save the repo manifest.",
+    ));
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.add_css_class("muted");
+
+    let preview_buffer = TextBuffer::new(None);
+    let preview_text = TextView::with_buffer(&preview_buffer);
+    preview_text.set_monospace(true);
+    preview_text.set_editable(false);
+    preview_text.set_wrap_mode(WrapMode::WordChar);
+    preview_text.set_vexpand(true);
+    let preview_scroller = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .min_content_height(260)
+        .hscrollbar_policy(PolicyType::Automatic)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .child(&preview_text)
+        .build();
+
+    refresh_repo_manifest_preview(
+        &preview_buffer,
+        &status,
+        &repo_id_entry,
+        &item_rows.borrow(),
+        &action_rows.borrow(),
+        &capability_rows.borrow(),
+        &preserved_repo_actions,
+        &preserved_aggregation,
+    );
+
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
+    let add_cargo = Button::with_label("Add Cargo Item");
+    add_cargo.connect_clicked({
+        let item_rows_box = item_rows_box.clone();
+        let item_rows = item_rows.clone();
+        move |_| {
+            append_repo_manifest_item_row(
+                &item_rows_box,
+                &item_rows,
+                Some(&ronomepo_core::RepoItem {
+                    id: "server".to_string(),
+                    item_type: "cargo".to_string(),
+                    path: PathBuf::from("."),
+                    config: None,
+                    artifacts: Vec::new(),
+                    actions: Vec::new(),
+                }),
+            )
+        }
+    });
+    let add_action = Button::with_label("Add Action");
+    add_action.connect_clicked({
+        let action_rows_box = action_rows_box.clone();
+        let action_rows = action_rows.clone();
+        move |_| append_repo_manifest_action_row(&action_rows_box, &action_rows, None)
+    });
+    let add_capability = Button::with_label("Add Capability");
+    add_capability.connect_clicked({
+        let capability_rows_box = capability_rows_box.clone();
+        let capability_rows = capability_rows.clone();
+        move |_| append_repo_manifest_capability_row(&capability_rows_box, &capability_rows, None)
+    });
+    let preview = Button::with_label("Preview JSON");
+    preview.connect_clicked({
+        let preview_buffer = preview_buffer.clone();
+        let status = status.clone();
+        let repo_id_entry = repo_id_entry.clone();
+        let item_rows = item_rows.clone();
+        let action_rows = action_rows.clone();
+        let capability_rows = capability_rows.clone();
+        let preserved_repo_actions = preserved_repo_actions.clone();
+        let preserved_aggregation = preserved_aggregation.clone();
+        move |_| {
+            refresh_repo_manifest_preview(
+                &preview_buffer,
+                &status,
+                &repo_id_entry,
+                &item_rows.borrow(),
+                &action_rows.borrow(),
+                &capability_rows.borrow(),
+                &preserved_repo_actions,
+                &preserved_aggregation,
+            );
+        }
+    });
+    let save = Button::with_label("Save Manifest");
+    save.connect_clicked({
+        let preview_buffer = preview_buffer.clone();
+        let status = status.clone();
+        let repo_id_entry = repo_id_entry.clone();
+        let item_rows = item_rows.clone();
+        let action_rows = action_rows.clone();
+        let capability_rows = capability_rows.clone();
+        let preserved_repo_actions = preserved_repo_actions.clone();
+        let preserved_aggregation = preserved_aggregation.clone();
+        let manifest_path = manifest_path.clone();
+        move |_| match build_repo_manifest_from_editor_rows(
+            &repo_id_entry,
+            &item_rows.borrow(),
+            &action_rows.borrow(),
+            &capability_rows.borrow(),
+            &preserved_repo_actions,
+            &preserved_aggregation,
+        ) {
+            Ok(manifest) => match save_repo_manifest(&manifest_path, &manifest) {
+                Ok(()) => {
+                    let json = serde_json::to_string_pretty(&manifest).unwrap_or_default();
+                    preview_buffer.set_text(&json);
+                    let message = format!("Saved repo manifest to {}.", manifest_path.display());
+                    status.set_text(&message);
+                    append_log(message);
+                    schedule_workspace_scan();
+                    refresh_views();
+                }
+                Err(error) => status.set_text(&format!("Cannot save manifest: {error}")),
+            },
+            Err(message) => status.set_text(&message),
+        }
+    });
+    let edit_json = Button::with_label("Edit JSON File");
+    edit_json.connect_clicked({
+        let manifest_path = manifest_path.clone();
+        move |_| open_text_editor_for_path(host_ptr, &manifest_path)
+    });
+
+    for button in [
+        add_cargo,
+        add_action,
+        add_capability,
+        preview,
+        save,
+        edit_json,
+    ] {
+        actions.append(&button);
+    }
+
+    root.append(&title);
+    root.append(&subtitle);
+    root.append(&actions);
+    root.append(&status);
+    root.append(&labeled_field("Repo ID", &repo_id_entry));
+    append_repo_manifest_editor_section(
+        root,
+        "Items",
+        "Declare code projects inside this repository.",
+        &item_rows_box,
+    );
+    append_repo_manifest_editor_section(
+        root,
+        "Repo Actions",
+        "Commands that capabilities can reference by id.",
+        &action_rows_box,
+    );
+    append_repo_manifest_editor_section(
+        root,
+        "Capabilities",
+        "Operational contracts exposed by this repo.",
+        &capability_rows_box,
+    );
+    append_repo_manifest_editor_section(
+        root,
+        "JSON Preview",
+        "Preview is generated from the structured fields above.",
+        &preview_scroller,
+    );
+}
+
+fn append_repo_manifest_editor_section(
+    container: &GtkBox,
+    heading: &str,
+    body: &str,
+    child: &impl IsA<gtk::Widget>,
+) {
+    let block = GtkBox::new(Orientation::Vertical, 8);
+    let heading_label = Label::new(Some(heading));
+    heading_label.set_xalign(0.0);
+    heading_label.add_css_class("title-4");
+    let body_label = Label::new(Some(body));
+    body_label.set_xalign(0.0);
+    body_label.set_wrap(true);
+    body_label.add_css_class("muted");
+    block.append(&heading_label);
+    block.append(&body_label);
+    block.append(child);
+    container.append(&block);
+    container.append(&Separator::new(Orientation::Horizontal));
+}
+
+fn append_repo_manifest_item_row(
+    rows_box: &GtkBox,
+    rows: &Rc<RefCell<Vec<RepoManifestItemRowHandle>>>,
+    item: Option<&ronomepo_core::RepoItem>,
+) {
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    let id = Entry::new();
+    id.set_placeholder_text(Some("id"));
+    id.set_width_chars(16);
+    let item_type = Entry::new();
+    item_type.set_placeholder_text(Some("cargo"));
+    item_type.set_width_chars(14);
+    let path = Entry::new();
+    path.set_placeholder_text(Some("path"));
+    path.set_hexpand(true);
+    let remove = Button::with_label("Remove");
+
+    if let Some(item) = item {
+        id.set_text(&item.id);
+        item_type.set_text(&item.item_type);
+        path.set_text(&item.path.display().to_string());
+    }
+
+    row.append(&id);
+    row.append(&item_type);
+    row.append(&path);
+    row.append(&remove);
+    rows_box.append(&row);
+
+    rows.borrow_mut().push(RepoManifestItemRowHandle {
+        row: row.clone(),
+        id: id.clone(),
+        item_type: item_type.clone(),
+        path: path.clone(),
+        config: item.and_then(|item| item.config.clone()),
+        artifacts: item.map(|item| item.artifacts.clone()).unwrap_or_default(),
+        actions: item.map(|item| item.actions.clone()).unwrap_or_default(),
+    });
+    remove.connect_clicked({
+        let rows_box = rows_box.clone();
+        let rows = rows.clone();
+        let row = row.clone();
+        move |_| {
+            rows_box.remove(&row);
+            rows.borrow_mut().retain(|handle| !handle.row.eq(&row));
+        }
+    });
+}
+
+fn append_repo_manifest_action_row(
+    rows_box: &GtkBox,
+    rows: &Rc<RefCell<Vec<RepoManifestActionRowHandle>>>,
+    action: Option<&ronomepo_core::RepoActionDefinition>,
+) {
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    let id = Entry::new();
+    id.set_placeholder_text(Some("id"));
+    id.set_width_chars(20);
+    let command = Entry::new();
+    command.set_placeholder_text(Some("command and args"));
+    command.set_hexpand(true);
+    let workdir = Entry::new();
+    workdir.set_placeholder_text(Some("workdir"));
+    workdir.set_width_chars(14);
+    let timeout_seconds = Entry::new();
+    timeout_seconds.set_placeholder_text(Some("timeout"));
+    timeout_seconds.set_width_chars(8);
+    let output = DropDown::from_strings(&["text", "json", "json_lines"]);
+    let remove = Button::with_label("Remove");
+
+    if let Some(action) = action {
+        id.set_text(&action.id);
+        command.set_text(&action.command.join(" "));
+        workdir.set_text(
+            &action
+                .workdir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        );
+        timeout_seconds.set_text(
+            &action
+                .timeout_seconds
+                .map(|timeout| timeout.to_string())
+                .unwrap_or_default(),
+        );
+        output.set_selected(action_output_index(action.output));
+    }
+
+    row.append(&id);
+    row.append(&command);
+    row.append(&workdir);
+    row.append(&timeout_seconds);
+    row.append(&output);
+    row.append(&remove);
+    rows_box.append(&row);
+
+    rows.borrow_mut().push(RepoManifestActionRowHandle {
+        row: row.clone(),
+        id: id.clone(),
+        command: command.clone(),
+        workdir: workdir.clone(),
+        timeout_seconds: timeout_seconds.clone(),
+        output: output.clone(),
+        env: action.map(|action| action.env.clone()).unwrap_or_default(),
+    });
+    remove.connect_clicked({
+        let rows_box = rows_box.clone();
+        let rows = rows.clone();
+        let row = row.clone();
+        move |_| {
+            rows_box.remove(&row);
+            rows.borrow_mut().retain(|handle| !handle.row.eq(&row));
+        }
+    });
+}
+
+fn append_repo_manifest_capability_row(
+    rows_box: &GtkBox,
+    rows: &Rc<RefCell<Vec<RepoManifestCapabilityRowHandle>>>,
+    capability: Option<&ronomepo_core::RepoCapabilityDeclaration>,
+) {
+    let row = GtkBox::new(Orientation::Vertical, 6);
+    let top = GtkBox::new(Orientation::Horizontal, 8);
+    let bottom = GtkBox::new(Orientation::Horizontal, 8);
+    let id = Entry::new();
+    id.set_placeholder_text(Some("capability id"));
+    id.set_width_chars(22);
+    let capability_name = Entry::new();
+    capability_name.set_placeholder_text(Some("integrity.tests"));
+    capability_name.set_width_chars(22);
+    let status = DropDown::from_strings(&["implemented", "not_applicable", "unsupported"]);
+    let item_id = Entry::new();
+    item_id.set_placeholder_text(Some("item_id"));
+    item_id.set_width_chars(14);
+    let root = Entry::new();
+    root.set_placeholder_text(Some("root"));
+    root.set_width_chars(14);
+    let action_kind = DropDown::from_strings(&["standard", "repo_action"]);
+    let action_value = Entry::new();
+    action_value.set_placeholder_text(Some("cargo.test or action id"));
+    action_value.set_hexpand(true);
+    let schedule_kind = DropDown::from_strings(&["manual", "interval", "on_commit_change"]);
+    let interval_seconds = Entry::new();
+    interval_seconds.set_placeholder_text(Some("seconds"));
+    interval_seconds.set_width_chars(9);
+    let reason = Entry::new();
+    reason.set_placeholder_text(Some("reason for N/A or unsupported"));
+    reason.set_hexpand(true);
+    let remove = Button::with_label("Remove");
+
+    if let Some(capability) = capability {
+        id.set_text(&capability.id);
+        capability_name.set_text(&capability.capability);
+        status.set_selected(capability_status_index(capability.status));
+        item_id.set_text(capability.item_id.as_deref().unwrap_or_default());
+        root.set_text(
+            &capability
+                .root
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        );
+        if let Some(standard) = capability.standard_action.as_deref() {
+            action_kind.set_selected(0);
+            action_value.set_text(standard);
+        } else if let Some(action_ref) = &capability.action_ref {
+            match action_ref {
+                ronomepo_core::RepoActionRef::Standard {
+                    name,
+                    item_id: action_item_id,
+                    root: action_root,
+                } => {
+                    action_kind.set_selected(0);
+                    action_value.set_text(name);
+                    if capability.item_id.is_none() {
+                        item_id.set_text(action_item_id.as_deref().unwrap_or_default());
+                    }
+                    if capability.root.is_none() {
+                        root.set_text(
+                            &action_root
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+                ronomepo_core::RepoActionRef::RepoAction { id } => {
+                    action_kind.set_selected(1);
+                    action_value.set_text(id);
+                }
+                ronomepo_core::RepoActionRef::Group { .. } => {
+                    action_value.set_placeholder_text(Some("group action_ref preserved"));
+                }
+            }
+        }
+        if let Some(schedule) = capability.schedule.as_ref() {
+            configure_schedule_controls(schedule, &schedule_kind, &interval_seconds);
+        }
+        reason.set_text(capability.reason.as_deref().unwrap_or_default());
+    }
+
+    top.append(&id);
+    top.append(&capability_name);
+    top.append(&status);
+    top.append(&item_id);
+    top.append(&root);
+    bottom.append(&action_kind);
+    bottom.append(&action_value);
+    bottom.append(&schedule_kind);
+    bottom.append(&interval_seconds);
+    bottom.append(&reason);
+    bottom.append(&remove);
+    row.append(&top);
+    row.append(&bottom);
+    rows_box.append(&row);
+
+    rows.borrow_mut().push(RepoManifestCapabilityRowHandle {
+        row: row.clone(),
+        id: id.clone(),
+        capability: capability_name.clone(),
+        status: status.clone(),
+        item_id: item_id.clone(),
+        root: root.clone(),
+        action_kind: action_kind.clone(),
+        action_value: action_value.clone(),
+        schedule_kind: schedule_kind.clone(),
+        interval_seconds: interval_seconds.clone(),
+        reason: reason.clone(),
+        preserved_action_ref: capability.and_then(|capability| capability.action_ref.clone()),
+        preserved_standard_action: capability
+            .and_then(|capability| capability.standard_action.clone()),
+    });
+    remove.connect_clicked({
+        let rows_box = rows_box.clone();
+        let rows = rows.clone();
+        let row = row.clone();
+        move |_| {
+            rows_box.remove(&row);
+            rows.borrow_mut().retain(|handle| !handle.row.eq(&row));
+        }
+    });
+}
+
+fn refresh_repo_manifest_preview(
+    buffer: &TextBuffer,
+    status: &Label,
+    repo_id: &Entry,
+    item_rows: &[RepoManifestItemRowHandle],
+    action_rows: &[RepoManifestActionRowHandle],
+    capability_rows: &[RepoManifestCapabilityRowHandle],
+    preserved_repo_actions: &[ronomepo_core::RepoActionCommand],
+    preserved_aggregation: &[ronomepo_core::RepoActionAggregation],
+) {
+    match build_repo_manifest_from_editor_rows(
+        repo_id,
+        item_rows,
+        action_rows,
+        capability_rows,
+        preserved_repo_actions,
+        preserved_aggregation,
+    ) {
+        Ok(manifest) => match serde_json::to_string_pretty(&manifest) {
+            Ok(json) => {
+                buffer.set_text(&json);
+                status.set_text("Preview is valid.");
+            }
+            Err(error) => status.set_text(&format!("Cannot render preview: {error}")),
+        },
+        Err(message) => status.set_text(&message),
+    }
+}
+
+fn build_repo_manifest_from_editor_rows(
+    repo_id: &Entry,
+    item_rows: &[RepoManifestItemRowHandle],
+    action_rows: &[RepoManifestActionRowHandle],
+    capability_rows: &[RepoManifestCapabilityRowHandle],
+    preserved_repo_actions: &[ronomepo_core::RepoActionCommand],
+    preserved_aggregation: &[ronomepo_core::RepoActionAggregation],
+) -> Result<RepoManifest, String> {
+    let items = build_repo_manifest_items(item_rows)?;
+    let actions = build_repo_manifest_actions(action_rows)?;
+    let capabilities = build_repo_manifest_capabilities(capability_rows)?;
+    let manifest = RepoManifest {
+        schema_version: ronomepo_core::REPO_MANIFEST_SCHEMA_VERSION,
+        repo_id: nonempty_entry_text(repo_id),
+        items,
+        actions,
+        capabilities,
+        repo_actions: preserved_repo_actions.to_vec(),
+        aggregation: preserved_aggregation.to_vec(),
+    };
+    ronomepo_core::validate_repo_manifest(&manifest).map_err(|error| error.to_string())?;
+    Ok(manifest)
+}
+
+fn build_repo_manifest_items(
+    rows: &[RepoManifestItemRowHandle],
+) -> Result<Vec<ronomepo_core::RepoItem>, String> {
+    let mut items = Vec::new();
+    for row in rows {
+        let id = row.id.text().trim().to_string();
+        let item_type = row.item_type.text().trim().to_string();
+        let path = row.path.text().trim().to_string();
+        if id.is_empty() && item_type.is_empty() && path.is_empty() {
+            continue;
+        }
+        if id.is_empty() || item_type.is_empty() || path.is_empty() {
+            return Err("Each non-empty item row needs id, type, and path.".to_string());
+        }
+        items.push(ronomepo_core::RepoItem {
+            id,
+            item_type,
+            path: PathBuf::from(path),
+            config: row.config.clone(),
+            artifacts: row.artifacts.clone(),
+            actions: row.actions.clone(),
+        });
+    }
+    Ok(items)
+}
+
+fn build_repo_manifest_actions(
+    rows: &[RepoManifestActionRowHandle],
+) -> Result<Vec<ronomepo_core::RepoActionDefinition>, String> {
+    let mut actions = Vec::new();
+    for row in rows {
+        let id = row.id.text().trim().to_string();
+        let command = split_command_entry(&row.command.text());
+        let workdir = nonempty_entry_path(&row.workdir);
+        let timeout_seconds = parse_optional_u64(&row.timeout_seconds, "action timeout")?;
+        if id.is_empty() && command.is_empty() && workdir.is_none() && timeout_seconds.is_none() {
+            continue;
+        }
+        if id.is_empty() || command.is_empty() {
+            return Err("Each non-empty action row needs id and command.".to_string());
+        }
+        actions.push(ronomepo_core::RepoActionDefinition {
+            id,
+            command,
+            workdir,
+            env: row.env.clone(),
+            timeout_seconds,
+            output: action_output_from_index(row.output.selected()),
+        });
+    }
+    Ok(actions)
+}
+
+fn build_repo_manifest_capabilities(
+    rows: &[RepoManifestCapabilityRowHandle],
+) -> Result<Vec<ronomepo_core::RepoCapabilityDeclaration>, String> {
+    let mut capabilities = Vec::new();
+    for row in rows {
+        let id = row.id.text().trim().to_string();
+        let capability = row.capability.text().trim().to_string();
+        if id.is_empty() && capability.is_empty() && row.action_value.text().trim().is_empty() {
+            continue;
+        }
+        if id.is_empty() || capability.is_empty() {
+            return Err("Each non-empty capability row needs id and capability.".to_string());
+        }
+        let status = capability_status_from_index(row.status.selected());
+        let action_value = row.action_value.text().trim().to_string();
+        let (action_ref, standard_action) =
+            if status == ronomepo_core::CapabilityDeclarationStatus::Implemented {
+                if action_value.is_empty() {
+                    match (
+                        row.preserved_action_ref.clone(),
+                        row.preserved_standard_action.clone(),
+                    ) {
+                        (Some(action_ref), None) => (Some(action_ref), None),
+                        (None, Some(standard_action)) => (None, Some(standard_action)),
+                        _ => {
+                            return Err(format!(
+                                "Implemented capability {id} needs an action reference."
+                            ));
+                        }
+                    }
+                } else if row.action_kind.selected() == 1 {
+                    (
+                        Some(ronomepo_core::RepoActionRef::RepoAction { id: action_value }),
+                        None,
+                    )
+                } else {
+                    (None, Some(action_value))
+                }
+            } else {
+                (None, None)
+            };
+        let reason = nonempty_entry_text(&row.reason);
+        let schedule = schedule_value_from_controls(&row.schedule_kind, &row.interval_seconds)?;
+        capabilities.push(ronomepo_core::RepoCapabilityDeclaration {
+            id,
+            capability,
+            status,
+            item_id: nonempty_entry_text(&row.item_id),
+            root: nonempty_entry_path(&row.root),
+            action_ref,
+            standard_action,
+            reason,
+            schedule,
+        });
+    }
+    Ok(capabilities)
+}
+
+fn nonempty_entry_text(entry: &Entry) -> Option<String> {
+    let value = entry.text().trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn nonempty_entry_path(entry: &Entry) -> Option<PathBuf> {
+    nonempty_entry_text(entry).map(PathBuf::from)
+}
+
+fn split_command_entry(raw: &str) -> Vec<String> {
+    raw.split_whitespace().map(ToString::to_string).collect()
+}
+
+fn parse_optional_u64(entry: &Entry, label: &str) -> Result<Option<u64>, String> {
+    let raw = entry.text().trim().to_string();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<u64>()
+        .map(Some)
+        .map_err(|_| format!("{label} must be a positive integer."))
+}
+
+fn action_output_index(output: ronomepo_core::ActionOutputMode) -> u32 {
+    match output {
+        ronomepo_core::ActionOutputMode::Text => 0,
+        ronomepo_core::ActionOutputMode::Json => 1,
+        ronomepo_core::ActionOutputMode::JsonLines => 2,
+    }
+}
+
+fn action_output_from_index(index: u32) -> ronomepo_core::ActionOutputMode {
+    match index {
+        1 => ronomepo_core::ActionOutputMode::Json,
+        2 => ronomepo_core::ActionOutputMode::JsonLines,
+        _ => ronomepo_core::ActionOutputMode::Text,
+    }
+}
+
+fn capability_status_index(status: ronomepo_core::CapabilityDeclarationStatus) -> u32 {
+    match status {
+        ronomepo_core::CapabilityDeclarationStatus::Implemented => 0,
+        ronomepo_core::CapabilityDeclarationStatus::NotApplicable => 1,
+        ronomepo_core::CapabilityDeclarationStatus::Unsupported => 2,
+    }
+}
+
+fn capability_status_from_index(index: u32) -> ronomepo_core::CapabilityDeclarationStatus {
+    match index {
+        1 => ronomepo_core::CapabilityDeclarationStatus::NotApplicable,
+        2 => ronomepo_core::CapabilityDeclarationStatus::Unsupported,
+        _ => ronomepo_core::CapabilityDeclarationStatus::Implemented,
+    }
+}
+
+fn configure_schedule_controls(value: &Value, schedule_kind: &DropDown, interval_seconds: &Entry) {
+    match value {
+        Value::Object(object) => {
+            if object
+                .get("kind")
+                .or_else(|| object.get("mode"))
+                .and_then(Value::as_str)
+                == Some("on_commit_change")
+                || object
+                    .get("on_commit_change")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            {
+                schedule_kind.set_selected(2);
+            } else if let Some(interval) = object.get("interval_seconds").and_then(Value::as_u64) {
+                schedule_kind.set_selected(1);
+                interval_seconds.set_text(&interval.to_string());
+            }
+        }
+        Value::String(kind) if kind == "on_commit_change" => schedule_kind.set_selected(2),
+        _ => schedule_kind.set_selected(0),
+    }
+}
+
+fn schedule_value_from_controls(
+    schedule_kind: &DropDown,
+    interval_seconds: &Entry,
+) -> Result<Option<Value>, String> {
+    match schedule_kind.selected() {
+        1 => {
+            let interval = parse_optional_u64(interval_seconds, "capability interval_seconds")?
+                .ok_or_else(|| "Interval schedules need interval_seconds.".to_string())?;
+            Ok(Some(serde_json::json!({
+                "kind": "interval",
+                "interval_seconds": interval
+            })))
+        }
+        2 => Ok(Some(serde_json::json!({ "kind": "on_commit_change" }))),
+        _ => Ok(None),
     }
 }
 
