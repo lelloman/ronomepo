@@ -8042,18 +8042,65 @@ fn build_vte_terminal_widget(path: &Path, label: &str, restart: &Button) -> GtkB
     style_embedded_terminal_palette(&terminal);
 
     let shell = preferred_embedded_shell();
-    spawn_shell_in_terminal(&terminal, path, label, &shell);
+    let path = path.to_path_buf();
+    let label = label.to_string();
+    let active_pid = Rc::new(Cell::new(None::<glib::Pid>));
+    let restart_pending = Rc::new(Cell::new(false));
+
+    spawn_shell_in_terminal(&terminal, &path, &label, &shell, active_pid.clone(), false);
+
+    terminal.connect_child_exited({
+        let terminal = terminal.clone();
+        let path = path.clone();
+        let label = label.clone();
+        let shell = shell.clone();
+        let active_pid = active_pid.clone();
+        let restart_pending = restart_pending.clone();
+        move |_, _| {
+            active_pid.set(None);
+            if restart_pending.replace(false) {
+                spawn_shell_in_terminal(&terminal, &path, &label, &shell, active_pid.clone(), true);
+            }
+        }
+    });
 
     restart.set_sensitive(true);
-    {
+    restart.connect_clicked({
         let terminal = terminal.clone();
+        let path = path.clone();
+        let label = label.clone();
         let shell = shell.clone();
-        let path = path.to_path_buf();
-        let label = label.to_string();
-        restart.connect_clicked(move |_| {
-            spawn_shell_in_terminal(&terminal, &path, &label, &shell);
-        });
-    }
+        let active_pid = active_pid.clone();
+        let restart_pending = restart_pending.clone();
+        move |_| {
+            if restart_pending.get() {
+                return;
+            }
+            if let Some(pid) = active_pid.get() {
+                restart_pending.set(true);
+                if terminate_embedded_shell_group(pid, libc::SIGHUP) {
+                    schedule_embedded_shell_kill_fallback(
+                        pid,
+                        active_pid.clone(),
+                        restart_pending.clone(),
+                    );
+                } else {
+                    restart_pending.set(false);
+                    active_pid.set(None);
+                    spawn_shell_in_terminal(
+                        &terminal,
+                        &path,
+                        &label,
+                        &shell,
+                        active_pid.clone(),
+                        true,
+                    );
+                }
+            } else {
+                spawn_shell_in_terminal(&terminal, &path, &label, &shell, active_pid.clone(), true);
+            }
+        }
+    });
     panel.append(&terminal);
 
     panel
@@ -8097,7 +8144,18 @@ fn rgba(hex: &str) -> RGBA {
 }
 
 #[cfg(feature = "embedded-terminal")]
-fn spawn_shell_in_terminal(terminal: &vte4::Terminal, path: &Path, label: &str, shell: &str) {
+fn spawn_shell_in_terminal(
+    terminal: &vte4::Terminal,
+    path: &Path,
+    label: &str,
+    shell: &str,
+    active_pid: Rc<Cell<Option<glib::Pid>>>,
+    clear_terminal: bool,
+) {
+    if clear_terminal {
+        terminal.reset(false, true);
+    }
+
     if !path.exists() {
         terminal.feed(b"Working directory does not exist.\r\n");
         return;
@@ -8106,23 +8164,49 @@ fn spawn_shell_in_terminal(terminal: &vte4::Terminal, path: &Path, label: &str, 
     let argv = [shell];
     let cwd = path.to_string_lossy().to_string();
     let repo_label = label.to_string();
-    terminal.spawn_async(
+    let terminal = terminal.clone();
+    terminal.clone().spawn_async(
         vte4::PtyFlags::DEFAULT,
         Some(cwd.as_str()),
         &argv,
         &[],
         glib::SpawnFlags::SEARCH_PATH,
-        || {},
+        || unsafe {
+            libc::setsid();
+        },
         -1,
         None::<&gio::Cancellable>,
-        move |result| {
-            if let Err(error) = result {
+        move |result| match result {
+            Ok(pid) => {
+                terminal.watch_child(pid);
+                active_pid.set(Some(pid));
+            }
+            Err(error) => {
+                active_pid.set(None);
                 append_log(format!(
                     "Failed to start embedded terminal for {repo_label}: {error}"
                 ));
             }
         },
     );
+}
+
+#[cfg(feature = "embedded-terminal")]
+fn terminate_embedded_shell_group(pid: glib::Pid, signal: libc::c_int) -> bool {
+    unsafe { libc::kill(-pid.0, signal) == 0 || libc::kill(pid.0, signal) == 0 }
+}
+
+#[cfg(feature = "embedded-terminal")]
+fn schedule_embedded_shell_kill_fallback(
+    pid: glib::Pid,
+    active_pid: Rc<Cell<Option<glib::Pid>>>,
+    restart_pending: Rc<Cell<bool>>,
+) {
+    glib::timeout_add_local_once(Duration::from_millis(750), move || {
+        if restart_pending.get() && active_pid.get() == Some(pid) {
+            let _ = terminate_embedded_shell_group(pid, libc::SIGKILL);
+        }
+    });
 }
 
 fn overview_actions(include_open_overview: bool) -> GtkBox {
