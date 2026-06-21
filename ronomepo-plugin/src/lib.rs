@@ -7917,17 +7917,23 @@ fn repo_overview_facts_body(facts: &[(&str, String)]) -> GtkBox {
 }
 
 fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str>) -> GtkBox {
-    let panel = GtkBox::new(Orientation::Vertical, 10);
+    let panel = GtkBox::new(Orientation::Vertical, 6);
     panel.set_hexpand(true);
     panel.set_vexpand(true);
 
-    let title_row = GtkBox::new(Orientation::Horizontal, 8);
-    let title = Label::new(Some("Embedded Terminal"));
-    title.set_xalign(0.0);
-    title.add_css_class("title-4");
-    title.set_hexpand(true);
-    title_row.append(&title);
-    panel.append(&title_row);
+    let header = GtkBox::new(Orientation::Horizontal, 6);
+    let restart = terminal_icon_button("view-refresh-symbolic", "Restart terminal");
+    restart.set_sensitive(false);
+    header.append(&restart);
+
+    let spacer = GtkBox::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    header.append(&spacer);
+
+    let external = terminal_icon_button("utilities-terminal-symbolic", "Open external terminal");
+    external.set_sensitive(false);
+    header.append(&external);
+    panel.append(&header);
 
     let target_repo_id = instance_key.or(snapshot.active_repo_id.as_deref());
     let Some(item) = target_repo_id.and_then(|repo_id| repo_item_by_id(snapshot, repo_id)) else {
@@ -7942,28 +7948,19 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
         return panel;
     };
 
-    let external = Button::with_label("Open External Terminal");
+    external.set_sensitive(true);
     let repo_path = item.status.repo_path.clone();
     let repo_name = item.name.clone();
     external.connect_clicked(move |_| {
         open_path_in_terminal(&repo_path, &repo_name);
     });
-    title_row.append(&external);
-
-    let subtitle = Label::new(Some(&format!(
-        "Shell working directory: {}",
-        item.status.repo_path.display()
-    )));
-    subtitle.set_xalign(0.0);
-    subtitle.set_wrap(true);
-    subtitle.add_css_class("muted");
-    panel.append(&subtitle);
 
     #[cfg(feature = "embedded-terminal")]
     {
         panel.append(&build_vte_terminal_widget(
             &item.status.repo_path,
             &item.name,
+            &restart,
         ));
     }
 
@@ -7979,6 +7976,21 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
     }
 
     panel
+}
+
+fn terminal_icon_button(icon_name: &str, tooltip: &str) -> Button {
+    let button = Button::new();
+    button.add_css_class("toolbar-button");
+    button.add_css_class("toolbar-icon-button");
+    button.add_css_class(&button_css_class("ronomepo-toolbar-ghost"));
+    button.set_focus_on_click(false);
+    button.set_tooltip_text(Some(tooltip));
+
+    let icon = Image::from_icon_name(icon_name);
+    icon.set_icon_size(gtk::IconSize::Normal);
+    button.set_child(Some(&icon));
+
+    button
 }
 
 fn sync_repo_terminal_panel(panel: &GtkBox, snapshot: &StateSnapshot, instance_key: Option<&str>) {
@@ -8014,8 +8026,8 @@ fn repo_item_by_id<'a>(
 }
 
 #[cfg(feature = "embedded-terminal")]
-fn build_vte_terminal_widget(path: &Path, label: &str) -> GtkBox {
-    let panel = GtkBox::new(Orientation::Vertical, 8);
+fn build_vte_terminal_widget(path: &Path, label: &str, restart: &Button) -> GtkBox {
+    let panel = GtkBox::new(Orientation::Vertical, 0);
     panel.set_hexpand(true);
     panel.set_vexpand(true);
 
@@ -8032,8 +8044,7 @@ fn build_vte_terminal_widget(path: &Path, label: &str) -> GtkBox {
     let shell = preferred_embedded_shell();
     spawn_shell_in_terminal(&terminal, path, label, &shell);
 
-    let action_row = GtkBox::new(Orientation::Horizontal, 8);
-    let restart = Button::with_label("Restart Shell");
+    restart.set_sensitive(true);
     {
         let terminal = terminal.clone();
         let shell = shell.clone();
@@ -8043,8 +8054,6 @@ fn build_vte_terminal_widget(path: &Path, label: &str) -> GtkBox {
             spawn_shell_in_terminal(&terminal, &path, &label, &shell);
         });
     }
-    action_row.append(&restart);
-    panel.append(&action_row);
     panel.append(&terminal);
 
     panel
