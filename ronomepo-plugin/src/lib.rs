@@ -26,9 +26,9 @@ use gtk::prelude::*;
 use gtk::{
     Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, Dialog, DropDown, Entry,
     EventControllerMotion, FilterChange, GestureClick, Image, Label, ListBox, ListBoxRow,
-    Orientation, Paned, PolicyType, Popover, PositionType, ResponseType, ScrolledWindow,
-    SelectionMode, Separator, SortListModel, SorterChange, TextBuffer, TextView, ToggleButton,
-    Window, WrapMode,
+    Orientation, PolicyType, Popover, PositionType, ResponseType, ScrolledWindow, SelectionMode,
+    Separator, SortListModel, SorterChange, Stack, StackSwitcher, TextBuffer, TextView,
+    ToggleButton, Window, WrapMode,
 };
 use maruzzella_sdk::{
     attach_text_tooltip, button_css_class, export_plugin, input_css_class, surface_css_class,
@@ -525,7 +525,16 @@ struct RepositoryViewHandle {
 #[derive(Default)]
 struct ContainerViewHandle {
     root: glib::WeakRef<GtkBox>,
-    auxiliary_root: glib::WeakRef<GtkBox>,
+    host_ptr: usize,
+}
+
+#[derive(Default)]
+struct RepoOverviewViewHandle {
+    summary_root: glib::WeakRef<GtkBox>,
+    git_root: glib::WeakRef<GtkBox>,
+    manifest_root: glib::WeakRef<GtkBox>,
+    activity_root: glib::WeakRef<GtkBox>,
+    terminal_root: glib::WeakRef<GtkBox>,
     instance_key: Option<String>,
     host_ptr: usize,
 }
@@ -540,7 +549,7 @@ struct OperationFollowHandle {
 thread_local! {
     static REPOSITORY_VIEWS: RefCell<Vec<RepositoryViewHandle>> = const { RefCell::new(Vec::new()) };
     static MONOREPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
-    static REPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
+    static REPO_OVERVIEWS: RefCell<Vec<RepoOverviewViewHandle>> = const { RefCell::new(Vec::new()) };
     static COMMIT_CHECK_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static WORKSPACE_SETTINGS_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_BUFFERS: RefCell<Vec<glib::WeakRef<TextBuffer>>> = const { RefCell::new(Vec::new()) };
@@ -2022,20 +2031,33 @@ fn refresh_overview_views(snapshot: &StateSnapshot) {
 
     REPO_OVERVIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|handle| match handle.root.upgrade() {
-            Some(root) => {
-                render_repo_overview_into(
-                    &root,
-                    &snapshot,
-                    handle.instance_key.as_deref(),
-                    handle.host_ptr as *const _,
-                );
-                if let Some(panel) = handle.auxiliary_root.upgrade() {
-                    sync_repo_terminal_panel(&panel, &snapshot, handle.instance_key.as_deref());
-                }
-                true
+        views.retain(|handle| {
+            let Some(summary_root) = handle.summary_root.upgrade() else {
+                return false;
+            };
+            let Some(git_root) = handle.git_root.upgrade() else {
+                return false;
+            };
+            let Some(manifest_root) = handle.manifest_root.upgrade() else {
+                return false;
+            };
+            let Some(activity_root) = handle.activity_root.upgrade() else {
+                return false;
+            };
+
+            render_repo_overview_pages(
+                &summary_root,
+                &git_root,
+                &manifest_root,
+                &activity_root,
+                &snapshot,
+                handle.instance_key.as_deref(),
+                handle.host_ptr as *const _,
+            );
+            if let Some(panel) = handle.terminal_root.upgrade() {
+                sync_repo_terminal_panel(&panel, &snapshot, handle.instance_key.as_deref());
             }
-            None => false,
+            true
         });
     });
 }
@@ -5430,8 +5452,6 @@ extern "C" fn create_monorepo_overview_view(
     MONOREPO_OVERVIEWS.with(|views| {
         views.borrow_mut().push(ContainerViewHandle {
             root: root_ref,
-            auxiliary_root: glib::WeakRef::new(),
-            instance_key: None,
             host_ptr: host as usize,
         });
     });
@@ -5477,8 +5497,6 @@ extern "C" fn create_commit_check_view(
     COMMIT_CHECK_VIEWS.with(|views| {
         views.borrow_mut().push(ContainerViewHandle {
             root: root_ref,
-            auxiliary_root: glib::WeakRef::new(),
-            instance_key: None,
             host_ptr: host as usize,
         });
     });
@@ -6202,60 +6220,101 @@ extern "C" fn create_repo_overview_view(
 
     remember_host_ptr(host);
 
-    let root = GtkBox::new(Orientation::Vertical, 18);
-    root.set_margin_top(24);
-    root.set_margin_bottom(24);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
+    let root = GtkBox::new(Orientation::Vertical, 0);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
 
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(0)
-        .child(&root)
-        .build();
-    scroller.set_valign(Align::Fill);
-    scroller.set_propagate_natural_height(false);
+    let tab_bar = GtkBox::new(Orientation::Horizontal, 8);
+    tab_bar.set_margin_top(10);
+    tab_bar.set_margin_bottom(8);
+    tab_bar.set_margin_start(12);
+    tab_bar.set_margin_end(12);
 
-    let instance_key =
-        unsafe { request.as_ref() }.and_then(|request| decode_mzstr(request.instance_key));
-    let snapshot = snapshot();
-    render_repo_overview_into(&root, &snapshot, instance_key.as_deref(), host);
+    let stack = Stack::new();
+    stack.set_hexpand(true);
+    stack.set_vexpand(true);
+
+    let switcher = StackSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    tab_bar.append(&switcher);
+
+    let spacer = GtkBox::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    tab_bar.append(&spacer);
+
+    root.append(&tab_bar);
+    root.append(&stack);
+
+    let summary_root = repo_overview_page_root();
+    let git_root = repo_overview_page_root();
+    let manifest_root = repo_overview_page_root();
+    let activity_root = repo_overview_page_root();
+
+    stack.add_titled(
+        &repo_overview_scroll_page(&summary_root),
+        Some("summary"),
+        "Summary",
+    );
+    stack.add_titled(&repo_overview_scroll_page(&git_root), Some("git"), "Git");
+    stack.add_titled(
+        &repo_overview_scroll_page(&manifest_root),
+        Some("manifest"),
+        "Manifest",
+    );
 
     let terminal_panel = GtkBox::new(Orientation::Vertical, 0);
     terminal_panel.set_hexpand(true);
     terminal_panel.set_vexpand(true);
+    stack.add_titled(&terminal_panel, Some("console"), "Console");
+
+    stack.add_titled(
+        &repo_overview_scroll_page(&activity_root),
+        Some("activity"),
+        "Activity",
+    );
+    stack.set_visible_child_name("summary");
+
+    let instance_key =
+        unsafe { request.as_ref() }.and_then(|request| decode_mzstr(request.instance_key));
+    let snapshot = snapshot();
+    render_repo_overview_pages(
+        &summary_root,
+        &git_root,
+        &manifest_root,
+        &activity_root,
+        &snapshot,
+        instance_key.as_deref(),
+        host,
+    );
     terminal_panel.append(&build_repo_terminal_panel(
         &snapshot,
         instance_key.as_deref(),
     ));
-    let split = Paned::new(Orientation::Vertical);
-    split.set_wide_handle(true);
-    split.set_resize_start_child(true);
-    split.set_shrink_start_child(false);
-    split.set_resize_end_child(true);
-    split.set_shrink_end_child(false);
-    split.set_position(520);
-    split.set_start_child(Some(&scroller));
-    split.set_end_child(Some(&terminal_panel));
 
-    let root_ref = glib::WeakRef::new();
-    root_ref.set(Some(&root));
-    let terminal_panel_ref = glib::WeakRef::new();
-    terminal_panel_ref.set(Some(&terminal_panel));
+    let summary_ref = glib::WeakRef::new();
+    summary_ref.set(Some(&summary_root));
+    let git_ref = glib::WeakRef::new();
+    git_ref.set(Some(&git_root));
+    let manifest_ref = glib::WeakRef::new();
+    manifest_ref.set(Some(&manifest_root));
+    let activity_ref = glib::WeakRef::new();
+    activity_ref.set(Some(&activity_root));
+    let terminal_ref = glib::WeakRef::new();
+    terminal_ref.set(Some(&terminal_panel));
     REPO_OVERVIEWS.with(|views| {
-        views.borrow_mut().push(ContainerViewHandle {
-            root: root_ref,
-            auxiliary_root: terminal_panel_ref,
+        views.borrow_mut().push(RepoOverviewViewHandle {
+            summary_root: summary_ref,
+            git_root: git_ref,
+            manifest_root: manifest_ref,
+            activity_root: activity_ref,
+            terminal_root: terminal_ref,
             instance_key,
             host_ptr: host as usize,
         });
     });
 
     unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(split.upcast())
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
             as *mut std::ffi::c_void
     }
 }
@@ -6292,8 +6351,6 @@ extern "C" fn create_workspace_settings_view(
     WORKSPACE_SETTINGS_VIEWS.with(|views| {
         views.borrow_mut().push(ContainerViewHandle {
             root: root_ref,
-            auxiliary_root: glib::WeakRef::new(),
-            instance_key: None,
             host_ptr: host as usize,
         });
     });
@@ -7550,41 +7607,75 @@ fn apply_saved_manifest(
     schedule_workspace_scan();
 }
 
-fn render_repo_overview_into(
-    root: &GtkBox,
+fn repo_overview_page_root() -> GtkBox {
+    let root = GtkBox::new(Orientation::Vertical, 18);
+    root.set_margin_top(18);
+    root.set_margin_bottom(24);
+    root.set_margin_start(24);
+    root.set_margin_end(24);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+    root
+}
+
+fn repo_overview_scroll_page(root: &GtkBox) -> ScrolledWindow {
+    let scroller = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(0)
+        .child(root)
+        .build();
+    scroller.set_valign(Align::Fill);
+    scroller.set_propagate_natural_height(false);
+    scroller
+}
+
+fn render_repo_overview_pages(
+    summary_root: &GtkBox,
+    git_root: &GtkBox,
+    manifest_root: &GtkBox,
+    activity_root: &GtkBox,
     snapshot: &StateSnapshot,
     instance_key: Option<&str>,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    clear_box(root);
+    for root in [summary_root, git_root, manifest_root, activity_root] {
+        clear_box(root);
+    }
 
     let target_repo_id = instance_key.or(snapshot.active_repo_id.as_deref());
     let Some(active_repo_id) = target_repo_id else {
-        append_repo_overview_empty_title(root);
-        let body = Label::new(Some(
+        render_repo_overview_empty_page(
+            summary_root,
+            snapshot,
+            host_ptr,
             "No repo target was provided. Open repo overviews from the left monitor.",
-        ));
-        body.set_xalign(0.0);
-        body.set_wrap(true);
-        body.add_css_class("muted");
-        root.append(&body);
-        root.append(&overview_actions(true));
-        root.append(&overview_file_actions(snapshot, host_ptr));
+        );
+        render_repo_overview_muted_page(git_root, "No repo target is attached to this tab.");
+        render_repo_overview_muted_page(manifest_root, "No repo target is attached to this tab.");
+        render_repo_overview_muted_page(activity_root, "No repo target is attached to this tab.");
         return;
     };
 
     let items = repository_items(snapshot);
     let Some(item) = items.iter().find(|item| item.id == active_repo_id) else {
-        append_repo_overview_empty_title(root);
-        let body = Label::new(Some(
+        render_repo_overview_empty_page(
+            summary_root,
+            snapshot,
+            host_ptr,
             "The active repo overview target is no longer present in the current manifest.",
-        ));
-        body.set_xalign(0.0);
-        body.set_wrap(true);
-        body.add_css_class("muted");
-        root.append(&body);
-        root.append(&overview_actions(true));
-        root.append(&overview_file_actions(snapshot, host_ptr));
+        );
+        render_repo_overview_muted_page(git_root, "This repository is no longer in the manifest.");
+        render_repo_overview_muted_page(
+            manifest_root,
+            "This repository is no longer in the manifest.",
+        );
+        render_repo_overview_muted_page(
+            activity_root,
+            "This repository is no longer in the manifest.",
+        );
         return;
     };
 
@@ -7597,29 +7688,214 @@ fn render_repo_overview_into(
     let attention_signals = repo_attention_detail_signals(snapshot, item);
     let details = snapshot.repo_details_cache.get(&item.id);
 
-    root.append(&repo_overview_context(item, snapshot, &attention_signals));
+    render_repo_overview_summary_page(summary_root, snapshot, item, &attention_signals, host_ptr);
+    render_repo_overview_git_page(git_root, snapshot, item, details, host_ptr);
+    render_repo_overview_manifest_page(manifest_root, snapshot, item, host_ptr);
+    render_repo_overview_activity_page(activity_root, snapshot, item, host_ptr);
+}
 
-    let content = GtkBox::new(Orientation::Horizontal, 24);
-    content.set_hexpand(true);
+fn render_repo_overview_empty_page(
+    root: &GtkBox,
+    snapshot: &StateSnapshot,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    message: &str,
+) {
+    append_repo_overview_empty_title(root);
+    let body = Label::new(Some(message));
+    body.set_xalign(0.0);
+    body.set_wrap(true);
+    body.add_css_class("muted");
+    root.append(&body);
+    root.append(&overview_actions(true));
+    root.append(&overview_file_actions(snapshot, host_ptr));
+}
 
-    let main = GtkBox::new(Orientation::Vertical, 16);
-    main.set_hexpand(true);
-    main.append(&repo_overview_attention_section(&attention_signals));
-    main.append(&repo_overview_capabilities_section(snapshot, item));
-    main.append(&repo_overview_activity_section(
-        &repo_recent_logs(snapshot, item),
-        6,
+fn render_repo_overview_muted_page(root: &GtkBox, message: &str) {
+    append_repo_overview_empty_title(root);
+    let body = Label::new(Some(message));
+    body.set_xalign(0.0);
+    body.set_wrap(true);
+    body.add_css_class("muted");
+    root.append(&body);
+}
+
+fn render_repo_overview_summary_page(
+    root: &GtkBox,
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+    attention_signals: &[AttentionSignal],
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) {
+    root.append(&repo_overview_context(item, snapshot, attention_signals));
+    root.append(&repo_overview_summary_facts_section(
+        snapshot,
+        item,
+        attention_signals,
     ));
+    root.append(&repo_overview_attention_section(attention_signals));
+    root.append(&repo_overview_action_section(
+        "Primary Actions",
+        item,
+        host_ptr,
+        &[
+            ("Target This Repo", None),
+            ("Run Cap Checks", None),
+            ("Open In Editor", None),
+            ("Open Folder", None),
+        ],
+    ));
+}
 
-    let side = GtkBox::new(Orientation::Vertical, 16);
-    side.set_width_request(380);
-    side.append(&repo_overview_actions_section(item, host_ptr));
-    side.append(&repo_overview_git_section(snapshot, item, details));
-    side.append(&repo_overview_workspace_section(snapshot, host_ptr));
+fn render_repo_overview_git_page(
+    root: &GtkBox,
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+    details: Option<&RepositoryDetails>,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) {
+    let attention_signals = repo_attention_detail_signals(snapshot, item);
+    root.append(&repo_overview_context(item, snapshot, &attention_signals));
+    root.append(&repo_overview_action_section(
+        "Git Actions",
+        item,
+        host_ptr,
+        &[
+            ("Pull Repo", Some(OperationKind::Pull)),
+            ("Push Repo", Some(OperationKind::Push)),
+            ("Clone Repo", Some(OperationKind::CloneMissing)),
+            ("Push Repo Force", Some(OperationKind::PushForce)),
+            ("Apply Hooks", Some(OperationKind::ApplyHooks)),
+        ],
+    ));
+    root.append(&repo_overview_git_section(snapshot, item, details));
+}
 
-    content.append(&main);
-    content.append(&side);
-    root.append(&content);
+fn render_repo_overview_manifest_page(
+    root: &GtkBox,
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) {
+    let attention_signals = repo_attention_detail_signals(snapshot, item);
+    root.append(&repo_overview_context(item, snapshot, &attention_signals));
+    root.append(&repo_overview_manifest_status_section(item));
+    root.append(&repo_overview_action_section(
+        "Manifest Actions",
+        item,
+        host_ptr,
+        &[
+            ("Edit Repo Manifest", None),
+            ("Run Cap Checks", None),
+            ("Edit README", None),
+            ("Edit .git/config", None),
+        ],
+    ));
+    root.append(&repo_overview_capabilities_section(snapshot, item));
+}
+
+fn render_repo_overview_activity_page(
+    root: &GtkBox,
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) {
+    let attention_signals = repo_attention_detail_signals(snapshot, item);
+    root.append(&repo_overview_context(item, snapshot, &attention_signals));
+    root.append(&repo_overview_activity_section(
+        &repo_recent_logs(snapshot, item),
+        18,
+    ));
+    root.append(&repo_overview_workspace_section(snapshot, host_ptr));
+}
+
+fn repo_overview_summary_facts_section(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+    attention_signals: &[AttentionSignal],
+) -> GtkBox {
+    let summary = capability_monitor_summary(item, snapshot);
+    let facts = [
+        ("State", status_label(&item.status.state).to_string()),
+        ("Sync", format_sync_label(&item.status.sync)),
+        ("Branch", branch_label(item).to_string()),
+        (
+            "Manifest",
+            manifest_presence_label(item.repo_manifest.as_ref()).to_string(),
+        ),
+        (
+            "Attention",
+            attention_monitor_label(attention_signals).to_string(),
+        ),
+        (
+            "Capabilities",
+            capability_monitor_label(&summary).to_string(),
+        ),
+        (
+            "Due Checks",
+            repo_due_capability_count(snapshot, item, current_epoch_secs()).to_string(),
+        ),
+    ];
+    repo_overview_section("Status", &repo_overview_facts_body(&facts))
+}
+
+fn repo_overview_manifest_status_section(item: &RepositoryListItem) -> GtkBox {
+    let manifest_path = item
+        .repo_manifest
+        .as_ref()
+        .map(|scan| scan.path.clone())
+        .unwrap_or_else(|| default_repo_manifest_path(&item.status.repo_path));
+    let mut facts = vec![
+        (
+            "Status",
+            manifest_presence_label(item.repo_manifest.as_ref()).to_string(),
+        ),
+        ("Path", manifest_path.display().to_string()),
+    ];
+
+    match item.repo_manifest.as_ref().map(|scan| &scan.state) {
+        Some(RepoManifestScanState::Valid(summary)) => {
+            facts.push(("Items", summary.item_count.to_string()));
+            facts.push(("Types", summary.item_types.join(", ")));
+            facts.push(("Actions", summary.action_count.to_string()));
+            facts.push(("Capabilities", summary.capability_count.to_string()));
+            facts.push((
+                "Policy Issues",
+                summary.missing_required_capability_count.to_string(),
+            ));
+            facts.push((
+                "Unsupported",
+                summary.unsupported_capability_count.to_string(),
+            ));
+        }
+        Some(RepoManifestScanState::Invalid { message }) => {
+            facts.push(("Error", message.clone()));
+        }
+        Some(RepoManifestScanState::Missing) => {
+            facts.push(("Next", "Create or edit the repo manifest.".to_string()));
+        }
+        None => {
+            facts.push((
+                "Scan",
+                "Manifest state has not been collected yet.".to_string(),
+            ));
+        }
+    }
+
+    repo_overview_section("Manifest", &repo_overview_facts_body(&facts))
+}
+
+fn repo_overview_action_section(
+    title: &str,
+    item: &RepositoryListItem,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    actions: &[(&'static str, Option<OperationKind>)],
+) -> GtkBox {
+    let body = GtkBox::new(Orientation::Horizontal, 8);
+    body.set_hexpand(true);
+    for (label, kind) in actions {
+        body.append(&repo_overview_action_button(item, host_ptr, label, *kind));
+    }
+    repo_overview_section(title, &body)
 }
 
 fn append_repo_overview_empty_title(root: &GtkBox) {
@@ -7729,58 +8005,6 @@ fn repo_overview_capabilities_section(
         false,
     );
     repo_overview_section("Capabilities", &body)
-}
-
-fn repo_overview_actions_section(
-    item: &RepositoryListItem,
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-) -> GtkBox {
-    let body = GtkBox::new(Orientation::Vertical, 10);
-
-    let primary = GtkBox::new(Orientation::Horizontal, 8);
-    for label in ["Run Cap Checks", "Edit Repo Manifest"] {
-        primary.append(&repo_overview_action_button(item, host_ptr, label, None));
-    }
-    body.append(&primary);
-
-    let open = GtkBox::new(Orientation::Horizontal, 8);
-    for label in ["Open Terminal", "Open In Editor", "Open Folder"] {
-        open.append(&repo_overview_action_button(item, host_ptr, label, None));
-    }
-    body.append(&open);
-
-    let config = GtkBox::new(Orientation::Horizontal, 8);
-    for label in ["Edit README", "Edit .git/config"] {
-        config.append(&repo_overview_action_button(item, host_ptr, label, None));
-    }
-    body.append(&config);
-
-    let git = GtkBox::new(Orientation::Horizontal, 8);
-    for (label, kind) in [
-        ("Target This Repo", None),
-        ("Pull Repo", Some(OperationKind::Pull)),
-        ("Push Repo", Some(OperationKind::Push)),
-    ] {
-        git.append(&repo_overview_action_button(item, host_ptr, label, kind));
-    }
-    body.append(&git);
-
-    let risky = GtkBox::new(Orientation::Horizontal, 8);
-    for (label, kind) in [
-        ("Clone Repo", OperationKind::CloneMissing),
-        ("Push Repo Force", OperationKind::PushForce),
-        ("Apply Hooks", OperationKind::ApplyHooks),
-    ] {
-        risky.append(&repo_overview_action_button(
-            item,
-            host_ptr,
-            label,
-            Some(kind),
-        ));
-    }
-    body.append(&risky);
-
-    repo_overview_section("Actions", &body)
 }
 
 fn repo_overview_git_section(
