@@ -138,12 +138,14 @@ const MONITOR_MANIFEST_COL_CHARS: i32 = 12;
 const MONITOR_STATE_COL_CHARS: i32 = 12;
 const MONITOR_CAPABILITY_COL_CHARS: i32 = 10;
 const MONITOR_ATTENTION_COL_CHARS: i32 = 12;
+const MONITOR_ACTIONS_COL_CHARS: i32 = 12;
 const MONITOR_NAME_COL_WIDTH: i32 = 300;
 const MONITOR_BRANCH_COL_WIDTH: i32 = 120;
 const MONITOR_MANIFEST_COL_WIDTH: i32 = 120;
 const MONITOR_STATE_COL_WIDTH: i32 = 120;
 const MONITOR_CAPABILITY_COL_WIDTH: i32 = 96;
 const MONITOR_ATTENTION_COL_WIDTH: i32 = 112;
+const MONITOR_ACTIONS_COL_WIDTH: i32 = 120;
 const WORKER_POOL_SIZE: usize = 4;
 const LOCAL_RESCAN_INTERVAL_SECS: u32 = 5 * 60;
 const REMOTE_FETCH_TICK_SECS: u32 = 30;
@@ -168,6 +170,32 @@ struct RonomepoPluginConfig {
     monitor_sort_mode: MonitorSortMode,
     #[serde(default)]
     monitor_sort_descending: bool,
+    #[serde(default)]
+    monitor_view_mode: MonitorViewMode,
+    #[serde(default)]
+    overview_filter_mode: MonitorFilterMode,
+    #[serde(default)]
+    git_filter_mode: MonitorFilterMode,
+    #[serde(default)]
+    checks_filter_mode: MonitorFilterMode,
+    #[serde(default)]
+    manifest_filter_mode: MonitorFilterMode,
+    #[serde(default)]
+    overview_sort_mode: MonitorSortMode,
+    #[serde(default)]
+    git_sort_mode: MonitorSortMode,
+    #[serde(default)]
+    checks_sort_mode: MonitorSortMode,
+    #[serde(default)]
+    manifest_sort_mode: MonitorSortMode,
+    #[serde(default)]
+    overview_sort_descending: bool,
+    #[serde(default)]
+    git_sort_descending: bool,
+    #[serde(default)]
+    checks_sort_descending: bool,
+    #[serde(default)]
+    manifest_sort_descending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +206,17 @@ enum MonitorFilterMode {
     Dirty,
     ToSync,
     Issues,
+    NeedsAttention,
+    Healthy,
+    Diverged,
+    Clean,
+    Due,
+    Failing,
+    MissingManifest,
+    NoChecks,
+    Enabled,
+    Disabled,
+    HasActions,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +226,21 @@ enum MonitorSortMode {
     Name,
     SyncState,
     RecentActivity,
+    Branch,
+    Attention,
+    CheckState,
+    Manifest,
+    Actions,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MonitorViewMode {
+    #[default]
+    Overview,
+    Git,
+    Checks,
+    Manifest,
 }
 
 #[derive(Clone, Debug)]
@@ -201,9 +255,19 @@ struct AppState {
     repo_details_cache: HashMap<String, RepositoryDetails>,
     repo_details_loading: HashSet<String>,
     monitor_filter: String,
-    monitor_filter_mode: MonitorFilterMode,
-    monitor_sort_mode: MonitorSortMode,
-    monitor_sort_descending: bool,
+    monitor_view_mode: MonitorViewMode,
+    overview_filter_mode: MonitorFilterMode,
+    git_filter_mode: MonitorFilterMode,
+    checks_filter_mode: MonitorFilterMode,
+    manifest_filter_mode: MonitorFilterMode,
+    overview_sort_mode: MonitorSortMode,
+    git_sort_mode: MonitorSortMode,
+    checks_sort_mode: MonitorSortMode,
+    manifest_sort_mode: MonitorSortMode,
+    overview_sort_descending: bool,
+    git_sort_descending: bool,
+    checks_sort_descending: bool,
+    manifest_sort_descending: bool,
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
@@ -231,9 +295,19 @@ impl Default for AppState {
             repo_details_cache: HashMap::new(),
             repo_details_loading: HashSet::new(),
             monitor_filter: String::new(),
-            monitor_filter_mode: MonitorFilterMode::default(),
-            monitor_sort_mode: MonitorSortMode::default(),
-            monitor_sort_descending: false,
+            monitor_view_mode: MonitorViewMode::default(),
+            overview_filter_mode: MonitorFilterMode::All,
+            git_filter_mode: MonitorFilterMode::All,
+            checks_filter_mode: MonitorFilterMode::All,
+            manifest_filter_mode: MonitorFilterMode::All,
+            overview_sort_mode: MonitorSortMode::Name,
+            git_sort_mode: MonitorSortMode::Name,
+            checks_sort_mode: MonitorSortMode::Name,
+            manifest_sort_mode: MonitorSortMode::Name,
+            overview_sort_descending: false,
+            git_sort_descending: false,
+            checks_sort_descending: false,
+            manifest_sort_descending: false,
             selected_repo_ids: Vec::new(),
             active_repo_id: None,
             logs: Vec::new(),
@@ -1215,9 +1289,33 @@ fn initialize_state(config: &RonomepoPluginConfig) {
     app_state.repository_items_refresh_pending = false;
     app_state.repo_details_cache.clear();
     app_state.repo_details_loading.clear();
-    app_state.monitor_filter_mode = config.monitor_filter_mode;
-    app_state.monitor_sort_mode = config.monitor_sort_mode;
-    app_state.monitor_sort_descending = config.monitor_sort_descending;
+    app_state.monitor_view_mode = config.monitor_view_mode;
+    app_state.overview_filter_mode = if config.overview_filter_mode == MonitorFilterMode::All {
+        match config.monitor_filter_mode {
+            MonitorFilterMode::Dirty | MonitorFilterMode::ToSync | MonitorFilterMode::Issues => {
+                MonitorFilterMode::Issues
+            }
+            _ => MonitorFilterMode::All,
+        }
+    } else {
+        config.overview_filter_mode
+    };
+    app_state.git_filter_mode = config.git_filter_mode;
+    app_state.checks_filter_mode = config.checks_filter_mode;
+    app_state.manifest_filter_mode = config.manifest_filter_mode;
+    app_state.overview_sort_mode = if config.overview_sort_mode == MonitorSortMode::Name {
+        config.monitor_sort_mode
+    } else {
+        config.overview_sort_mode
+    };
+    app_state.git_sort_mode = config.git_sort_mode;
+    app_state.checks_sort_mode = config.checks_sort_mode;
+    app_state.manifest_sort_mode = config.manifest_sort_mode;
+    app_state.overview_sort_descending =
+        config.monitor_sort_descending || config.overview_sort_descending;
+    app_state.git_sort_descending = config.git_sort_descending;
+    app_state.checks_sort_descending = config.checks_sort_descending;
+    app_state.manifest_sort_descending = config.manifest_sort_descending;
     sync_repo_runtime_state(&mut app_state);
     if app_state.logs.is_empty() {
         app_state.logs.push(format!(
@@ -1826,7 +1924,7 @@ fn handle_worker_result(result: WorkerResult) {
                 changed
             };
             if changed {
-                if snapshot().monitor_sort_mode == MonitorSortMode::RecentActivity {
+                if active_monitor_sort_mode(&snapshot()) == MonitorSortMode::RecentActivity {
                     let snapshot = snapshot();
                     refresh_repository_views(&snapshot);
                 }
@@ -2272,9 +2370,19 @@ struct StateSnapshot {
     repo_details_cache: HashMap<String, RepositoryDetails>,
     repo_details_loading: HashSet<String>,
     monitor_filter: String,
-    monitor_filter_mode: MonitorFilterMode,
-    monitor_sort_mode: MonitorSortMode,
-    monitor_sort_descending: bool,
+    monitor_view_mode: MonitorViewMode,
+    overview_filter_mode: MonitorFilterMode,
+    git_filter_mode: MonitorFilterMode,
+    checks_filter_mode: MonitorFilterMode,
+    manifest_filter_mode: MonitorFilterMode,
+    overview_sort_mode: MonitorSortMode,
+    git_sort_mode: MonitorSortMode,
+    checks_sort_mode: MonitorSortMode,
+    manifest_sort_mode: MonitorSortMode,
+    overview_sort_descending: bool,
+    git_sort_descending: bool,
+    checks_sort_descending: bool,
+    manifest_sort_descending: bool,
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
@@ -2297,9 +2405,19 @@ fn snapshot() -> StateSnapshot {
         repo_details_cache: app_state.repo_details_cache.clone(),
         repo_details_loading: app_state.repo_details_loading.clone(),
         monitor_filter: app_state.monitor_filter.clone(),
-        monitor_filter_mode: app_state.monitor_filter_mode,
-        monitor_sort_mode: app_state.monitor_sort_mode,
-        monitor_sort_descending: app_state.monitor_sort_descending,
+        monitor_view_mode: app_state.monitor_view_mode,
+        overview_filter_mode: app_state.overview_filter_mode,
+        git_filter_mode: app_state.git_filter_mode,
+        checks_filter_mode: app_state.checks_filter_mode,
+        manifest_filter_mode: app_state.manifest_filter_mode,
+        overview_sort_mode: app_state.overview_sort_mode,
+        git_sort_mode: app_state.git_sort_mode,
+        checks_sort_mode: app_state.checks_sort_mode,
+        manifest_sort_mode: app_state.manifest_sort_mode,
+        overview_sort_descending: app_state.overview_sort_descending,
+        git_sort_descending: app_state.git_sort_descending,
+        checks_sort_descending: app_state.checks_sort_descending,
+        manifest_sort_descending: app_state.manifest_sort_descending,
         selected_repo_ids: app_state.selected_repo_ids.clone(),
         active_repo_id: app_state.active_repo_id.clone(),
         logs: app_state.logs.clone(),
@@ -2413,35 +2531,12 @@ fn all_monitor_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
 }
 
 fn sync_repository_monitor_store(store: &gio::ListStore, next_items: &[RepositoryListItem]) {
-    let mut index = 0usize;
-    while index < next_items.len() {
-        let next_item = &next_items[index];
-        let current = store
-            .item(index as u32)
-            .and_then(|item| item.downcast::<BoxedAnyObject>().ok())
-            .map(|boxed| boxed.borrow::<RepositoryListItem>().clone());
-
-        match current {
-            Some(current_item) if current_item.id == next_item.id => {
-                if current_item != *next_item {
-                    store.splice(index as u32, 1, &[BoxedAnyObject::new(next_item.clone())]);
-                }
-                index += 1;
-            }
-            Some(_) => {
-                store.splice(index as u32, 1, &[BoxedAnyObject::new(next_item.clone())]);
-                index += 1;
-            }
-            None => {
-                store.append(&BoxedAnyObject::new(next_item.clone()));
-                index += 1;
-            }
-        }
-    }
-
-    while store.n_items() > next_items.len() as u32 {
-        store.remove(store.n_items() - 1);
-    }
+    let boxed_items = next_items
+        .iter()
+        .cloned()
+        .map(BoxedAnyObject::new)
+        .collect::<Vec<_>>();
+    store.splice(0, store.n_items(), &boxed_items);
 }
 
 fn update_repository_monitor_empty_state(list: &ListBox, snapshot: &StateSnapshot, is_empty: bool) {
@@ -2521,7 +2616,7 @@ fn repo_item_from_object(object: &glib::Object) -> Option<RepositoryListItem> {
 }
 
 fn repo_monitor_filter_matches(item: &RepositoryListItem, snapshot: &StateSnapshot) -> bool {
-    if !matches_filter_mode(item, snapshot.monitor_filter_mode, snapshot) {
+    if !matches_filter_mode(item, active_monitor_filter_mode(snapshot), snapshot) {
         return false;
     }
     let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
@@ -2550,6 +2645,7 @@ fn build_repo_monitor_row(
     item: &RepositoryListItem,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> GtkBox {
+    let current_snapshot = snapshot();
     let content = GtkBox::new(Orientation::Horizontal, 10);
     mark_clickable(&content);
     content.set_margin_top(8);
@@ -2564,35 +2660,51 @@ fn build_repo_monitor_row(
         item.dir_name
     )));
 
-    let name = monitor_text_cell(
+    append_monitor_name_cell(&content, item);
+    match current_snapshot.monitor_view_mode {
+        MonitorViewMode::Overview => {
+            content.append(&monitor_state_cell(&item.status.state));
+            content.append(&monitor_sync_cell(&item.status.sync));
+            content.append(&monitor_attention_cell(&current_snapshot, item));
+        }
+        MonitorViewMode::Git => {
+            content.append(&monitor_text_cell(
+                branch_label(item),
+                MONITOR_BRANCH_COL_CHARS,
+                MONITOR_BRANCH_COL_WIDTH,
+                false,
+            ));
+            content.append(&monitor_state_cell(&item.status.state));
+            content.append(&monitor_sync_cell(&item.status.sync));
+        }
+        MonitorViewMode::Checks => {
+            content.append(&monitor_manifest_cell(item.repo_manifest.as_ref()));
+            content.append(&monitor_capability_cell(item, &current_snapshot));
+            content.append(&monitor_attention_cell(&current_snapshot, item));
+        }
+        MonitorViewMode::Manifest => {
+            content.append(&monitor_manifest_cell(item.repo_manifest.as_ref()));
+            content.append(&monitor_manifest_actions_cell(item));
+            content.append(&monitor_enabled_cell(&current_snapshot, item));
+            content.append(&monitor_text_cell(
+                &item.remote_url,
+                MONITOR_BRANCH_COL_CHARS,
+                MONITOR_BRANCH_COL_WIDTH,
+                true,
+            ));
+        }
+    }
+    attach_repo_monitor_context_menu(&content, host_ptr);
+    content
+}
+
+fn append_monitor_name_cell(row: &GtkBox, item: &RepositoryListItem) {
+    row.append(&monitor_text_cell(
         &item.name,
         MONITOR_NAME_COL_CHARS,
         MONITOR_NAME_COL_WIDTH,
         false,
-    );
-    let branch = monitor_text_cell(
-        branch_label(item),
-        MONITOR_BRANCH_COL_CHARS,
-        MONITOR_BRANCH_COL_WIDTH,
-        false,
-    );
-    let manifest = monitor_manifest_cell(item.repo_manifest.as_ref());
-    let current_snapshot = snapshot();
-    let capability = monitor_capability_cell(item, &current_snapshot);
-    let attention = monitor_attention_cell(&current_snapshot, item);
-    let status = monitor_state_cell(&item.status.state);
-
-    let sync = monitor_sync_cell(&item.status.sync);
-
-    content.append(&name);
-    content.append(&branch);
-    content.append(&manifest);
-    content.append(&capability);
-    content.append(&attention);
-    content.append(&status);
-    content.append(&sync);
-    attach_repo_monitor_context_menu(&content, host_ptr);
-    content
+    ));
 }
 
 fn repository_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
@@ -2616,13 +2728,40 @@ fn visible_monitor_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
     filtered_repository_items(snapshot, all_monitor_items(snapshot))
 }
 
+fn active_monitor_filter_mode(snapshot: &StateSnapshot) -> MonitorFilterMode {
+    match snapshot.monitor_view_mode {
+        MonitorViewMode::Overview => snapshot.overview_filter_mode,
+        MonitorViewMode::Git => snapshot.git_filter_mode,
+        MonitorViewMode::Checks => snapshot.checks_filter_mode,
+        MonitorViewMode::Manifest => snapshot.manifest_filter_mode,
+    }
+}
+
+fn active_monitor_sort_mode(snapshot: &StateSnapshot) -> MonitorSortMode {
+    match snapshot.monitor_view_mode {
+        MonitorViewMode::Overview => snapshot.overview_sort_mode,
+        MonitorViewMode::Git => snapshot.git_sort_mode,
+        MonitorViewMode::Checks => snapshot.checks_sort_mode,
+        MonitorViewMode::Manifest => snapshot.manifest_sort_mode,
+    }
+}
+
+fn active_monitor_sort_descending(snapshot: &StateSnapshot) -> bool {
+    match snapshot.monitor_view_mode {
+        MonitorViewMode::Overview => snapshot.overview_sort_descending,
+        MonitorViewMode::Git => snapshot.git_sort_descending,
+        MonitorViewMode::Checks => snapshot.checks_sort_descending,
+        MonitorViewMode::Manifest => snapshot.manifest_sort_descending,
+    }
+}
+
 fn filtered_repository_items(
     snapshot: &StateSnapshot,
     mut items: Vec<RepositoryListItem>,
 ) -> Vec<RepositoryListItem> {
     items.sort_by(|left, right| repo_monitor_sort_cmp(snapshot, left, right));
 
-    let mode = snapshot.monitor_filter_mode;
+    let mode = active_monitor_filter_mode(snapshot);
     items.retain(|item| matches_filter_mode(item, mode, snapshot));
 
     let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
@@ -2648,23 +2787,134 @@ fn monitor_sort_mode_label(mode: MonitorSortMode) -> &'static str {
         MonitorSortMode::Name => "Name",
         MonitorSortMode::SyncState => "Sync state",
         MonitorSortMode::RecentActivity => "Recent activity",
+        MonitorSortMode::Branch => "Branch",
+        MonitorSortMode::Attention => "Attention",
+        MonitorSortMode::CheckState => "Check state",
+        MonitorSortMode::Manifest => "Manifest",
+        MonitorSortMode::Actions => "Actions",
     }
 }
 
-fn monitor_sort_mode_from_index(index: u32) -> MonitorSortMode {
-    match index {
-        1 => MonitorSortMode::SyncState,
-        2 => MonitorSortMode::RecentActivity,
-        _ => MonitorSortMode::Name,
-    }
-}
-
-fn monitor_sort_mode_index(mode: MonitorSortMode) -> u32 {
+fn monitor_view_mode_label(mode: MonitorViewMode) -> &'static str {
     match mode {
-        MonitorSortMode::Name => 0,
-        MonitorSortMode::SyncState => 1,
-        MonitorSortMode::RecentActivity => 2,
+        MonitorViewMode::Overview => "Overview",
+        MonitorViewMode::Git => "Git",
+        MonitorViewMode::Checks => "Checks",
+        MonitorViewMode::Manifest => "Manifest",
     }
+}
+
+fn monitor_view_mode_key(mode: MonitorViewMode) -> &'static str {
+    match mode {
+        MonitorViewMode::Overview => "overview",
+        MonitorViewMode::Git => "git",
+        MonitorViewMode::Checks => "checks",
+        MonitorViewMode::Manifest => "manifest",
+    }
+}
+
+fn monitor_filter_mode_label(mode: MonitorFilterMode) -> &'static str {
+    match mode {
+        MonitorFilterMode::All => "All",
+        MonitorFilterMode::Dirty => "Dirty",
+        MonitorFilterMode::ToSync => "To sync",
+        MonitorFilterMode::Issues => "Issues",
+        MonitorFilterMode::NeedsAttention => "Needs attention",
+        MonitorFilterMode::Healthy => "Healthy",
+        MonitorFilterMode::Diverged => "Diverged",
+        MonitorFilterMode::Clean => "Clean",
+        MonitorFilterMode::Due => "Due",
+        MonitorFilterMode::Failing => "Failing",
+        MonitorFilterMode::MissingManifest => "Missing manifest",
+        MonitorFilterMode::NoChecks => "No checks",
+        MonitorFilterMode::Enabled => "Enabled",
+        MonitorFilterMode::Disabled => "Disabled",
+        MonitorFilterMode::HasActions => "Has actions",
+    }
+}
+
+fn monitor_view_modes() -> &'static [MonitorViewMode] {
+    &[
+        MonitorViewMode::Overview,
+        MonitorViewMode::Git,
+        MonitorViewMode::Checks,
+        MonitorViewMode::Manifest,
+    ]
+}
+
+fn monitor_filter_modes_for_view(view: MonitorViewMode) -> &'static [MonitorFilterMode] {
+    match view {
+        MonitorViewMode::Overview => &[
+            MonitorFilterMode::All,
+            MonitorFilterMode::NeedsAttention,
+            MonitorFilterMode::Issues,
+            MonitorFilterMode::Healthy,
+        ],
+        MonitorViewMode::Git => &[
+            MonitorFilterMode::All,
+            MonitorFilterMode::Dirty,
+            MonitorFilterMode::ToSync,
+            MonitorFilterMode::Diverged,
+            MonitorFilterMode::Clean,
+        ],
+        MonitorViewMode::Checks => &[
+            MonitorFilterMode::All,
+            MonitorFilterMode::Due,
+            MonitorFilterMode::Failing,
+            MonitorFilterMode::MissingManifest,
+            MonitorFilterMode::NoChecks,
+        ],
+        MonitorViewMode::Manifest => &[
+            MonitorFilterMode::All,
+            MonitorFilterMode::Enabled,
+            MonitorFilterMode::Disabled,
+            MonitorFilterMode::MissingManifest,
+            MonitorFilterMode::HasActions,
+        ],
+    }
+}
+
+fn monitor_sort_modes_for_view(view: MonitorViewMode) -> &'static [MonitorSortMode] {
+    match view {
+        MonitorViewMode::Overview => &[
+            MonitorSortMode::Name,
+            MonitorSortMode::Attention,
+            MonitorSortMode::SyncState,
+            MonitorSortMode::RecentActivity,
+        ],
+        MonitorViewMode::Git => &[
+            MonitorSortMode::Name,
+            MonitorSortMode::Branch,
+            MonitorSortMode::SyncState,
+            MonitorSortMode::RecentActivity,
+        ],
+        MonitorViewMode::Checks => &[
+            MonitorSortMode::Name,
+            MonitorSortMode::CheckState,
+            MonitorSortMode::Manifest,
+            MonitorSortMode::Attention,
+        ],
+        MonitorViewMode::Manifest => &[
+            MonitorSortMode::Name,
+            MonitorSortMode::Manifest,
+            MonitorSortMode::Actions,
+            MonitorSortMode::RecentActivity,
+        ],
+    }
+}
+
+fn monitor_sort_mode_from_index(view: MonitorViewMode, index: u32) -> MonitorSortMode {
+    monitor_sort_modes_for_view(view)
+        .get(index as usize)
+        .copied()
+        .unwrap_or(MonitorSortMode::Name)
+}
+
+fn monitor_sort_mode_index(view: MonitorViewMode, mode: MonitorSortMode) -> u32 {
+    monitor_sort_modes_for_view(view)
+        .iter()
+        .position(|candidate| *candidate == mode)
+        .unwrap_or(0) as u32
 }
 
 fn monitor_sort_direction_label(descending: bool) -> &'static str {
@@ -2686,11 +2936,19 @@ fn repo_monitor_sort_cmp(
         return monorepo_rank;
     }
 
-    let ordering = match snapshot.monitor_sort_mode {
+    let ordering = match active_monitor_sort_mode(snapshot) {
         MonitorSortMode::Name => left
             .name
             .to_ascii_lowercase()
             .cmp(&right.name.to_ascii_lowercase()),
+        MonitorSortMode::Branch => branch_label(left)
+            .to_ascii_lowercase()
+            .cmp(&branch_label(right).to_ascii_lowercase())
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            }),
         MonitorSortMode::SyncState => {
             repo_sync_state_sort_key(left).cmp(&repo_sync_state_sort_key(right))
         }
@@ -2701,9 +2959,37 @@ fn repo_monitor_sort_cmp(
                     .to_ascii_lowercase()
                     .cmp(&right.name.to_ascii_lowercase())
             }),
+        MonitorSortMode::Attention => repo_attention_rank(snapshot, left)
+            .cmp(&repo_attention_rank(snapshot, right))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            }),
+        MonitorSortMode::CheckState => capability_sort_key(snapshot, left)
+            .cmp(&capability_sort_key(snapshot, right))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            }),
+        MonitorSortMode::Manifest => manifest_sort_key(left)
+            .cmp(&manifest_sort_key(right))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            }),
+        MonitorSortMode::Actions => manifest_action_count_sort_key(left)
+            .cmp(&manifest_action_count_sort_key(right))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            }),
     };
 
-    if snapshot.monitor_sort_descending {
+    if active_monitor_sort_descending(snapshot) {
         ordering.reverse()
     } else {
         ordering
@@ -2747,7 +3033,40 @@ fn matches_filter_mode(
             item.status.sync,
             RepositorySync::UpToDate | RepositorySync::NoUpstream
         ),
+        MonitorFilterMode::Diverged => matches!(item.status.sync, RepositorySync::Diverged { .. }),
+        MonitorFilterMode::Clean => {
+            matches!(item.status.state, RepositoryState::Clean)
+                && matches!(
+                    item.status.sync,
+                    RepositorySync::UpToDate | RepositorySync::NoUpstream
+                )
+        }
         MonitorFilterMode::Issues => !repo_attention_signals(snapshot, item).is_empty(),
+        MonitorFilterMode::NeedsAttention => repo_attention_rank(snapshot, item) <= 2,
+        MonitorFilterMode::Healthy => repo_attention_signals(snapshot, item).is_empty(),
+        MonitorFilterMode::Due => repo_needs_capability_attention(snapshot, item),
+        MonitorFilterMode::Failing => {
+            let summary = capability_monitor_summary(item, snapshot);
+            summary.policy_issues > 0
+                || summary.unsupported > 0
+                || summary.error > 0
+                || summary.failed > 0
+        }
+        MonitorFilterMode::MissingManifest => {
+            item.id != MONOREPO_ROW_ID
+                && matches!(
+                    item.repo_manifest.as_ref().map(|scan| &scan.state),
+                    Some(RepoManifestScanState::Missing | RepoManifestScanState::Invalid { .. })
+                        | None
+                )
+        }
+        MonitorFilterMode::NoChecks => {
+            let summary = capability_monitor_summary(item, snapshot);
+            item.id != MONOREPO_ROW_ID && summary.declared == 0 && summary.stored == 0
+        }
+        MonitorFilterMode::Enabled => workspace_repo_enabled(snapshot, item) == Some(true),
+        MonitorFilterMode::Disabled => workspace_repo_enabled(snapshot, item) == Some(false),
+        MonitorFilterMode::HasActions => manifest_action_count(item) > 0,
     }
 }
 
@@ -2774,6 +3093,78 @@ fn repo_sync_state_sort_key(item: &RepositoryListItem) -> (u8, usize, u8, String
         repo_local_state_sort_rank(&item.status.state),
         item.name.to_ascii_lowercase(),
     )
+}
+
+fn capability_sort_key(snapshot: &StateSnapshot, item: &RepositoryListItem) -> (u8, usize, String) {
+    let summary = capability_monitor_summary(item, snapshot);
+    let rank = if summary.policy_issues > 0 || summary.unsupported > 0 {
+        0
+    } else if summary.error > 0 {
+        1
+    } else if summary.failed > 0 {
+        2
+    } else if summary.stale > 0 {
+        3
+    } else if summary.warning > 0 {
+        4
+    } else if summary.unknown > 0 {
+        5
+    } else if summary.running > 0 {
+        6
+    } else if summary.declared > 0 || summary.stored > 0 {
+        7
+    } else {
+        8
+    };
+    (
+        rank,
+        usize::MAX
+            - summary
+                .declared
+                .saturating_add(summary.stored)
+                .saturating_add(summary.policy_issues)
+                .saturating_add(summary.unsupported),
+        item.name.to_ascii_lowercase(),
+    )
+}
+
+fn manifest_sort_key(item: &RepositoryListItem) -> (u8, String) {
+    let rank = match item.repo_manifest.as_ref().map(|scan| &scan.state) {
+        Some(RepoManifestScanState::Invalid { .. }) => 0,
+        Some(RepoManifestScanState::Missing) | None => 1,
+        Some(RepoManifestScanState::Valid(summary))
+            if summary.missing_required_capability_count > 0 =>
+        {
+            2
+        }
+        Some(RepoManifestScanState::Valid(_)) => 3,
+    };
+    (rank, item.name.to_ascii_lowercase())
+}
+
+fn manifest_action_count_sort_key(item: &RepositoryListItem) -> (usize, String) {
+    (
+        usize::MAX - manifest_action_count(item),
+        item.name.to_ascii_lowercase(),
+    )
+}
+
+fn manifest_action_count(item: &RepositoryListItem) -> usize {
+    match item.repo_manifest.as_ref().map(|scan| &scan.state) {
+        Some(RepoManifestScanState::Valid(summary)) => summary.action_count,
+        _ => 0,
+    }
+}
+
+fn workspace_repo_enabled(snapshot: &StateSnapshot, item: &RepositoryListItem) -> Option<bool> {
+    if item.id == MONOREPO_ROW_ID {
+        return None;
+    }
+    snapshot
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.repos.iter().find(|repo| repo.id == item.id))
+        .map(|repo| repo.enabled)
 }
 
 fn repo_local_state_sort_rank(state: &ronomepo_core::RepositoryState) -> u8 {
@@ -2845,30 +3236,62 @@ extern "C" fn command_filter(
 }
 
 fn update_monitor_filter_mode(mode: MonitorFilterMode) {
-    {
+    let view = {
         let mut app_state = state().lock().expect("state mutex poisoned");
-        app_state.monitor_filter_mode = mode;
-    }
-    persist_monitor_filter_mode(mode);
+        match app_state.monitor_view_mode {
+            MonitorViewMode::Overview => app_state.overview_filter_mode = mode,
+            MonitorViewMode::Git => app_state.git_filter_mode = mode,
+            MonitorViewMode::Checks => app_state.checks_filter_mode = mode,
+            MonitorViewMode::Manifest => app_state.manifest_filter_mode = mode,
+        }
+        app_state.monitor_view_mode
+    };
+    persist_monitor_filter_mode(view, mode);
 }
 
 fn update_monitor_sort_mode(mode: MonitorSortMode) {
-    {
+    let view = {
         let mut app_state = state().lock().expect("state mutex poisoned");
-        app_state.monitor_sort_mode = mode;
-    }
+        match app_state.monitor_view_mode {
+            MonitorViewMode::Overview => app_state.overview_sort_mode = mode,
+            MonitorViewMode::Git => app_state.git_sort_mode = mode,
+            MonitorViewMode::Checks => app_state.checks_sort_mode = mode,
+            MonitorViewMode::Manifest => app_state.manifest_sort_mode = mode,
+        }
+        app_state.monitor_view_mode
+    };
     if mode == MonitorSortMode::RecentActivity {
         prefetch_monitor_sort_details();
     }
-    persist_monitor_sort_mode(mode);
+    persist_monitor_sort_mode(view, mode);
 }
 
 fn update_monitor_sort_descending(descending: bool) {
+    let view = {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        match app_state.monitor_view_mode {
+            MonitorViewMode::Overview => app_state.overview_sort_descending = descending,
+            MonitorViewMode::Git => app_state.git_sort_descending = descending,
+            MonitorViewMode::Checks => app_state.checks_sort_descending = descending,
+            MonitorViewMode::Manifest => app_state.manifest_sort_descending = descending,
+        }
+        app_state.monitor_view_mode
+    };
+    persist_monitor_sort_descending(view, descending);
+}
+
+fn update_monitor_view_mode(mode: MonitorViewMode) {
     {
         let mut app_state = state().lock().expect("state mutex poisoned");
-        app_state.monitor_sort_descending = descending;
+        app_state.monitor_view_mode = mode;
     }
-    persist_monitor_sort_descending(descending);
+    if matches!(
+        active_monitor_sort_mode(&snapshot()),
+        MonitorSortMode::RecentActivity
+    ) {
+        prefetch_monitor_sort_details();
+    }
+    persist_monitor_view_mode(mode);
 }
 
 fn prefetch_monitor_sort_details() {
@@ -4516,74 +4939,94 @@ extern "C" fn create_repo_monitor_view(
     content.set_margin_start(8);
     content.set_margin_end(8);
 
-    let filter_box = GtkBox::new(Orientation::Horizontal, 0);
-    filter_box.add_css_class("linked");
-
-    let btn_all = clickable_toggle_button_with_label("All");
-    let btn_dirty = clickable_toggle_button_with_label("Dirty");
-    let btn_to_sync = clickable_toggle_button_with_label("To sync");
-    let btn_issues = clickable_toggle_button_with_label("Issues");
-    btn_dirty.set_group(Some(&btn_all));
-    btn_to_sync.set_group(Some(&btn_all));
-    btn_issues.set_group(Some(&btn_all));
-
-    match snapshot().monitor_filter_mode {
-        MonitorFilterMode::All => btn_all.set_active(true),
-        MonitorFilterMode::Dirty => btn_dirty.set_active(true),
-        MonitorFilterMode::ToSync => btn_to_sync.set_active(true),
-        MonitorFilterMode::Issues => btn_issues.set_active(true),
-    }
-
-    btn_all.connect_toggled(|button| {
-        if button.is_active() {
-            update_monitor_filter_mode(MonitorFilterMode::All);
-            refresh_views();
-        }
-    });
-    btn_dirty.connect_toggled(|button| {
-        if button.is_active() {
-            update_monitor_filter_mode(MonitorFilterMode::Dirty);
-            refresh_views();
-        }
-    });
-    btn_to_sync.connect_toggled(|button| {
-        if button.is_active() {
-            update_monitor_filter_mode(MonitorFilterMode::ToSync);
-            refresh_views();
-        }
-    });
-    btn_issues.connect_toggled(|button| {
-        if button.is_active() {
-            update_monitor_filter_mode(MonitorFilterMode::Issues);
-            refresh_views();
-        }
-    });
-
-    filter_box.append(&btn_all);
-    filter_box.append(&btn_dirty);
-    filter_box.append(&btn_to_sync);
-    filter_box.append(&btn_issues);
-
-    let sort_dropdown = clickable_dropdown_from_strings(&[
-        monitor_sort_mode_label(MonitorSortMode::Name),
-        monitor_sort_mode_label(MonitorSortMode::SyncState),
-        monitor_sort_mode_label(MonitorSortMode::RecentActivity),
-    ]);
     let initial_snapshot = snapshot();
-    sort_dropdown.set_selected(monitor_sort_mode_index(initial_snapshot.monitor_sort_mode));
-    sort_dropdown.set_tooltip_text(Some("Sort repositories by the selected criterion"));
-    sort_dropdown.connect_selected_notify(|dropdown| {
-        let mode = monitor_sort_mode_from_index(dropdown.selected());
-        update_monitor_sort_mode(mode);
-        let snapshot = snapshot();
-        refresh_repository_views(&snapshot);
-        refresh_views();
-    });
+
+    let view_row = GtkBox::new(Orientation::Horizontal, 8);
+    view_row.set_hexpand(true);
+
+    let view_box = GtkBox::new(Orientation::Horizontal, 0);
+    view_box.add_css_class("linked");
+    let mut first_view_button: Option<ToggleButton> = None;
+    let mut view_buttons = Vec::new();
+    for view in monitor_view_modes() {
+        let button = clickable_toggle_button_with_label(monitor_view_mode_label(*view));
+        if let Some(first) = first_view_button.as_ref() {
+            button.set_group(Some(first));
+        } else {
+            first_view_button = Some(button.clone());
+        }
+        button.set_active(initial_snapshot.monitor_view_mode == *view);
+        view_buttons.push((*view, button.clone()));
+        view_box.append(&button);
+    }
+    view_row.append(&view_box);
+
+    let filter_stack = Stack::new();
+    filter_stack.set_hexpand(true);
+    for view in monitor_view_modes() {
+        let filter_box = GtkBox::new(Orientation::Horizontal, 0);
+        filter_box.add_css_class("linked");
+        let active_filter = match *view {
+            MonitorViewMode::Overview => initial_snapshot.overview_filter_mode,
+            MonitorViewMode::Git => initial_snapshot.git_filter_mode,
+            MonitorViewMode::Checks => initial_snapshot.checks_filter_mode,
+            MonitorViewMode::Manifest => initial_snapshot.manifest_filter_mode,
+        };
+        let mut first_filter_button: Option<ToggleButton> = None;
+        for filter_mode in monitor_filter_modes_for_view(*view) {
+            let button =
+                clickable_toggle_button_with_label(monitor_filter_mode_label(*filter_mode));
+            if let Some(first) = first_filter_button.as_ref() {
+                button.set_group(Some(first));
+            } else {
+                first_filter_button = Some(button.clone());
+            }
+            button.set_active(active_filter == *filter_mode);
+            let filter_mode = *filter_mode;
+            button.connect_toggled(move |button| {
+                if button.is_active() {
+                    update_monitor_filter_mode(filter_mode);
+                    refresh_views();
+                }
+            });
+            filter_box.append(&button);
+        }
+        filter_stack.add_named(&filter_box, Some(monitor_view_mode_key(*view)));
+    }
+    filter_stack.set_visible_child_name(monitor_view_mode_key(initial_snapshot.monitor_view_mode));
+
+    let sort_stack = Stack::new();
+    for view in monitor_view_modes() {
+        let labels = monitor_sort_modes_for_view(*view)
+            .iter()
+            .map(|mode| monitor_sort_mode_label(*mode))
+            .collect::<Vec<_>>();
+        let dropdown = clickable_dropdown_from_strings(&labels);
+        let active_sort = match *view {
+            MonitorViewMode::Overview => initial_snapshot.overview_sort_mode,
+            MonitorViewMode::Git => initial_snapshot.git_sort_mode,
+            MonitorViewMode::Checks => initial_snapshot.checks_sort_mode,
+            MonitorViewMode::Manifest => initial_snapshot.manifest_sort_mode,
+        };
+        dropdown.set_selected(monitor_sort_mode_index(*view, active_sort));
+        dropdown.set_tooltip_text(Some("Sort repositories by the selected criterion"));
+        let view = *view;
+        dropdown.connect_selected_notify(move |dropdown| {
+            let mode = monitor_sort_mode_from_index(view, dropdown.selected());
+            update_monitor_sort_mode(mode);
+            let snapshot = snapshot();
+            refresh_repository_views(&snapshot);
+            refresh_views();
+        });
+        sort_stack.add_named(&dropdown, Some(monitor_view_mode_key(view)));
+    }
+    sort_stack.set_visible_child_name(monitor_view_mode_key(initial_snapshot.monitor_view_mode));
 
     let sort_box = GtkBox::new(Orientation::Horizontal, 6);
     sort_box.set_halign(Align::End);
-    sort_box.append(&sort_dropdown);
-    let sort_direction = Rc::new(Cell::new(initial_snapshot.monitor_sort_descending));
+    sort_box.set_hexpand(false);
+    sort_box.append(&sort_stack);
+    let sort_direction = Rc::new(Cell::new(active_monitor_sort_descending(&initial_snapshot)));
     let sort_indicator = clickable_button();
     sort_indicator.add_css_class("flat");
     sort_indicator.set_tooltip_text(Some("Toggle sort direction"));
@@ -4606,13 +5049,49 @@ extern "C" fn create_repo_monitor_view(
     });
     sort_box.append(&sort_indicator);
 
-    let controls = GtkBox::new(Orientation::Horizontal, 10);
+    let header_stack = Stack::new();
+    for view in monitor_view_modes() {
+        header_stack.add_named(
+            &repo_monitor_header_for_view(*view),
+            Some(monitor_view_mode_key(*view)),
+        );
+    }
+    header_stack.set_visible_child_name(monitor_view_mode_key(initial_snapshot.monitor_view_mode));
+
+    for (view, button) in view_buttons {
+        let filter_stack = filter_stack.clone();
+        let sort_stack = sort_stack.clone();
+        let header_stack = header_stack.clone();
+        let sort_direction = Rc::clone(&sort_direction);
+        let sort_indicator_label = sort_indicator_label.clone();
+        button.connect_toggled(move |button| {
+            if !button.is_active() {
+                return;
+            }
+            update_monitor_view_mode(view);
+            filter_stack.set_visible_child_name(monitor_view_mode_key(view));
+            sort_stack.set_visible_child_name(monitor_view_mode_key(view));
+            header_stack.set_visible_child_name(monitor_view_mode_key(view));
+            let snapshot = snapshot();
+            let descending = active_monitor_sort_descending(&snapshot);
+            sort_direction.set(descending);
+            sort_indicator_label.set_text(monitor_sort_direction_label(descending));
+            refresh_views();
+        });
+    }
+
+    let controls = GtkBox::new(Orientation::Vertical, 6);
     controls.set_hexpand(true);
-    controls.append(&filter_box);
+    controls.append(&view_row);
+
+    let filter_sort_row = GtkBox::new(Orientation::Horizontal, 10);
+    filter_sort_row.set_hexpand(true);
+    filter_sort_row.append(&filter_stack);
     let spacer = GtkBox::new(Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
-    controls.append(&spacer);
-    controls.append(&sort_box);
+    filter_sort_row.append(&spacer);
+    filter_sort_row.append(&sort_box);
+    controls.append(&filter_sort_row);
 
     let store = gio::ListStore::new::<BoxedAnyObject>();
     let filter = CustomFilter::new(|object| {
@@ -4731,11 +5210,11 @@ extern "C" fn create_repo_monitor_view(
     scroller.set_valign(Align::Fill);
     scroller.set_propagate_natural_height(false);
 
+    let snapshot = snapshot();
     content.append(&controls);
-    content.append(&repo_monitor_header());
+    content.append(&header_stack);
     content.append(&scroller);
 
-    let snapshot = snapshot();
     sync_repository_monitor_store(&store, &all_monitor_items(&snapshot));
     filter.changed(FilterChange::Different);
     sorter.changed(SorterChange::Different);
@@ -4772,65 +5251,106 @@ extern "C" fn create_repo_monitor_view(
     }
 }
 
-fn repo_monitor_header() -> GtkBox {
+fn repo_monitor_header_for_view(view: MonitorViewMode) -> GtkBox {
     let header = GtkBox::new(Orientation::Horizontal, 10);
     header.add_css_class("mono");
     header.set_margin_bottom(4);
-    let name = monitor_text_cell(
+
+    let mut labels = vec![monitor_text_cell(
         "Name",
         MONITOR_NAME_COL_CHARS,
         MONITOR_NAME_COL_WIDTH,
         false,
-    );
-    let branch = monitor_text_cell(
-        "Branch",
-        MONITOR_BRANCH_COL_CHARS,
-        MONITOR_BRANCH_COL_WIDTH,
-        false,
-    );
-    let manifest = monitor_text_cell(
-        "Manifest",
-        MONITOR_MANIFEST_COL_CHARS,
-        MONITOR_MANIFEST_COL_WIDTH,
-        false,
-    );
-    let capability = monitor_text_cell(
-        "Caps",
-        MONITOR_CAPABILITY_COL_CHARS,
-        MONITOR_CAPABILITY_COL_WIDTH,
-        false,
-    );
-    let attention = monitor_text_cell(
-        "Attention",
-        MONITOR_ATTENTION_COL_CHARS,
-        MONITOR_ATTENTION_COL_WIDTH,
-        false,
-    );
-    let state = monitor_text_cell(
-        "State",
-        MONITOR_STATE_COL_CHARS,
-        MONITOR_STATE_COL_WIDTH,
-        false,
-    );
-    let sync = Label::new(Some("Sync"));
-    sync.set_xalign(0.0);
-    sync.set_hexpand(true);
-    sync.set_ellipsize(EllipsizeMode::End);
+    )];
 
-    for label in [
-        &name,
-        &branch,
-        &manifest,
-        &capability,
-        &attention,
-        &state,
-        &sync,
-    ] {
+    match view {
+        MonitorViewMode::Overview => {
+            labels.push(monitor_text_cell(
+                "Status",
+                MONITOR_STATE_COL_CHARS,
+                MONITOR_STATE_COL_WIDTH,
+                false,
+            ));
+            labels.push(monitor_expand_cell("Sync"));
+            labels.push(monitor_text_cell(
+                "Attention",
+                MONITOR_ATTENTION_COL_CHARS,
+                MONITOR_ATTENTION_COL_WIDTH,
+                false,
+            ));
+        }
+        MonitorViewMode::Git => {
+            labels.push(monitor_text_cell(
+                "Branch",
+                MONITOR_BRANCH_COL_CHARS,
+                MONITOR_BRANCH_COL_WIDTH,
+                false,
+            ));
+            labels.push(monitor_text_cell(
+                "Status",
+                MONITOR_STATE_COL_CHARS,
+                MONITOR_STATE_COL_WIDTH,
+                false,
+            ));
+            labels.push(monitor_expand_cell("Sync"));
+        }
+        MonitorViewMode::Checks => {
+            labels.push(monitor_text_cell(
+                "Manifest",
+                MONITOR_MANIFEST_COL_CHARS,
+                MONITOR_MANIFEST_COL_WIDTH,
+                false,
+            ));
+            labels.push(monitor_text_cell(
+                "Checks",
+                MONITOR_CAPABILITY_COL_CHARS,
+                MONITOR_CAPABILITY_COL_WIDTH,
+                false,
+            ));
+            labels.push(monitor_text_cell(
+                "Attention",
+                MONITOR_ATTENTION_COL_CHARS,
+                MONITOR_ATTENTION_COL_WIDTH,
+                false,
+            ));
+        }
+        MonitorViewMode::Manifest => {
+            labels.push(monitor_text_cell(
+                "Manifest",
+                MONITOR_MANIFEST_COL_CHARS,
+                MONITOR_MANIFEST_COL_WIDTH,
+                false,
+            ));
+            labels.push(monitor_text_cell(
+                "Actions",
+                MONITOR_ACTIONS_COL_CHARS,
+                MONITOR_ACTIONS_COL_WIDTH,
+                false,
+            ));
+            labels.push(monitor_text_cell(
+                "Enabled",
+                MONITOR_STATE_COL_CHARS,
+                MONITOR_STATE_COL_WIDTH,
+                false,
+            ));
+            labels.push(monitor_expand_cell("Remote"));
+        }
+    }
+
+    for label in labels {
         label.add_css_class("dim-label");
-        header.append(label);
+        header.append(&label);
     }
 
     header
+}
+
+fn monitor_expand_cell(text: &str) -> Label {
+    let label = Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_ellipsize(EllipsizeMode::End);
+    label
 }
 
 fn monitor_text_cell(text: &str, width_chars: i32, width_px: i32, expand: bool) -> Label {
@@ -5402,6 +5922,46 @@ fn monitor_manifest_cell(scan: Option<&RepoManifestScan>) -> Label {
         "<span foreground=\"{}\">{escaped}</span>",
         manifest_presence_color(scan)
     ));
+    label
+}
+
+fn monitor_manifest_actions_cell(item: &RepositoryListItem) -> Label {
+    let count = manifest_action_count(item);
+    let text = if count == 0 {
+        "-".to_string()
+    } else {
+        count.to_string()
+    };
+    let label = monitor_text_cell(
+        &text,
+        MONITOR_ACTIONS_COL_CHARS,
+        MONITOR_ACTIONS_COL_WIDTH,
+        false,
+    );
+    attach_text_tooltip(&label, format!("{count} configured repo action(s)"));
+    label
+}
+
+fn monitor_enabled_cell(snapshot: &StateSnapshot, item: &RepositoryListItem) -> Label {
+    let enabled = workspace_repo_enabled(snapshot, item);
+    let text = match enabled {
+        Some(true) => "Enabled",
+        Some(false) => "Disabled",
+        None => "-",
+    };
+    let label = monitor_text_cell(
+        text,
+        MONITOR_STATE_COL_CHARS,
+        MONITOR_STATE_COL_WIDTH,
+        false,
+    );
+    let escaped = glib::markup_escape_text(text);
+    let color = if enabled == Some(true) {
+        "#7fdc8a"
+    } else {
+        "#8f96a3"
+    };
+    label.set_markup(&format!("<span foreground=\"{color}\">{escaped}</span>"));
     label
 }
 
@@ -6813,21 +7373,36 @@ fn persist_last_workspace_path(
     }
 }
 
-fn persist_monitor_filter_mode(mode: MonitorFilterMode) {
+fn persist_monitor_view_mode(mode: MonitorViewMode) {
     persist_plugin_config_direct(|config| {
-        config.monitor_filter_mode = mode;
+        config.monitor_view_mode = mode;
     });
 }
 
-fn persist_monitor_sort_mode(mode: MonitorSortMode) {
-    persist_plugin_config_direct(|config| {
-        config.monitor_sort_mode = mode;
+fn persist_monitor_filter_mode(view: MonitorViewMode, mode: MonitorFilterMode) {
+    persist_plugin_config_direct(|config| match view {
+        MonitorViewMode::Overview => config.overview_filter_mode = mode,
+        MonitorViewMode::Git => config.git_filter_mode = mode,
+        MonitorViewMode::Checks => config.checks_filter_mode = mode,
+        MonitorViewMode::Manifest => config.manifest_filter_mode = mode,
     });
 }
 
-fn persist_monitor_sort_descending(descending: bool) {
-    persist_plugin_config_direct(|config| {
-        config.monitor_sort_descending = descending;
+fn persist_monitor_sort_mode(view: MonitorViewMode, mode: MonitorSortMode) {
+    persist_plugin_config_direct(|config| match view {
+        MonitorViewMode::Overview => config.overview_sort_mode = mode,
+        MonitorViewMode::Git => config.git_sort_mode = mode,
+        MonitorViewMode::Checks => config.checks_sort_mode = mode,
+        MonitorViewMode::Manifest => config.manifest_sort_mode = mode,
+    });
+}
+
+fn persist_monitor_sort_descending(view: MonitorViewMode, descending: bool) {
+    persist_plugin_config_direct(|config| match view {
+        MonitorViewMode::Overview => config.overview_sort_descending = descending,
+        MonitorViewMode::Git => config.git_sort_descending = descending,
+        MonitorViewMode::Checks => config.checks_sort_descending = descending,
+        MonitorViewMode::Manifest => config.manifest_sort_descending = descending,
     });
 }
 
