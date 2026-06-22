@@ -2,3 +2,8 @@
 members = ["ronomepo-app", "ronomepo-core", "ronomepo-plugin"]
 resolver = "2"
 
+[patch.crates-io]
+maruzzella = { path = "../maruzzella" }
+maruzzella_api = { path = "../maruzzella/maruzzella_api" }
+maruzzella_sdk = { path = "../maruzzella/maruzzella_sdk" }
+

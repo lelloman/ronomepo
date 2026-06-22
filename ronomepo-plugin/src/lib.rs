@@ -71,6 +71,57 @@ const VIEW_COMMIT_CHECK: &str = "com.lelloman.ronomepo.commit_check";
 const VIEW_WORKSPACE_SETTINGS: &str = "com.lelloman.ronomepo.workspace_settings";
 const VIEW_TEXT_EDITOR: &str = "com.lelloman.ronomepo.text_editor";
 const VIEW_OPERATIONS: &str = "com.lelloman.ronomepo.operations";
+
+fn mark_clickable<W: IsA<gtk::Widget>>(widget: &W) {
+    update_clickable_cursor(widget);
+    widget.connect_sensitive_notify(|widget| {
+        update_clickable_cursor(widget);
+    });
+}
+
+fn update_clickable_cursor<W: IsA<gtk::Widget>>(widget: &W) {
+    if widget.is_sensitive() {
+        widget.set_cursor_from_name(Some("pointer"));
+    } else {
+        widget.set_cursor_from_name(None);
+    }
+}
+
+fn clickable_button() -> Button {
+    let button = Button::new();
+    mark_clickable(&button);
+    button
+}
+
+fn clickable_button_with_label(label: impl AsRef<str>) -> Button {
+    let button = Button::with_label(label.as_ref());
+    mark_clickable(&button);
+    button
+}
+
+fn clickable_toggle_button() -> ToggleButton {
+    let button = ToggleButton::new();
+    mark_clickable(&button);
+    button
+}
+
+fn clickable_toggle_button_with_label(label: impl AsRef<str>) -> ToggleButton {
+    let button = ToggleButton::with_label(label.as_ref());
+    mark_clickable(&button);
+    button
+}
+
+fn clickable_check_button_with_label(label: impl AsRef<str>) -> CheckButton {
+    let button = CheckButton::with_label(label.as_ref());
+    mark_clickable(&button);
+    button
+}
+
+fn clickable_dropdown_from_strings(strings: &[&str]) -> DropDown {
+    let dropdown = DropDown::from_strings(strings);
+    mark_clickable(&dropdown);
+    dropdown
+}
 const CMD_REFRESH: &str = "ronomepo.workspace.refresh";
 const CMD_PULL: &str = "ronomepo.workspace.pull";
 const CMD_PUSH: &str = "ronomepo.workspace.push";
@@ -1587,9 +1638,11 @@ fn present_operation_failure_dialog(
         dialog.set_transient_for(Some(parent));
     }
     if is_generated_commit_failure {
-        dialog.add_button("Open Commit Check", ResponseType::Accept);
+        let open_commit_check = dialog.add_button("Open Commit Check", ResponseType::Accept);
+        mark_clickable(&open_commit_check);
     }
-    dialog.add_button("Close", ResponseType::Close);
+    let close = dialog.add_button("Close", ResponseType::Close);
+    mark_clickable(&close);
     dialog.set_default_response(ResponseType::Close);
 
     let content = dialog.content_area();
@@ -2158,7 +2211,7 @@ fn schedule_scroll_to_bottom(scroller: &ScrolledWindow, suppress_scroll_events: 
 }
 
 fn operation_follow_button() -> ToggleButton {
-    let button = ToggleButton::new();
+    let button = clickable_toggle_button();
     button.add_css_class("toolbar-button");
     button.add_css_class("toolbar-icon-button");
     button.add_css_class(&button_css_class("ronomepo-toolbar-ghost"));
@@ -2498,6 +2551,7 @@ fn build_repo_monitor_row(
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> GtkBox {
     let content = GtkBox::new(Orientation::Horizontal, 10);
+    mark_clickable(&content);
     content.set_margin_top(8);
     content.set_margin_bottom(8);
     content.set_margin_start(10);
@@ -3865,7 +3919,7 @@ fn append_context_submenu(
     root_child_hovered: &Rc<Cell<bool>>,
     root_schedule_close: &Rc<dyn Fn()>,
 ) {
-    let header = Button::new();
+    let header = clickable_button();
     header.set_halign(Align::Fill);
     header.set_hexpand(true);
     header.set_margin_top(2);
@@ -4426,7 +4480,7 @@ fn append_context_button<F>(menu: &GtkBox, popover: &Popover, label: &str, actio
 where
     F: Fn() + 'static,
 {
-    let button = Button::new();
+    let button = clickable_button();
     button.set_halign(Align::Fill);
     button.set_hexpand(true);
     button.add_css_class("flat");
@@ -4465,10 +4519,10 @@ extern "C" fn create_repo_monitor_view(
     let filter_box = GtkBox::new(Orientation::Horizontal, 0);
     filter_box.add_css_class("linked");
 
-    let btn_all = ToggleButton::with_label("All");
-    let btn_dirty = ToggleButton::with_label("Dirty");
-    let btn_to_sync = ToggleButton::with_label("To sync");
-    let btn_issues = ToggleButton::with_label("Issues");
+    let btn_all = clickable_toggle_button_with_label("All");
+    let btn_dirty = clickable_toggle_button_with_label("Dirty");
+    let btn_to_sync = clickable_toggle_button_with_label("To sync");
+    let btn_issues = clickable_toggle_button_with_label("Issues");
     btn_dirty.set_group(Some(&btn_all));
     btn_to_sync.set_group(Some(&btn_all));
     btn_issues.set_group(Some(&btn_all));
@@ -4510,7 +4564,7 @@ extern "C" fn create_repo_monitor_view(
     filter_box.append(&btn_to_sync);
     filter_box.append(&btn_issues);
 
-    let sort_dropdown = DropDown::from_strings(&[
+    let sort_dropdown = clickable_dropdown_from_strings(&[
         monitor_sort_mode_label(MonitorSortMode::Name),
         monitor_sort_mode_label(MonitorSortMode::SyncState),
         monitor_sort_mode_label(MonitorSortMode::RecentActivity),
@@ -4530,7 +4584,7 @@ extern "C" fn create_repo_monitor_view(
     sort_box.set_halign(Align::End);
     sort_box.append(&sort_dropdown);
     let sort_direction = Rc::new(Cell::new(initial_snapshot.monitor_sort_descending));
-    let sort_indicator = Button::new();
+    let sort_indicator = clickable_button();
     sort_indicator.add_css_class("flat");
     sort_indicator.set_tooltip_text(Some("Toggle sort direction"));
     let sort_indicator_label = Label::new(Some(monitor_sort_direction_label(sort_direction.get())));
@@ -5706,13 +5760,13 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
     hero.append(&subtitle);
 
     let actions = GtkBox::new(Orientation::Horizontal, 8);
-    let rerun = Button::with_label("Run Check");
+    let rerun = clickable_button_with_label("Run Check");
     rerun.connect_clicked(|_| {
         let _ = command_check_history(maruzzella_sdk::ffi::MzBytes::empty());
     });
     actions.append(&rerun);
 
-    let open_overview = Button::with_label("Open Overview");
+    let open_overview = clickable_button_with_label("Open Overview");
     open_overview.connect_clicked(|_| {
         let _ = command_open_overview(maruzzella_sdk::ffi::MzBytes::empty());
     });
@@ -5762,7 +5816,7 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
     rule_status.add_css_class("muted");
 
     let rule_actions = GtkBox::new(Orientation::Horizontal, 8);
-    let add_rule = Button::with_label("Add Rule");
+    let add_rule = clickable_button_with_label("Add Rule");
     add_rule.connect_clicked({
         let rules_box = rules_box.clone();
         let rule_rows = rule_rows.clone();
@@ -5776,7 +5830,7 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
             );
         }
     });
-    let save_rules = Button::with_label("Save Rules");
+    let save_rules = clickable_button_with_label("Save Rules");
     save_rules.connect_clicked({
         let rule_rows = rule_rows.clone();
         let rule_status = rule_status.clone();
@@ -5801,7 +5855,7 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
             }
         }
     });
-    let discard_changes = Button::with_label("Discard Changes");
+    let discard_changes = clickable_button_with_label("Discard Changes");
     discard_changes.connect_clicked(|_| {
         refresh_views();
     });
@@ -5826,16 +5880,16 @@ fn append_commit_check_rule_row(
     let row = GtkBox::new(Orientation::Vertical, 8);
     row.add_css_class("boxed-list");
 
-    let enabled = CheckButton::with_label("Enabled");
+    let enabled = clickable_check_button_with_label("Enabled");
     enabled.set_active(rule.map(|rule| rule.enabled).unwrap_or(true));
 
-    let allow = CheckButton::with_label("Allow");
+    let allow = clickable_check_button_with_label("Allow");
     allow.set_active(
         rule.map(|rule| matches!(rule.effect, CommitCheckRuleEffect::Allow))
             .unwrap_or(false),
     );
 
-    let hash_matcher = CheckButton::with_label("Hash");
+    let hash_matcher = clickable_check_button_with_label("Hash");
     hash_matcher.set_active(
         rule.map(|rule| matches!(rule.matcher, CommitCheckRuleMatcher::CommitHash { .. }))
             .unwrap_or(false),
@@ -5873,7 +5927,7 @@ fn append_commit_check_rule_row(
             .unwrap_or_else(String::new),
     );
 
-    let remove = Button::with_label("Remove");
+    let remove = clickable_button_with_label("Remove");
     let rule_id = rule
         .map(|rule| rule.id.clone())
         .unwrap_or_else(new_commit_check_rule_id);
@@ -5932,8 +5986,10 @@ fn open_add_commit_check_rule_dialog(
         dialog.set_transient_for(Some(parent));
     }
     let cancel = dialog.add_button("Cancel", ResponseType::Cancel);
+    mark_clickable(&cancel);
     cancel.add_css_class(&button_css_class("secondary"));
     let add = dialog.add_button("Add Rule", ResponseType::Accept);
+    mark_clickable(&add);
     add.add_css_class(&button_css_class("primary"));
     dialog.set_default_response(ResponseType::Accept);
     dialog.add_css_class(&surface_css_class("ronomepo-workbench"));
@@ -5952,12 +6008,12 @@ fn open_add_commit_check_rule_dialog(
     body.add_css_class(&surface_css_class("ronomepo-workbench"));
     body.add_css_class(&text_css_class("body"));
 
-    let enabled = CheckButton::with_label("Enabled");
+    let enabled = clickable_check_button_with_label("Enabled");
     enabled.set_active(true);
 
-    let allow = CheckButton::with_label("Allow");
+    let allow = clickable_check_button_with_label("Allow");
 
-    let hash_matcher = CheckButton::with_label("Hash");
+    let hash_matcher = clickable_check_button_with_label("Hash");
 
     let name = Entry::new();
     name.add_css_class(&input_css_class("search"));
@@ -6442,11 +6498,11 @@ fn render_workspace_settings_into(
     status.add_css_class("muted");
 
     let actions = GtkBox::new(Orientation::Horizontal, 8);
-    let add_repo = Button::with_label("Add Repo");
-    let save = Button::with_label("Save Manifest");
-    let reload = Button::with_label("Reload Manifest");
-    let import = Button::with_label("Import repos.txt");
-    let edit_manifest = Button::with_label("Edit Manifest File");
+    let add_repo = clickable_button_with_label("Add Repo");
+    let save = clickable_button_with_label("Save Manifest");
+    let reload = clickable_button_with_label("Reload Manifest");
+    let import = clickable_button_with_label("Import repos.txt");
+    let edit_manifest = clickable_button_with_label("Edit Manifest File");
 
     add_repo.connect_clicked({
         let root = root.clone();
@@ -6561,7 +6617,7 @@ fn append_repo_editor_row(
     let row = GtkBox::new(Orientation::Horizontal, 8);
     row.add_css_class("boxed-list");
 
-    let enabled = CheckButton::with_label("Enabled");
+    let enabled = clickable_check_button_with_label("Enabled");
     enabled.set_active(repo.map(|repo| repo.enabled).unwrap_or(true));
 
     let name = Entry::new();
@@ -6578,7 +6634,7 @@ fn append_repo_editor_row(
     remote_url.set_hexpand(true);
     remote_url.set_text(repo.map(|repo| repo.remote_url.as_str()).unwrap_or(""));
 
-    let remove = Button::with_label("Remove");
+    let remove = clickable_button_with_label("Remove");
     remove.connect_clicked({
         let repo_rows_box = repo_rows_box.clone();
         let repo_rows = repo_rows.clone();
@@ -6629,8 +6685,10 @@ fn open_add_repository_dialog(
     if let Some(parent) = parent.as_ref() {
         dialog.set_transient_for(Some(parent));
     }
-    dialog.add_button("Cancel", ResponseType::Cancel);
-    dialog.add_button("Add Repository", ResponseType::Accept);
+    let cancel = dialog.add_button("Cancel", ResponseType::Cancel);
+    mark_clickable(&cancel);
+    let add = dialog.add_button("Add Repository", ResponseType::Accept);
+    mark_clickable(&add);
     dialog.set_default_response(ResponseType::Accept);
 
     let content = dialog.content_area();
@@ -6650,7 +6708,7 @@ fn open_add_repository_dialog(
     dir_name.set_hexpand(true);
     dir_name.set_placeholder_text(Some("repo-dir"));
 
-    let clone_now = CheckButton::with_label("Clone now");
+    let clone_now = clickable_check_button_with_label("Clone now");
 
     let error = Label::new(None);
     error.set_xalign(0.0);
@@ -8203,7 +8261,7 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
 }
 
 fn terminal_icon_button(icon_name: &str, tooltip: &str) -> Button {
-    let button = Button::new();
+    let button = clickable_button();
     button.add_css_class("toolbar-button");
     button.add_css_class("toolbar-icon-button");
     button.add_css_class(&button_css_class("ronomepo-toolbar-ghost"));
@@ -8451,7 +8509,7 @@ fn overview_actions(include_open_overview: bool) -> GtkBox {
     }
 
     for (label, handler) in entries {
-        let button = Button::with_label(label);
+        let button = clickable_button_with_label(label);
         button.connect_clicked(move |_| {
             let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
         });
@@ -8476,7 +8534,7 @@ fn overview_command_group(label: &str, actions: GtkBox) -> GtkBox {
 }
 
 fn action_button(label: &str, count: usize) -> Button {
-    let button = Button::with_label(&format!("{label} ({count})"));
+    let button = clickable_button_with_label(&format!("{label} ({count})"));
     button.set_sensitive(count > 0);
     button
 }
@@ -8527,7 +8585,7 @@ fn report_button(
     loading: bool,
     handler: extern "C" fn(maruzzella_sdk::ffi::MzBytes) -> maruzzella_sdk::ffi::MzStatus,
 ) -> Button {
-    let button = Button::with_label(if loading { "Running..." } else { label });
+    let button = clickable_button_with_label(if loading { "Running..." } else { label });
     button.set_sensitive(!loading);
     button.connect_clicked(move |_| {
         let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
@@ -8536,7 +8594,7 @@ fn report_button(
 }
 
 fn repo_target_button(item: &RepositoryListItem) -> Button {
-    let button = Button::with_label("Target");
+    let button = clickable_button_with_label("Target");
     let repo_id = item.id.clone();
     let repo_name = item.name.clone();
     button.connect_clicked(move |_| {
@@ -8551,7 +8609,7 @@ fn repo_open_button(
     item: &RepositoryListItem,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> Button {
-    let button = Button::with_label("Open");
+    let button = clickable_button_with_label("Open");
     let repo_id = item.id.clone();
     button.connect_clicked(move |_| {
         open_repo_overviews(host_ptr, std::slice::from_ref(&repo_id));
@@ -8691,7 +8749,7 @@ fn repo_overview_action_button(
     label: &'static str,
     kind: Option<OperationKind>,
 ) -> Button {
-    let button = Button::with_label(label);
+    let button = clickable_button_with_label(label);
     let repo_id = item.id.clone();
     let repo_name = item.name.clone();
     let repo_path = item.status.repo_path.clone();
@@ -8750,7 +8808,7 @@ fn overview_file_actions(
         ),
         ("Edit repos.txt", snapshot.workspace_root.join("repos.txt")),
     ] {
-        let button = Button::with_label(label);
+        let button = clickable_button_with_label(label);
         button.connect_clicked(move |_| {
             open_text_editor_for_path(host_ptr, &path);
         });
@@ -8810,7 +8868,7 @@ fn monorepo_selection_actions(
     ));
     scope_row.append(&clear_selection_button(selected_count));
 
-    let settings = Button::with_label("Workspace Settings");
+    let settings = clickable_button_with_label("Workspace Settings");
     settings.connect_clicked(move |_| {
         if let Err(message) = open_workspace_settings_tab() {
             append_log(message);
@@ -8833,7 +8891,7 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
         command_check_history,
     ));
 
-    let open_commit_check = Button::with_label("Open Commit Check");
+    let open_commit_check = clickable_button_with_label("Open Commit Check");
     open_commit_check.connect_clicked(|_| {
         let _ = command_open_commit_check(maruzzella_sdk::ffi::MzBytes::empty());
     });
@@ -8857,25 +8915,25 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
         command_line_stats,
     ));
 
-    let capability_checks = Button::with_label("Capability Checks");
+    let capability_checks = clickable_button_with_label("Capability Checks");
     capability_checks.connect_clicked(|_| {
         run_selected_repo_capability_checks();
     });
     actions.append(&capability_checks);
 
-    let stale_capability_checks = Button::with_label("Stale Cap Checks");
+    let stale_capability_checks = clickable_button_with_label("Stale Cap Checks");
     stale_capability_checks.connect_clicked(|_| {
         run_stale_repo_capability_checks();
     });
     actions.append(&stale_capability_checks);
 
-    let due_capability_checks = Button::with_label("Due Cap Checks");
+    let due_capability_checks = clickable_button_with_label("Due Cap Checks");
     due_capability_checks.connect_clicked(|_| {
         run_due_repo_capability_checks();
     });
     actions.append(&due_capability_checks);
 
-    let all_time = Button::with_label("All Time");
+    let all_time = clickable_button_with_label("All Time");
     all_time.set_sensitive(!snapshot.line_stats_loading);
     all_time.connect_clicked(|_| {
         update_line_stats_since(String::new());
@@ -9434,7 +9492,7 @@ fn render_repo_manifest_editor_into(
     );
 
     let actions = GtkBox::new(Orientation::Horizontal, 8);
-    let add_cargo = Button::with_label("Add Cargo Item");
+    let add_cargo = clickable_button_with_label("Add Cargo Item");
     add_cargo.connect_clicked({
         let item_rows_box = item_rows_box.clone();
         let item_rows = item_rows.clone();
@@ -9453,19 +9511,19 @@ fn render_repo_manifest_editor_into(
             )
         }
     });
-    let add_action = Button::with_label("Add Action");
+    let add_action = clickable_button_with_label("Add Action");
     add_action.connect_clicked({
         let action_rows_box = action_rows_box.clone();
         let action_rows = action_rows.clone();
         move |_| append_repo_manifest_action_row(&action_rows_box, &action_rows, None)
     });
-    let add_capability = Button::with_label("Add Capability");
+    let add_capability = clickable_button_with_label("Add Capability");
     add_capability.connect_clicked({
         let capability_rows_box = capability_rows_box.clone();
         let capability_rows = capability_rows.clone();
         move |_| append_repo_manifest_capability_row(&capability_rows_box, &capability_rows, None)
     });
-    let preview = Button::with_label("Preview JSON");
+    let preview = clickable_button_with_label("Preview JSON");
     preview.connect_clicked({
         let preview_buffer = preview_buffer.clone();
         let status = status.clone();
@@ -9488,7 +9546,7 @@ fn render_repo_manifest_editor_into(
             );
         }
     });
-    let save = Button::with_label("Save Manifest");
+    let save = clickable_button_with_label("Save Manifest");
     save.connect_clicked({
         let preview_buffer = preview_buffer.clone();
         let status = status.clone();
@@ -9522,7 +9580,7 @@ fn render_repo_manifest_editor_into(
             Err(message) => status.set_text(&message),
         }
     });
-    let edit_json = Button::with_label("Edit JSON File");
+    let edit_json = clickable_button_with_label("Edit JSON File");
     edit_json.connect_clicked({
         let manifest_path = manifest_path.clone();
         move |_| open_text_editor_for_path(host_ptr, &manifest_path)
@@ -9606,7 +9664,7 @@ fn append_repo_manifest_item_row(
     let path = Entry::new();
     path.set_placeholder_text(Some("path"));
     path.set_hexpand(true);
-    let remove = Button::with_label("Remove");
+    let remove = clickable_button_with_label("Remove");
 
     if let Some(item) = item {
         id.set_text(&item.id);
@@ -9658,8 +9716,8 @@ fn append_repo_manifest_action_row(
     let timeout_seconds = Entry::new();
     timeout_seconds.set_placeholder_text(Some("timeout"));
     timeout_seconds.set_width_chars(8);
-    let output = DropDown::from_strings(&["text", "json", "json_lines"]);
-    let remove = Button::with_label("Remove");
+    let output = clickable_dropdown_from_strings(&["text", "json", "json_lines"]);
+    let remove = clickable_button_with_label("Remove");
 
     if let Some(action) = action {
         id.set_text(&action.id);
@@ -9722,25 +9780,26 @@ fn append_repo_manifest_capability_row(
     let capability_name = Entry::new();
     capability_name.set_placeholder_text(Some("integrity.tests"));
     capability_name.set_width_chars(22);
-    let status = DropDown::from_strings(&["implemented", "not_applicable", "unsupported"]);
+    let status = clickable_dropdown_from_strings(&["implemented", "not_applicable", "unsupported"]);
     let item_id = Entry::new();
     item_id.set_placeholder_text(Some("item_id"));
     item_id.set_width_chars(14);
     let root = Entry::new();
     root.set_placeholder_text(Some("root"));
     root.set_width_chars(14);
-    let action_kind = DropDown::from_strings(&["standard", "repo_action"]);
+    let action_kind = clickable_dropdown_from_strings(&["standard", "repo_action"]);
     let action_value = Entry::new();
     action_value.set_placeholder_text(Some("cargo.test or action id"));
     action_value.set_hexpand(true);
-    let schedule_kind = DropDown::from_strings(&["manual", "interval", "on_commit_change"]);
+    let schedule_kind =
+        clickable_dropdown_from_strings(&["manual", "interval", "on_commit_change"]);
     let interval_seconds = Entry::new();
     interval_seconds.set_placeholder_text(Some("seconds"));
     interval_seconds.set_width_chars(9);
     let reason = Entry::new();
     reason.set_placeholder_text(Some("reason for N/A or unsupported"));
     reason.set_hexpand(true);
-    let remove = Button::with_label("Remove");
+    let remove = clickable_button_with_label("Remove");
 
     if let Some(capability) = capability {
         id.set_text(&capability.id);
@@ -10137,9 +10196,9 @@ extern "C" fn create_text_editor_view(
     path_entry.set_hexpand(true);
     path_entry.set_placeholder_text(Some("Relative or absolute file path"));
 
-    let open_button = Button::with_label("Open");
-    let save_button = Button::with_label("Save");
-    let format_button = Button::with_label("Format");
+    let open_button = clickable_button_with_label("Open");
+    let save_button = clickable_button_with_label("Save");
+    let format_button = clickable_button_with_label("Format");
 
     toolbar.append(&path_entry);
     toolbar.append(&open_button);
@@ -10432,11 +10491,11 @@ extern "C" fn create_operations_view(
         .and_then(|host| {
             host_toolbar_button(host, CMD_REFRESH_LOGS, "view-refresh-symbolic", "Refresh")
         })
-        .unwrap_or_else(|| Button::with_label("Refresh"));
+        .unwrap_or_else(|| clickable_button_with_label("Refresh"));
     let clear = view_host
         .as_ref()
         .and_then(|host| host_toolbar_button(host, CMD_CLEAR_LOGS, "user-trash-symbolic", "Clear"))
-        .unwrap_or_else(|| Button::with_label("Clear"));
+        .unwrap_or_else(|| clickable_button_with_label("Clear"));
 
     let buffer = TextBuffer::new(None);
     buffer.set_text(&snapshot().logs.join("\n"));
