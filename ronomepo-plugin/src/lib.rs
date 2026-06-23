@@ -26,9 +26,9 @@ use gtk::prelude::*;
 use gtk::{
     Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, Dialog, DropDown, Entry,
     EventControllerMotion, FilterChange, GestureClick, Image, Label, ListBox, ListBoxRow,
-    Orientation, PolicyType, Popover, PositionType, ResponseType, ScrolledWindow, SelectionMode,
-    Separator, SortListModel, SorterChange, Stack, StackSwitcher, TextBuffer, TextView,
-    ToggleButton, Window, WrapMode,
+    Orientation, Paned, PolicyType, Popover, PositionType, ResponseType, ScrolledWindow,
+    SelectionMode, Separator, SortListModel, SorterChange, Stack, StackSwitcher, TextBuffer,
+    TextView, ToggleButton, Window, WrapMode,
 };
 use maruzzella_sdk::{
     attach_text_tooltip, button_css_class, export_plugin, input_css_class, surface_css_class,
@@ -84,6 +84,20 @@ fn update_clickable_cursor<W: IsA<gtk::Widget>>(widget: &W) {
         widget.set_cursor_from_name(Some("pointer"));
     } else {
         widget.set_cursor_from_name(None);
+    }
+}
+
+fn mark_clickable_descendant_buttons<W: IsA<gtk::Widget>>(widget: &W) {
+    let widget = widget.as_ref();
+    if let Some(button) = widget.downcast_ref::<Button>() {
+        mark_clickable(button);
+    }
+
+    let mut child = widget.first_child();
+    while let Some(child_widget) = child {
+        let next = child_widget.next_sibling();
+        mark_clickable_descendant_buttons(&child_widget);
+        child = next;
     }
 }
 
@@ -6859,7 +6873,6 @@ extern "C" fn create_repo_overview_view(
     tab_bar.append(&spacer);
 
     root.append(&tab_bar);
-    root.append(&stack);
 
     let summary_root = repo_overview_page_root();
     let git_root = repo_overview_page_root();
@@ -6878,17 +6891,31 @@ extern "C" fn create_repo_overview_view(
         "Manifest",
     );
 
-    let terminal_panel = GtkBox::new(Orientation::Vertical, 0);
-    terminal_panel.set_hexpand(true);
-    terminal_panel.set_vexpand(true);
-    stack.add_titled(&terminal_panel, Some("console"), "Console");
-
     stack.add_titled(
         &repo_overview_scroll_page(&activity_root),
         Some("activity"),
         "Activity",
     );
     stack.set_visible_child_name("summary");
+    mark_clickable(&switcher);
+    mark_clickable_descendant_buttons(&switcher);
+
+    let repo_body = Paned::new(Orientation::Vertical);
+    repo_body.set_hexpand(true);
+    repo_body.set_vexpand(true);
+    repo_body.set_wide_handle(true);
+    repo_body.set_resize_start_child(true);
+    repo_body.set_resize_end_child(false);
+    repo_body.set_shrink_start_child(true);
+    repo_body.set_shrink_end_child(true);
+
+    let terminal_panel = GtkBox::new(Orientation::Vertical, 0);
+    terminal_panel.set_hexpand(true);
+    terminal_panel.set_vexpand(true);
+
+    repo_body.set_start_child(Some(&stack));
+    repo_body.set_end_child(Some(&terminal_panel));
+    root.append(&repo_body);
 
     let instance_key =
         unsafe { request.as_ref() }.and_then(|request| decode_mzstr(request.instance_key));
@@ -8779,6 +8806,11 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
     panel.set_vexpand(true);
 
     let header = GtkBox::new(Orientation::Horizontal, 6);
+    header.set_margin_top(6);
+    header.set_margin_bottom(6);
+    header.set_margin_start(12);
+    header.set_margin_end(12);
+
     let restart = terminal_icon_button("view-refresh-symbolic", "Restart terminal");
     restart.set_sensitive(false);
     header.append(&restart);
@@ -8792,16 +8824,22 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
     header.append(&external);
     panel.append(&header);
 
+    let body = GtkBox::new(Orientation::Vertical, 6);
+    body.set_hexpand(true);
+    body.set_vexpand(true);
+    body.set_size_request(-1, 180);
+    panel.append(&body);
+
     let target_repo_id = instance_key.or(snapshot.active_repo_id.as_deref());
     let Some(item) = target_repo_id.and_then(|repo_id| repo_item_by_id(snapshot, repo_id)) else {
         panel.add_css_class("repo-terminal-empty");
-        let body = Label::new(Some(
+        let empty = Label::new(Some(
             "No repository target is attached to this tab, so no terminal session can be started.",
         ));
-        body.set_xalign(0.0);
-        body.set_wrap(true);
-        body.add_css_class("muted");
-        panel.append(&body);
+        empty.set_xalign(0.0);
+        empty.set_wrap(true);
+        empty.add_css_class("muted");
+        body.append(&empty);
         return panel;
     };
 
@@ -8814,7 +8852,7 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
 
     #[cfg(feature = "embedded-terminal")]
     {
-        panel.append(&build_vte_terminal_widget(
+        body.append(&build_vte_terminal_widget(
             &item.status.repo_path,
             &item.name,
             &restart,
@@ -8829,7 +8867,7 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
         disabled.set_xalign(0.0);
         disabled.set_wrap(true);
         disabled.add_css_class("muted");
-        panel.append(&disabled);
+        body.append(&disabled);
     }
 
     panel
