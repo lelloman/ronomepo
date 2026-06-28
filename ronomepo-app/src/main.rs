@@ -5,9 +5,7 @@ use std::path::PathBuf;
 use gtk::gio::prelude::ApplicationExtManual;
 use maruzzella::{
     build_application, default_product_spec, load_static_plugin, plugin_tab, BottomPanelLayout,
-    ButtonAppearance, ButtonStyle, CommandSpec, InputAppearance, MaruzzellaConfig, MenuItemSpec,
-    MenuRootSpec, PanelResizePolicy, SurfaceAppearance, SurfaceLevel, TabGroupSpec,
-    TabStripAppearance, TabStripStyle, TextAppearance, TextRole, ThemeSpec, Tone,
+    CommandSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy, TabGroupSpec,
     ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec,
 };
 use ronomepo_core::normalize_workspace_root;
@@ -212,7 +210,7 @@ fn main() {
             payload: Vec::new(),
             secondary: false,
             display_mode: ToolbarDisplayMode::IconOnly,
-            appearance_id: "ronomepo-toolbar-primary".to_string(),
+            appearance_id: "primary".to_string(),
             options: Vec::new(),
             selected_index: 0,
         },
@@ -224,7 +222,7 @@ fn main() {
             payload: Vec::new(),
             secondary: false,
             display_mode: ToolbarDisplayMode::IconOnly,
-            appearance_id: "ronomepo-toolbar-primary".to_string(),
+            appearance_id: "primary".to_string(),
             options: Vec::new(),
             selected_index: 0,
         },
@@ -236,7 +234,7 @@ fn main() {
             payload: Vec::new(),
             secondary: false,
             display_mode: ToolbarDisplayMode::IconOnly,
-            appearance_id: "ronomepo-toolbar-primary".to_string(),
+            appearance_id: "primary".to_string(),
             options: Vec::new(),
             selected_index: 0,
         },
@@ -248,7 +246,7 @@ fn main() {
             payload: Vec::new(),
             secondary: true,
             display_mode: ToolbarDisplayMode::IconOnly,
-            appearance_id: "ronomepo-toolbar-primary".to_string(),
+            appearance_id: "ghost".to_string(),
             options: Vec::new(),
             selected_index: 0,
         },
@@ -260,7 +258,7 @@ fn main() {
             payload: Vec::new(),
             secondary: true,
             display_mode: ToolbarDisplayMode::IconOnly,
-            appearance_id: "ronomepo-toolbar-primary".to_string(),
+            appearance_id: "ghost".to_string(),
             options: Vec::new(),
             selected_index: 0,
         },
@@ -282,14 +280,14 @@ fn main() {
         )],
     )
     .with_tab_strip_hidden()
-    .with_panel_appearance("ronomepo-side-panel")
-    .with_panel_header_appearance("ronomepo-panel-header")
-    .with_tab_strip_appearance("ronomepo-side-tabs")
+    .with_panel_appearance("primary")
+    .with_panel_header_appearance("secondary")
+    .with_tab_strip_appearance("utility")
     .with_text_appearance("body");
     product.layout.right_panel = TabGroupSpec::new("panel-right", None, Vec::new())
-        .with_panel_appearance("ronomepo-side-panel")
-        .with_panel_header_appearance("ronomepo-panel-header")
-        .with_tab_strip_appearance("ronomepo-side-tabs")
+        .with_panel_appearance("secondary")
+        .with_panel_header_appearance("secondary")
+        .with_tab_strip_appearance("utility")
         .with_text_appearance("body");
     product.layout.bottom_panel = TabGroupSpec::new(
         "panel-bottom",
@@ -304,10 +302,10 @@ fn main() {
         )],
     )
     .with_tab_strip_hidden()
-    .with_panel_appearance("ronomepo-bottom-panel")
-    .with_panel_header_appearance("ronomepo-panel-header")
-    .with_tab_strip_appearance("ronomepo-console-tabs")
-    .with_text_appearance("body");
+    .with_panel_appearance("console")
+    .with_panel_header_appearance("secondary")
+    .with_tab_strip_appearance("console")
+    .with_text_appearance("code");
     product.layout.workbench = WorkbenchNodeSpec::Group(
         TabGroupSpec::new(
             "workbench-main",
@@ -331,15 +329,14 @@ fn main() {
                 ),
             ],
         )
-        .with_panel_appearance("ronomepo-workbench")
-        .with_panel_header_appearance("ronomepo-workbench-header")
-        .with_tab_strip_appearance("ronomepo-editor-tabs")
+        .with_panel_appearance("workbench")
+        .with_panel_header_appearance("secondary")
+        .with_tab_strip_appearance("editor")
         .with_text_appearance("body"),
     );
 
     let config = MaruzzellaConfig::new("com.lelloman.ronomepo")
         .with_persistence_id("ronomepo")
-        .with_theme(app_theme())
         .with_product(product)
         .with_builtin_plugin(embedded_ronomepo_plugin);
 
@@ -448,174 +445,4 @@ fn embedded_ronomepo_plugin() -> Result<maruzzella::LoadedPlugin, maruzzella::Pl
         "builtin:ronomepo-plugin",
         ronomepo_plugin::maruzzella_plugin_entry,
     )
-}
-
-fn app_theme() -> ThemeSpec {
-    let mut theme = ThemeSpec::default();
-
-    // Typography – match IntelliJ/AS system font feel
-    theme.typography.font_family = "\"Inter\", \"Noto Sans\", sans-serif".to_string();
-    theme.typography.mono_font_family = "\"JetBrains Mono\", monospace".to_string();
-    theme.typography.font_size_base = 13;
-    theme.typography.font_size_ui = 12;
-    theme.typography.font_size_small = 11;
-    theme.typography.font_size_tiny = 10;
-
-    // Palette – Darcula-inspired warm dark grays
-    theme.palette.bg_0 = "#3c3f41".to_string();
-    theme.palette.bg_1 = "#45494a".to_string();
-    theme.palette.workbench = "#2b2b2b".to_string();
-    theme.palette.panel_left = "#3c3f41".to_string();
-    theme.palette.panel_right = "#3c3f41".to_string();
-    theme.palette.panel_bottom = "#3c3f41".to_string();
-    theme.palette.border = "#323232".to_string();
-    theme.palette.border_strong = "#515151".to_string();
-    theme.palette.text_0 = "#bbbbbb".to_string();
-    theme.palette.text_1 = "#a9b7c6".to_string();
-    theme.palette.text_2 = "#787878".to_string();
-    theme.palette.accent = "#4b6eaf".to_string();
-    theme.palette.accent_strong = "#589df6".to_string();
-
-    // Density – compact like Android Studio
-    theme.density.radius_none = 0;
-    theme.density.radius_small = 2;
-    theme.density.radius_medium = 3;
-    theme.density.radius_large = 4;
-    theme.density.radius_pill = 3;
-    theme.density.toolbar_height = 30;
-    theme.density.tab_height = 26;
-    theme.density.space_xs = 2;
-    theme.density.space_sm = 4;
-    theme.density.space_md = 4;
-    theme.density.space_lg = 6;
-    theme.density.space_xl = 8;
-    theme.density.panel_header_height = 26;
-    theme.density.icon_size = 16;
-    theme.density.min_side_panel_width = 200;
-    theme.density.min_bottom_panel_height = 200;
-
-    theme = theme
-        .with_surface_appearance(
-            "app-shell",
-            SurfaceAppearance::new(Tone::Neutral, SurfaceLevel::Sunken, TextRole::Body)
-                .borderless(),
-        )
-        .with_surface_appearance(
-            "topbar",
-            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Raised, TextRole::BodyStrong),
-        )
-        .with_surface_appearance(
-            "menu",
-            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Flat, TextRole::BodyStrong)
-                .borderless(),
-        )
-        .with_surface_appearance(
-            "toolbar",
-            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Flat, TextRole::Body),
-        )
-        .with_surface_appearance(
-            "status",
-            SurfaceAppearance::new(Tone::Secondary, SurfaceLevel::Raised, TextRole::Meta),
-        )
-        .with_surface_appearance(
-            "ronomepo-side-panel",
-            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Raised, TextRole::Body),
-        )
-        .with_surface_appearance(
-            "ronomepo-panel-header",
-            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Flat, TextRole::SectionLabel),
-        )
-        .with_surface_appearance(
-            "ronomepo-bottom-panel",
-            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Raised, TextRole::Body),
-        )
-        .with_surface_appearance(
-            "ronomepo-workbench",
-            SurfaceAppearance::new(Tone::Neutral, SurfaceLevel::Sunken, TextRole::Body)
-                .borderless(),
-        )
-        .with_surface_appearance(
-            "ronomepo-workbench-header",
-            SurfaceAppearance::new(Tone::Primary, SurfaceLevel::Flat, TextRole::TabLabel),
-        )
-        .with_button_appearance(
-            "primary",
-            ButtonAppearance::new(Tone::Accent, ButtonStyle::Solid, TextRole::BodyStrong),
-        )
-        .with_button_appearance(
-            "secondary",
-            ButtonAppearance::new(Tone::Primary, ButtonStyle::Soft, TextRole::Body),
-        )
-        .with_button_appearance(
-            "ghost",
-            ButtonAppearance::new(Tone::Neutral, ButtonStyle::Ghost, TextRole::Body),
-        )
-        .with_button_appearance(
-            "ronomepo-toolbar-primary",
-            ButtonAppearance::new(Tone::Accent, ButtonStyle::Ghost, TextRole::BodyStrong),
-        )
-        .with_button_appearance(
-            "ronomepo-toolbar-ghost",
-            ButtonAppearance::new(Tone::Primary, ButtonStyle::Ghost, TextRole::Body),
-        )
-        .with_text_appearance(
-            "title",
-            TextAppearance {
-                role: TextRole::Title,
-                tone: Tone::Primary,
-            },
-        )
-        .with_text_appearance(
-            "subtitle",
-            TextAppearance {
-                role: TextRole::Subtitle,
-                tone: Tone::Secondary,
-            },
-        )
-        .with_text_appearance(
-            "body",
-            TextAppearance {
-                role: TextRole::Body,
-                tone: Tone::Primary,
-            },
-        )
-        .with_text_appearance(
-            "meta",
-            TextAppearance {
-                role: TextRole::Meta,
-                tone: Tone::Neutral,
-            },
-        )
-        .with_text_appearance(
-            "code",
-            TextAppearance {
-                role: TextRole::Code,
-                tone: Tone::Primary,
-            },
-        )
-        .with_input_appearance(
-            "search",
-            InputAppearance::new(Tone::Secondary, SurfaceLevel::Sunken, TextRole::Body),
-        )
-        .with_tab_strip_appearance(
-            "ronomepo-side-tabs",
-            TabStripAppearance::new(Tone::Primary, TabStripStyle::Utility, TextRole::TabLabel),
-        )
-        .with_tab_strip_appearance(
-            "ronomepo-editor-tabs",
-            TabStripAppearance::new(Tone::Neutral, TabStripStyle::Editor, TextRole::TabLabel),
-        )
-        .with_tab_strip_appearance(
-            "ronomepo-console-tabs",
-            TabStripAppearance::new(Tone::Primary, TabStripStyle::Console, TextRole::TabLabel),
-        )
-        // Keep token overrides for stateful shell details not fully expressed by appearance ids.
-        .with_override("color_separator_fill", "#323232")
-        .with_override("separator_alpha", "1.0")
-        .with_override("separator_size", "1px")
-        .with_override("dense_row_selected_bg", "#2d5c88")
-        .with_override("dense_row_selected_text", "#ffffff")
-        .with_override("dense_row_hover_bg", "alpha(#2d5c88, 0.3)");
-
-    theme
 }

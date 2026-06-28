@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use gtk::gdk::{Rectangle, RGBA};
+use gtk::gdk::Rectangle;
 use gtk::gio;
 use gtk::glib::{
     self,
@@ -2326,7 +2326,7 @@ fn operation_follow_button() -> ToggleButton {
     let button = clickable_toggle_button();
     button.add_css_class("toolbar-button");
     button.add_css_class("toolbar-icon-button");
-    button.add_css_class(&button_css_class("ronomepo-toolbar-ghost"));
+    button.add_css_class(&button_css_class("ghost"));
     button.set_focus_on_click(false);
     button.set_tooltip_text(Some("Follow scroll to bottom"));
 
@@ -6566,11 +6566,11 @@ fn open_add_commit_check_rule_dialog(
     mark_clickable(&add);
     add.add_css_class(&button_css_class("primary"));
     dialog.set_default_response(ResponseType::Accept);
-    dialog.add_css_class(&surface_css_class("ronomepo-workbench"));
+    dialog.add_css_class(&surface_css_class("workbench"));
     dialog.add_css_class(&text_css_class("body"));
 
     let content = dialog.content_area();
-    content.add_css_class(&surface_css_class("ronomepo-workbench"));
+    content.add_css_class(&surface_css_class("workbench"));
     content.add_css_class(&text_css_class("body"));
     content.set_margin_top(16);
     content.set_margin_bottom(16);
@@ -6579,7 +6579,7 @@ fn open_add_commit_check_rule_dialog(
     content.set_spacing(12);
 
     let body = GtkBox::new(Orientation::Vertical, 8);
-    body.add_css_class(&surface_css_class("ronomepo-workbench"));
+    body.add_css_class(&surface_css_class("workbench"));
     body.add_css_class(&text_css_class("body"));
 
     let enabled = clickable_check_button_with_label("Enabled");
@@ -8877,7 +8877,7 @@ fn terminal_icon_button(icon_name: &str, tooltip: &str) -> Button {
     let button = clickable_button();
     button.add_css_class("toolbar-button");
     button.add_css_class("toolbar-icon-button");
-    button.add_css_class(&button_css_class("ronomepo-toolbar-ghost"));
+    button.add_css_class(&button_css_class("ghost"));
     button.set_focus_on_click(false);
     button.set_tooltip_text(Some(tooltip));
 
@@ -8934,7 +8934,6 @@ fn build_vte_terminal_widget(path: &Path, label: &str, restart: &Button) -> GtkB
     terminal.set_scroll_on_keystroke(true);
     terminal.set_mouse_autohide(true);
     terminal.add_css_class("mono");
-    style_embedded_terminal_palette(&terminal);
 
     let shell = preferred_embedded_shell();
     let path = path.to_path_buf();
@@ -9007,35 +9006,6 @@ fn preferred_embedded_shell() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "/bin/bash".to_string())
-}
-
-#[cfg(feature = "embedded-terminal")]
-fn style_embedded_terminal_palette(terminal: &vte4::Terminal) {
-    let palette = [
-        rgba("#171717"),
-        rgba("#d16969"),
-        rgba("#7fb069"),
-        rgba("#d7ba7d"),
-        rgba("#6cb6ff"),
-        rgba("#c586c0"),
-        rgba("#4ec9b0"),
-        rgba("#d4d4d4"),
-        rgba("#6a6a6a"),
-        rgba("#f48771"),
-        rgba("#8ec07c"),
-        rgba("#e5c07b"),
-        rgba("#9cdcfe"),
-        rgba("#d7a6ff"),
-        rgba("#7fe4d2"),
-        rgba("#f0f0f0"),
-    ];
-    let palette_refs = palette.iter().collect::<Vec<_>>();
-    terminal.set_colors(None, None, &palette_refs);
-}
-
-#[cfg(feature = "embedded-terminal")]
-fn rgba(hex: &str) -> RGBA {
-    RGBA::parse(hex).expect("invalid hard-coded terminal color")
 }
 
 #[cfg(feature = "embedded-terminal")]
@@ -11053,7 +11023,7 @@ fn host_toolbar_button(
         command_id,
         payload: &[],
         display_mode: MzToolbarDisplayMode::IconOnly,
-        appearance_id: Some("ronomepo-toolbar-ghost"),
+        appearance_id: Some("ghost"),
     };
     let widget_ptr = host.create_toolbar_widget(&spec).ok()?;
     let widget = unsafe { gtk::Widget::from_glib_full(widget_ptr as *mut gtk::ffi::GtkWidget) };
