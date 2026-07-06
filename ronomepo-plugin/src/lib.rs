@@ -101,6 +101,33 @@ fn mark_clickable_descendant_buttons<W: IsA<gtk::Widget>>(widget: &W) {
     }
 }
 
+fn mark_clickable_list_rows(list: &ListBox) {
+    let motion = EventControllerMotion::new();
+    motion.connect_motion({
+        let list = list.clone();
+        move |_, _x, y| {
+            if list.is_sensitive() && list.row_at_y(y as i32).is_some() {
+                list.set_cursor_from_name(Some("pointer"));
+            } else {
+                list.set_cursor_from_name(None);
+            }
+        }
+    });
+    motion.connect_leave({
+        let list = list.clone();
+        move |_| {
+            list.set_cursor_from_name(None);
+        }
+    });
+    list.add_controller(motion);
+
+    list.connect_sensitive_notify(|list| {
+        if !list.is_sensitive() {
+            list.set_cursor_from_name(None);
+        }
+    });
+}
+
 fn clickable_button() -> Button {
     let button = Button::new();
     mark_clickable(&button);
@@ -5127,6 +5154,7 @@ extern "C" fn create_repo_monitor_view(
 
     let list = ListBox::new();
     list.add_css_class("boxed-list");
+    mark_clickable_list_rows(&list);
     list.set_hexpand(true);
     list.set_valign(Align::Start);
     list.set_selection_mode(SelectionMode::Multiple);
