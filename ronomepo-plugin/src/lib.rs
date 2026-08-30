@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -33,29 +33,29 @@ use gtk::{
 use maruzzella_sdk::{
     attach_text_tooltip, button_css_class, export_plugin, input_css_class, surface_css_class,
     text_css_class, CommandSpec, HostApi, MzLogLevel, MzStatusCode, MzToolbarDisplayMode,
-    MzViewOpenDisposition, MzViewPlacement, OpenViewRequest, Plugin, PluginDependency,
-    PluginDescriptor, SurfaceContributionSpec, ToolbarWidgetSpec, Version, ViewFactorySpec,
+    MzViewOpenDisposition, MzViewPlacement, MzViewTeardownDecision, MzViewTeardownRequest,
+    MzViewTeardownResult, OpenViewRequest, Plugin, PluginDependency, PluginDescriptor,
+    SurfaceContributionSpec, ToolbarWidgetSpec, Version, ViewFactorySpec,
 };
 use notify::{Config as NotifyConfig, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use ronomepo_core::{
     assess_repo_capability_policy, attention_rank, build_repository_list, capability_due_reason,
     capability_next_due_at_epoch_secs, collect_capability_git_snapshot,
     collect_commit_check_report, collect_repository_details, collect_workspace_line_stats,
-    current_epoch_secs, default_capability_registry_path, default_commit_check_rules,
-    default_manifest_path, default_repo_manifest_path, derive_attention_signals, derive_dir_name,
-    ensure_commit_check_rules_initialized, format_sync_label, import_repos_txt,
-    list_repo_artifacts, load_capability_registry, load_manifest, load_repo_manifest,
-    normalize_workspace_root, parse_capability_result_json, plan_capability_action,
-    plan_repo_action, run_workspace_operation, save_capability_registry, save_manifest,
-    save_repo_manifest, scan_repo_manifest, text_capability_result, upsert_capability_state,
+    current_epoch_secs, default_capability_registry_path, default_manifest_path,
+    default_repo_manifest_path, derive_attention_signals,
+    ensure_commit_check_rules_initialized, format_sync_label, list_repo_artifacts,
+    load_capability_registry, load_manifest, load_repo_manifest, normalize_workspace_root,
+    parse_capability_result_json, plan_capability_action, plan_repo_action, run_workspace_operation,
+    save_capability_registry, save_manifest, save_repo_manifest, scan_repo_manifest,
+    text_capability_result, upsert_capability_state,
     verify_repo_dependencies_freshness, workspace_summary, AttentionImpact, AttentionKind,
     AttentionLevel, AttentionSignal, AttentionSource, AttentionUrgency, CapabilityFinding,
     CapabilityFindingSeverity, CapabilityRegistry, CapabilityResult, CapabilityResultStatus,
     CapabilityState, CommitCheckRule, CommitCheckRuleEffect, CommitCheckRuleMatcher,
     CommitCheckRuleScope, OperationEvent, OperationEventKind, OperationKind, PlannedCommand,
     RepoActionExecutor, RepoManifest, RepoManifestScan, RepoManifestScanState, RepositoryDetails,
-    RepositoryEntry, RepositoryListItem, RepositoryStatus, StandardActionName, WorkspaceManifest,
-    MANIFEST_FILE_NAME,
+    RepositoryListItem, RepositoryStatus, StandardActionName, WorkspaceManifest, MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -478,10 +478,6 @@ enum WorkerJob {
         workspace_root: PathBuf,
         status_sender: Option<mpsc::Sender<String>>,
     },
-    ImportWorkspaceFromReposTxt {
-        workspace_root: PathBuf,
-        status_sender: Option<mpsc::Sender<String>>,
-    },
     HistoryReport {
         manifest: WorkspaceManifest,
         selected_repo_ids: Vec<String>,
@@ -495,16 +491,6 @@ enum WorkerJob {
         workspace_root: PathBuf,
         targets: Vec<CapabilityRunTarget>,
         run_reason: String,
-    },
-    SaveManifestFromEditor {
-        host_ptr: usize,
-        workspace_name: String,
-        workspace_root: String,
-        shared_hooks_path: String,
-        repo_rows: Vec<RepoEditorRowInput>,
-        selected_repo_id: Option<String>,
-        clone_after_save: bool,
-        status_sender: mpsc::Sender<String>,
     },
     EditorLoad {
         path: PathBuf,
@@ -545,10 +531,6 @@ enum WorkerResult {
         result: Result<RefreshWorkspaceResult, String>,
         status_sender: Option<mpsc::Sender<String>>,
     },
-    ImportWorkspaceCompleted {
-        result: Result<ImportWorkspaceResult, String>,
-        status_sender: Option<mpsc::Sender<String>>,
-    },
     HistoryReportCompleted {
         result: Result<HistoryReportResult, String>,
     },
@@ -558,22 +540,12 @@ enum WorkerResult {
     CapabilityChecksCompleted {
         result: Result<CapabilityRunReport, String>,
     },
-    SaveManifestCompleted {
-        result: Result<SaveManifestResult, String>,
-        status_sender: mpsc::Sender<String>,
-    },
 }
 
 struct RefreshWorkspaceResult {
     workspace_root: PathBuf,
     manifest_path: PathBuf,
     manifest: Option<WorkspaceManifest>,
-    message: String,
-}
-
-struct ImportWorkspaceResult {
-    manifest_path: PathBuf,
-    manifest: WorkspaceManifest,
     message: String,
 }
 
@@ -599,24 +571,6 @@ struct CapabilityRunTarget {
 struct CapabilityRunReport {
     lines: Vec<String>,
     message: String,
-}
-
-struct SaveManifestResult {
-    host_ptr: usize,
-    workspace_root: PathBuf,
-    manifest_path: PathBuf,
-    manifest: WorkspaceManifest,
-    selected_repo_id: Option<String>,
-    clone_after_save: bool,
-    message: String,
-}
-
-#[derive(Clone)]
-struct RepoEditorRowInput {
-    enabled: bool,
-    name: String,
-    dir_name: String,
-    remote_url: String,
 }
 
 #[derive(Clone)]
@@ -721,6 +675,7 @@ thread_local! {
     static OPERATION_BUFFERS: RefCell<Vec<glib::WeakRef<TextBuffer>>> = const { RefCell::new(Vec::new()) };
     static OPERATION_SUMMARIES: RefCell<Vec<glib::WeakRef<Label>>> = const { RefCell::new(Vec::new()) };
     static OPERATION_FOLLOWERS: RefCell<Vec<OperationFollowHandle>> = const { RefCell::new(Vec::new()) };
+    static DIRTY_TEXT_EDITORS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -1034,16 +989,6 @@ fn run_worker_job(queued_job: QueuedJob) {
                 status_sender,
             });
         }
-        WorkerJob::ImportWorkspaceFromReposTxt {
-            workspace_root,
-            status_sender,
-        } => {
-            let result = import_workspace_manifest_from_repos_txt(&workspace_root);
-            dispatch_worker_result(WorkerResult::ImportWorkspaceCompleted {
-                result,
-                status_sender,
-            });
-        }
         WorkerJob::HistoryReport {
             manifest,
             selected_repo_ids,
@@ -1066,30 +1011,6 @@ fn run_worker_job(queued_job: QueuedJob) {
         } => {
             let result = run_capability_checks(&workspace_root, targets, &run_reason);
             dispatch_worker_result(WorkerResult::CapabilityChecksCompleted { result });
-        }
-        WorkerJob::SaveManifestFromEditor {
-            host_ptr,
-            workspace_name,
-            workspace_root,
-            shared_hooks_path,
-            repo_rows,
-            selected_repo_id,
-            clone_after_save,
-            status_sender,
-        } => {
-            let result = save_workspace_manifest_from_inputs(
-                host_ptr,
-                &workspace_name,
-                &workspace_root,
-                &shared_hooks_path,
-                &repo_rows,
-                selected_repo_id,
-                clone_after_save,
-            );
-            dispatch_worker_result(WorkerResult::SaveManifestCompleted {
-                result,
-                status_sender,
-            });
         }
         WorkerJob::EditorLoad { path, reply } => {
             let result = fs::read_to_string(&path).map_err(|error| error.to_string());
@@ -1271,13 +1192,16 @@ impl Plugin for RonomepoPlugin {
             MzViewPlacement::Workbench,
             create_workspace_settings_view,
         ))?;
-        host.register_view_factory(ViewFactorySpec::new(
-            PLUGIN_ID,
-            VIEW_TEXT_EDITOR,
-            "Text Editor",
-            MzViewPlacement::Workbench,
-            create_text_editor_view,
-        ))?;
+        host.register_view_factory(
+            ViewFactorySpec::new(
+                PLUGIN_ID,
+                VIEW_TEXT_EDITOR,
+                "Text Editor",
+                MzViewPlacement::Workbench,
+                create_text_editor_view,
+            )
+            .with_prepare_teardown(prepare_text_editor_teardown),
+        )?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
             VIEW_OPERATIONS,
@@ -1574,19 +1498,6 @@ fn queue_refresh_workspace(status_sender: Option<mpsc::Sender<String>>) -> Resul
         app_state.workspace_root.clone()
     };
     submit_job(WorkerJob::RefreshWorkspace {
-        workspace_root,
-        status_sender,
-    })
-}
-
-fn queue_import_workspace_from_repos_txt(
-    status_sender: Option<mpsc::Sender<String>>,
-) -> Result<(), String> {
-    let workspace_root = {
-        let app_state = state().lock().expect("state mutex poisoned");
-        app_state.workspace_root.clone()
-    };
-    submit_job(WorkerJob::ImportWorkspaceFromReposTxt {
         workspace_root,
         status_sender,
     })
@@ -2052,23 +1963,6 @@ fn handle_worker_result(result: WorkerResult) {
             append_log(message);
             refresh_views();
         }
-        WorkerResult::ImportWorkspaceCompleted {
-            result,
-            status_sender,
-        } => {
-            let message = match result {
-                Ok(result) => {
-                    apply_imported_manifest(result.manifest_path, result.manifest);
-                    result.message
-                }
-                Err(message) => format!("Import failed: {message}"),
-            };
-            if let Some(sender) = status_sender {
-                let _ = sender.send(message.clone());
-            }
-            append_log(message);
-            refresh_views();
-        }
         WorkerResult::HistoryReportCompleted { result } => {
             let message = match result {
                 Ok(result) => {
@@ -2115,34 +2009,6 @@ fn handle_worker_result(result: WorkerResult) {
             };
             append_log(message);
             schedule_workspace_scan();
-            refresh_views();
-        }
-        WorkerResult::SaveManifestCompleted {
-            result,
-            status_sender,
-        } => {
-            let message = match result {
-                Ok(result) => {
-                    let selected_repo_id = result.selected_repo_id.clone();
-                    let clone_after_save = result.clone_after_save;
-                    apply_saved_manifest(
-                        result.host_ptr,
-                        result.workspace_root,
-                        result.manifest_path,
-                        result.manifest,
-                    );
-                    if let Some(repo_id) = selected_repo_id {
-                        update_selected_repo_ids(vec![repo_id]);
-                    }
-                    if clone_after_save {
-                        launch_operation(OperationKind::CloneMissing);
-                    }
-                    result.message
-                }
-                Err(message) => message,
-            };
-            let _ = status_sender.send(message.clone());
-            append_log(message);
             refresh_views();
         }
     }
@@ -7007,14 +6873,6 @@ extern "C" fn create_repo_overview_view(
     }
 }
 
-#[derive(Clone)]
-struct RepoEditorRowHandle {
-    enabled: CheckButton,
-    name: Entry,
-    dir_name: Entry,
-    remote_url: Entry,
-}
-
 extern "C" fn create_workspace_settings_view(
     host: *const maruzzella_sdk::ffi::MzHostApi,
     _request: *const maruzzella_sdk::ffi::MzViewRequest,
@@ -7051,184 +6909,10 @@ extern "C" fn create_workspace_settings_view(
 
 fn render_workspace_settings_into(
     root: &GtkBox,
-    snapshot: &StateSnapshot,
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    _snapshot: &StateSnapshot,
+    _host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
     clear_box(root);
-
-    let manifest = snapshot
-        .manifest
-        .clone()
-        .unwrap_or_else(|| WorkspaceManifest {
-            name: workspace_name_from_root(&snapshot.workspace_root),
-            root: snapshot.workspace_root.clone(),
-            repos: Vec::new(),
-            shared_hooks_path: Some(snapshot.workspace_root.join("hooks")),
-            commit_check_rules: Some(default_commit_check_rules()),
-        });
-
-    let title = Label::new(Some("Workspace Settings"));
-    title.set_xalign(0.0);
-    title.add_css_class("title-2");
-
-    let subtitle = Label::new(Some(
-        "Edit the workspace manifest directly. Changes here become the source of truth for Ronomepo.",
-    ));
-    subtitle.set_xalign(0.0);
-    subtitle.set_wrap(true);
-    subtitle.add_css_class("muted");
-
-    let name_entry = Entry::new();
-    name_entry.set_text(&manifest.name);
-    let root_entry = Entry::new();
-    root_entry.set_text(&manifest.root.display().to_string());
-    let hooks_entry = Entry::new();
-    hooks_entry.set_text(
-        &manifest
-            .shared_hooks_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
-    );
-
-    let form = GtkBox::new(Orientation::Vertical, 8);
-    form.append(&labeled_field("Workspace Name", &name_entry));
-    form.append(&labeled_field("Workspace Root", &root_entry));
-    form.append(&labeled_field("Shared Hooks Path", &hooks_entry));
-
-    let repo_header = Label::new(Some("Repositories"));
-    repo_header.set_xalign(0.0);
-    repo_header.add_css_class("title-4");
-
-    let repo_help = Label::new(Some(
-        "Each repository row controls one manifest entry. Empty rows are ignored on save.",
-    ));
-    repo_help.set_xalign(0.0);
-    repo_help.set_wrap(true);
-    repo_help.add_css_class("muted");
-
-    let repo_rows_box = GtkBox::new(Orientation::Vertical, 8);
-    let repo_rows = Rc::new(RefCell::new(Vec::<RepoEditorRowHandle>::new()));
-    for repo in &manifest.repos {
-        append_repo_editor_row(&repo_rows_box, &repo_rows, Some(repo));
-    }
-
-    let repo_scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .min_content_height(280)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .child(&repo_rows_box)
-        .build();
-
-    let status = Label::new(Some(
-        "Use Save Manifest to persist changes, or Import repos.txt to regenerate entries from the legacy file.",
-    ));
-    status.set_xalign(0.0);
-    status.set_wrap(true);
-    status.add_css_class("muted");
-
-    let actions = GtkBox::new(Orientation::Horizontal, 8);
-    let add_repo = clickable_button_with_label("Add Repo");
-    let save = clickable_button_with_label("Save Manifest");
-    let reload = clickable_button_with_label("Reload Manifest");
-    let import = clickable_button_with_label("Import repos.txt");
-    let edit_manifest = clickable_button_with_label("Edit Manifest File");
-
-    add_repo.connect_clicked({
-        let root = root.clone();
-        let repo_rows = repo_rows.clone();
-        let status = status.clone();
-        let name_entry = name_entry.clone();
-        let root_entry = root_entry.clone();
-        let hooks_entry = hooks_entry.clone();
-        move |_| {
-            open_add_repository_dialog(
-                root.root()
-                    .and_then(|widget| widget.downcast::<Window>().ok()),
-                host_ptr,
-                &name_entry,
-                &root_entry,
-                &hooks_entry,
-                repo_rows.clone(),
-                &status,
-            );
-        }
-    });
-
-    save.connect_clicked({
-        let status = status.clone();
-        let repo_rows = repo_rows.clone();
-        let name_entry = name_entry.clone();
-        let root_entry = root_entry.clone();
-        let hooks_entry = hooks_entry.clone();
-        move |_| {
-            status.set_text("Saving manifest...");
-            if let Err(message) = queue_save_workspace_manifest_from_editor(
-                host_ptr,
-                name_entry.text().as_str(),
-                root_entry.text().as_str(),
-                hooks_entry.text().as_str(),
-                &repo_rows.borrow(),
-                None,
-                false,
-                &status,
-            ) {
-                status.set_text(&message);
-                append_log(message);
-                refresh_views();
-            }
-        }
-    });
-
-    reload.connect_clicked({
-        let status = status.clone();
-        move |_| {
-            status.set_text("Refreshing workspace...");
-            if let Err(message) = queue_refresh_workspace(Some(status_text_sender(&status))) {
-                status.set_text(&message);
-                append_log(message);
-                refresh_views();
-            }
-        }
-    });
-
-    import.connect_clicked({
-        let status = status.clone();
-        move |_| {
-            status.set_text("Importing repos.txt...");
-            if let Err(message) =
-                queue_import_workspace_from_repos_txt(Some(status_text_sender(&status)))
-            {
-                status.set_text(&message);
-                append_log(message);
-                refresh_views();
-            }
-        }
-    });
-
-    let manifest_edit_path = snapshot
-        .manifest_path
-        .clone()
-        .unwrap_or_else(|| default_manifest_path(&snapshot.workspace_root));
-    edit_manifest.connect_clicked(move |_| {
-        let path = manifest_edit_path.clone();
-        open_text_editor_for_path(host_ptr, &path);
-    });
-
-    for button in [add_repo, save, reload, import, edit_manifest] {
-        actions.append(&button);
-    }
-
-    root.append(&title);
-    root.append(&subtitle);
-    root.append(&actions);
-    root.append(&form);
-    root.append(&repo_header);
-    root.append(&repo_help);
-    root.append(&repo_scroller);
-    root.append(&status);
 }
 
 fn labeled_field(label: &str, widget: &impl IsA<gtk::Widget>) -> GtkBox {
@@ -7239,210 +6923,6 @@ fn labeled_field(label: &str, widget: &impl IsA<gtk::Widget>) -> GtkBox {
     row.append(&title);
     row.append(widget);
     row
-}
-
-fn append_repo_editor_row(
-    repo_rows_box: &GtkBox,
-    repo_rows: &Rc<RefCell<Vec<RepoEditorRowHandle>>>,
-    repo: Option<&RepositoryEntry>,
-) {
-    let row = GtkBox::new(Orientation::Horizontal, 8);
-    row.add_css_class("boxed-list");
-
-    let enabled = clickable_check_button_with_label("Enabled");
-    enabled.set_active(repo.map(|repo| repo.enabled).unwrap_or(true));
-
-    let name = Entry::new();
-    name.set_placeholder_text(Some("Name"));
-    name.set_hexpand(true);
-    name.set_text(repo.map(|repo| repo.name.as_str()).unwrap_or(""));
-
-    let dir_name = Entry::new();
-    dir_name.set_placeholder_text(Some("dir_name"));
-    dir_name.set_text(repo.map(|repo| repo.dir_name.as_str()).unwrap_or(""));
-
-    let remote_url = Entry::new();
-    remote_url.set_placeholder_text(Some("Remote URL"));
-    remote_url.set_hexpand(true);
-    remote_url.set_text(repo.map(|repo| repo.remote_url.as_str()).unwrap_or(""));
-
-    let remove = clickable_button_with_label("Remove");
-    remove.connect_clicked({
-        let repo_rows_box = repo_rows_box.clone();
-        let repo_rows = repo_rows.clone();
-        let row = row.clone();
-        let enabled = enabled.clone();
-        let name = name.clone();
-        let dir_name = dir_name.clone();
-        let remote_url = remote_url.clone();
-        move |_| {
-            repo_rows_box.remove(&row);
-            repo_rows.borrow_mut().retain(|handle| {
-                !handle.enabled.eq(&enabled)
-                    && !handle.name.eq(&name)
-                    && !handle.dir_name.eq(&dir_name)
-                    && !handle.remote_url.eq(&remote_url)
-            });
-        }
-    });
-
-    row.append(&enabled);
-    row.append(&name);
-    row.append(&dir_name);
-    row.append(&remote_url);
-    row.append(&remove);
-    repo_rows_box.append(&row);
-
-    repo_rows.borrow_mut().push(RepoEditorRowHandle {
-        enabled,
-        name,
-        dir_name,
-        remote_url,
-    });
-}
-
-fn open_add_repository_dialog(
-    parent: Option<Window>,
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-    workspace_name: &Entry,
-    workspace_root: &Entry,
-    shared_hooks_path: &Entry,
-    repo_rows: Rc<RefCell<Vec<RepoEditorRowHandle>>>,
-    status: &Label,
-) {
-    let dialog = Dialog::builder()
-        .modal(true)
-        .title("Add Repository")
-        .build();
-    if let Some(parent) = parent.as_ref() {
-        dialog.set_transient_for(Some(parent));
-    }
-    let cancel = dialog.add_button("Cancel", ResponseType::Cancel);
-    mark_clickable(&cancel);
-    let add = dialog.add_button("Add Repository", ResponseType::Accept);
-    mark_clickable(&add);
-    dialog.set_default_response(ResponseType::Accept);
-
-    let content = dialog.content_area();
-    content.set_margin_top(16);
-    content.set_margin_bottom(16);
-    content.set_margin_start(16);
-    content.set_margin_end(16);
-    content.set_spacing(12);
-
-    let body = GtkBox::new(Orientation::Vertical, 8);
-
-    let remote_url = Entry::new();
-    remote_url.set_hexpand(true);
-    remote_url.set_placeholder_text(Some("git@github.com:org/repo.git"));
-
-    let dir_name = Entry::new();
-    dir_name.set_hexpand(true);
-    dir_name.set_placeholder_text(Some("repo-dir"));
-
-    let clone_now = clickable_check_button_with_label("Clone now");
-
-    let error = Label::new(None);
-    error.set_xalign(0.0);
-    error.set_wrap(true);
-    error.add_css_class("error");
-
-    body.append(&labeled_field("Git Remote URL", &remote_url));
-    body.append(&labeled_field("Directory Name", &dir_name));
-    body.append(&clone_now);
-    body.append(&error);
-    content.append(&body);
-
-    dialog.connect_response({
-        let dialog = dialog.clone();
-        let error = error.clone();
-        let remote_url = remote_url.clone();
-        let dir_name = dir_name.clone();
-        let clone_now = clone_now.clone();
-        let workspace_name = workspace_name.clone();
-        let workspace_root = workspace_root.clone();
-        let shared_hooks_path = shared_hooks_path.clone();
-        let repo_rows = repo_rows.clone();
-        let status = status.clone();
-        move |_, response| {
-            if response != ResponseType::Accept {
-                dialog.close();
-                return;
-            }
-
-            let mut repo_inputs = build_repo_editor_row_inputs(&repo_rows.borrow());
-            let (_, manifest) = match build_workspace_manifest_from_inputs(
-                workspace_name.text().as_str(),
-                workspace_root.text().as_str(),
-                shared_hooks_path.text().as_str(),
-                &repo_inputs,
-            ) {
-                Ok(result) => result,
-                Err(message) => {
-                    error.set_text(&message);
-                    return;
-                }
-            };
-
-            let new_repo = match validate_new_repository_entry(
-                &manifest,
-                remote_url.text().as_str(),
-                dir_name.text().as_str(),
-            ) {
-                Ok(repo) => repo,
-                Err(message) => {
-                    error.set_text(&message);
-                    return;
-                }
-            };
-
-            repo_inputs.push(RepoEditorRowInput {
-                enabled: true,
-                name: new_repo.name.clone(),
-                dir_name: new_repo.dir_name.clone(),
-                remote_url: new_repo.remote_url.clone(),
-            });
-
-            status.set_text("Saving manifest...");
-            if let Err(message) = queue_save_workspace_manifest(
-                host_ptr,
-                workspace_name.text().as_str(),
-                workspace_root.text().as_str(),
-                shared_hooks_path.text().as_str(),
-                repo_inputs,
-                Some(new_repo.id.clone()),
-                clone_now.is_active(),
-                &status,
-            ) {
-                error.set_text(&message);
-                status.set_text(&message);
-                append_log(message);
-                refresh_views();
-                return;
-            }
-
-            dialog.close();
-        }
-    });
-
-    dialog.present();
-}
-
-fn persist_last_workspace_path(
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-    workspace_root: &Path,
-) {
-    if host_ptr.is_null() {
-        return;
-    }
-    let host = unsafe { HostApi::from_raw(&*host_ptr) };
-    let Ok(mut config) = ensure_config(&host) else {
-        return;
-    };
-    config.last_workspace_path = Some(workspace_root.display().to_string());
-    if let Ok(payload) = serde_json::to_vec(&config) {
-        let _ = host.write_config(&payload);
-    }
 }
 
 fn persist_monitor_view_mode(mode: MonitorViewMode) {
@@ -7542,183 +7022,6 @@ fn persisted_plugin_configs_path(persistence_id: &str) -> PathBuf {
     path
 }
 
-fn status_text_sender(status: &Label) -> mpsc::Sender<String> {
-    let (sender, receiver) = mpsc::channel::<String>();
-    let status = glib::SendWeakRef::from(status.downgrade());
-    let main_context = glib::MainContext::default();
-    thread::spawn(move || {
-        let Ok(message) = receiver.recv() else {
-            return;
-        };
-        main_context.invoke(move || {
-            if let Some(status) = status.upgrade() {
-                status.set_text(&message);
-            }
-        });
-    });
-    sender
-}
-
-fn build_repo_editor_row_inputs(repo_rows: &[RepoEditorRowHandle]) -> Vec<RepoEditorRowInput> {
-    repo_rows
-        .iter()
-        .map(|handle| RepoEditorRowInput {
-            enabled: handle.enabled.is_active(),
-            name: handle.name.text().trim().to_string(),
-            dir_name: handle.dir_name.text().trim().to_string(),
-            remote_url: handle.remote_url.text().trim().to_string(),
-        })
-        .collect()
-}
-
-fn build_workspace_manifest_from_inputs(
-    workspace_name: &str,
-    workspace_root: &str,
-    shared_hooks_path: &str,
-    repo_rows: &[RepoEditorRowInput],
-) -> Result<(PathBuf, WorkspaceManifest), String> {
-    let workspace_root = normalize_workspace_root(workspace_root.trim());
-    if workspace_root.as_os_str().is_empty() {
-        return Err("Workspace root cannot be empty.".to_string());
-    }
-
-    let mut repos = Vec::new();
-    for row in repo_rows {
-        let remote_url = row.remote_url.trim().to_string();
-        let mut dir_name = row.dir_name.trim().to_string();
-        let mut name = row.name.trim().to_string();
-
-        if remote_url.is_empty() && dir_name.is_empty() && name.is_empty() {
-            continue;
-        }
-        if remote_url.is_empty() {
-            return Err("Each non-empty repository row needs a remote URL.".to_string());
-        }
-        if dir_name.is_empty() {
-            dir_name = derive_dir_name(&remote_url).map_err(|error| error.to_string())?;
-        }
-        if name.is_empty() {
-            name = dir_name.clone();
-        }
-
-        repos.push(RepositoryEntry {
-            id: dir_name.clone(),
-            name,
-            dir_name,
-            remote_url,
-            enabled: row.enabled,
-        });
-    }
-
-    let manifest = WorkspaceManifest {
-        name: if workspace_name.trim().is_empty() {
-            workspace_name_from_root(&workspace_root)
-        } else {
-            workspace_name.trim().to_string()
-        },
-        root: workspace_root.clone(),
-        repos,
-        shared_hooks_path: if shared_hooks_path.trim().is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(shared_hooks_path.trim()))
-        },
-        commit_check_rules: None,
-    };
-
-    Ok((workspace_root.clone(), manifest))
-}
-
-fn validate_new_repository_entry(
-    manifest: &WorkspaceManifest,
-    remote_url: &str,
-    dir_name: &str,
-) -> Result<RepositoryEntry, String> {
-    let remote_url = remote_url.trim();
-    let dir_name = dir_name.trim();
-
-    if remote_url.is_empty() {
-        return Err("Remote URL is required.".to_string());
-    }
-    if dir_name.is_empty() {
-        return Err("Directory name is required.".to_string());
-    }
-    if manifest
-        .repos
-        .iter()
-        .any(|repo| repo.remote_url == remote_url)
-    {
-        return Err(format!(
-            "A repository with remote URL {remote_url} already exists in the manifest."
-        ));
-    }
-    if manifest.repos.iter().any(|repo| repo.dir_name == dir_name) {
-        return Err(format!(
-            "A repository with directory name {dir_name} already exists in the manifest."
-        ));
-    }
-
-    let repo_path = manifest.root.join(dir_name);
-    if repo_path.exists() {
-        return Err(format!(
-            "Cannot add {dir_name} because {} already exists locally.",
-            repo_path.display()
-        ));
-    }
-
-    Ok(RepositoryEntry {
-        id: dir_name.to_string(),
-        name: dir_name.to_string(),
-        dir_name: dir_name.to_string(),
-        remote_url: remote_url.to_string(),
-        enabled: true,
-    })
-}
-
-fn queue_save_workspace_manifest(
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-    workspace_name: &str,
-    workspace_root: &str,
-    shared_hooks_path: &str,
-    repo_rows: Vec<RepoEditorRowInput>,
-    selected_repo_id: Option<String>,
-    clone_after_save: bool,
-    status: &Label,
-) -> Result<(), String> {
-    submit_job(WorkerJob::SaveManifestFromEditor {
-        host_ptr: host_ptr as usize,
-        workspace_name: workspace_name.to_string(),
-        workspace_root: workspace_root.to_string(),
-        shared_hooks_path: shared_hooks_path.to_string(),
-        repo_rows,
-        selected_repo_id,
-        clone_after_save,
-        status_sender: status_text_sender(status),
-    })
-}
-
-fn queue_save_workspace_manifest_from_editor(
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-    workspace_name: &str,
-    workspace_root: &str,
-    shared_hooks_path: &str,
-    repo_rows: &[RepoEditorRowHandle],
-    selected_repo_id: Option<String>,
-    clone_after_save: bool,
-    status: &Label,
-) -> Result<(), String> {
-    queue_save_workspace_manifest(
-        host_ptr,
-        workspace_name,
-        workspace_root,
-        shared_hooks_path,
-        build_repo_editor_row_inputs(repo_rows),
-        selected_repo_id,
-        clone_after_save,
-        status,
-    )
-}
-
 fn load_workspace_manifest(workspace_root: &Path) -> Result<RefreshWorkspaceResult, String> {
     let manifest_path = default_manifest_path(workspace_root);
     let manifest = load_manifest_if_present(&manifest_path);
@@ -7738,31 +7041,6 @@ fn load_workspace_manifest(workspace_root: &Path) -> Result<RefreshWorkspaceResu
         manifest_path,
         manifest,
         message,
-    })
-}
-
-fn import_workspace_manifest_from_repos_txt(
-    workspace_root: &Path,
-) -> Result<ImportWorkspaceResult, String> {
-    let repos_path = workspace_root.join("repos.txt");
-    let manifest_path = default_manifest_path(workspace_root);
-    let mut manifest = import_repos_txt(
-        &repos_path,
-        workspace_root,
-        &workspace_name_from_root(workspace_root),
-    )
-    .map_err(|error| error.to_string())?;
-    ensure_commit_check_rules_initialized(&mut manifest);
-    let repo_count = manifest.repos.len();
-    save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
-    Ok(ImportWorkspaceResult {
-        manifest_path,
-        manifest,
-        message: format!(
-            "Imported {repo_count} repositories from {} into {}",
-            repos_path.display(),
-            default_manifest_path(workspace_root).display()
-        ),
     })
 }
 
@@ -8155,101 +7433,6 @@ fn command_failure_summary(command: &PlannedCommand, stderr: &[u8]) -> String {
     }
 }
 
-fn save_workspace_manifest_from_inputs(
-    host_ptr: usize,
-    workspace_name: &str,
-    workspace_root: &str,
-    shared_hooks_path: &str,
-    repo_rows: &[RepoEditorRowInput],
-    selected_repo_id: Option<String>,
-    clone_after_save: bool,
-) -> Result<SaveManifestResult, String> {
-    let (workspace_root, mut manifest) = build_workspace_manifest_from_inputs(
-        workspace_name,
-        workspace_root,
-        shared_hooks_path,
-        repo_rows,
-    )?;
-    manifest.commit_check_rules = existing_commit_check_rules_for_workspace(&workspace_root)
-        .or_else(|| Some(default_commit_check_rules()));
-    let manifest_path = default_manifest_path(&workspace_root);
-    save_manifest(&manifest_path, &manifest).map_err(|error| error.to_string())?;
-    sync_workspace_gitignore(&workspace_root, &manifest.repos)
-        .map_err(|error| error.to_string())?;
-    let repo_count = manifest.repos.len();
-
-    Ok(SaveManifestResult {
-        host_ptr,
-        workspace_root,
-        manifest_path: manifest_path.clone(),
-        manifest,
-        selected_repo_id,
-        clone_after_save,
-        message: format!(
-            "Saved {} with {} repositories.",
-            manifest_path.display(),
-            repo_count
-        ),
-    })
-}
-
-fn existing_commit_check_rules_for_workspace(
-    workspace_root: &Path,
-) -> Option<Vec<CommitCheckRule>> {
-    let app_state = state().lock().expect("state mutex poisoned");
-    let manifest = app_state.manifest.as_ref()?;
-    (manifest.root == workspace_root)
-        .then(|| manifest.commit_check_rules.clone())
-        .flatten()
-}
-
-fn sync_workspace_gitignore(
-    workspace_root: &Path,
-    repos: &[RepositoryEntry],
-) -> Result<(), std::io::Error> {
-    let gitignore_path = workspace_root.join(".gitignore");
-    let mut content = match fs::read_to_string(&gitignore_path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error),
-    };
-
-    let mut additions = Vec::new();
-    for repo in repos {
-        if !gitignore_contains_repo_dir(&content, &repo.dir_name) {
-            additions.push(format!("/{}/", repo.dir_name.trim_matches('/')));
-        }
-    }
-
-    if additions.is_empty() {
-        return Ok(());
-    }
-
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
-
-    for entry in additions {
-        content.push_str(&entry);
-        content.push('\n');
-    }
-
-    fs::write(gitignore_path, content)
-}
-
-fn gitignore_contains_repo_dir(content: &str, dir_name: &str) -> bool {
-    let normalized = dir_name.trim().trim_matches('/');
-    content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .any(|line| {
-            let line = line.trim_end_matches('/');
-            let line = line.strip_prefix('/').unwrap_or(line);
-            line == normalized
-        })
-}
-
 fn apply_loaded_manifest(
     workspace_root: PathBuf,
     manifest_path: PathBuf,
@@ -8264,50 +7447,6 @@ fn apply_loaded_manifest(
     app_state.repo_details_loading.clear();
     sync_repo_runtime_state(&mut app_state);
     drop(app_state);
-    sync_watch_manager_from_state();
-    schedule_workspace_scan();
-}
-
-fn apply_imported_manifest(manifest_path: PathBuf, manifest: WorkspaceManifest) {
-    let mut app_state = state().lock().expect("state mutex poisoned");
-    app_state.manifest = Some(manifest);
-    app_state.manifest_path = Some(manifest_path);
-    app_state.repository_items_refresh_pending = false;
-    app_state.repo_details_cache.clear();
-    app_state.repo_details_loading.clear();
-    sync_repo_runtime_state(&mut app_state);
-    drop(app_state);
-    sync_watch_manager_from_state();
-    schedule_workspace_scan();
-}
-
-fn apply_saved_manifest(
-    host_ptr: usize,
-    workspace_root: PathBuf,
-    manifest_path: PathBuf,
-    manifest: WorkspaceManifest,
-) {
-    {
-        let mut app_state = state().lock().expect("state mutex poisoned");
-        app_state.workspace_root = workspace_root.clone();
-        app_state.manifest_path = Some(manifest_path);
-        app_state.manifest = Some(manifest.clone());
-        app_state.repo_details_cache.clear();
-        app_state.repo_details_loading.clear();
-        app_state
-            .selected_repo_ids
-            .retain(|id| manifest.repos.iter().any(|repo| &repo.id == id));
-        if app_state
-            .active_repo_id
-            .as_ref()
-            .is_some_and(|id| !manifest.repos.iter().any(|repo| &repo.id == id))
-        {
-            app_state.active_repo_id = None;
-        }
-        sync_repo_runtime_state(&mut app_state);
-    }
-
-    persist_last_workspace_path(host_ptr as *const _, &workspace_root);
     sync_watch_manager_from_state();
     schedule_workspace_scan();
 }
@@ -10839,6 +9978,25 @@ extern "C" fn create_text_editor_view(
     status.set_wrap(true);
 
     let buffer = TextBuffer::new(None);
+    let editor_key = initial_path
+        .as_deref()
+        .map(resolve_editor_path)
+        .map(|path| path.to_string_lossy().to_string());
+    let suppress_dirty = Arc::new(AtomicBool::new(true));
+    buffer.connect_changed({
+        let editor_key = editor_key.clone();
+        let suppress_dirty = suppress_dirty.clone();
+        move |_| {
+            if suppress_dirty.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Some(editor_key) = editor_key.as_ref() {
+                DIRTY_TEXT_EDITORS.with(|dirty| {
+                    dirty.borrow_mut().insert(editor_key.clone());
+                });
+            }
+        }
+    });
     let text = TextView::with_buffer(&buffer);
     text.set_monospace(true);
     text.set_wrap_mode(WrapMode::WordChar);
@@ -10856,7 +10014,16 @@ extern "C" fn create_text_editor_view(
         path_entry.set_text(path);
         let resolved = resolve_editor_path(path);
         title.set_text(&editor_title_for_path(&resolved));
-        queue_editor_load(&buffer, &status, &title, &path_entry, &resolved);
+        queue_editor_load(
+            &buffer,
+            &status,
+            &title,
+            &path_entry,
+            &resolved,
+            suppress_dirty.clone(),
+        );
+    } else {
+        suppress_dirty.store(false, Ordering::SeqCst);
     }
 
     open_button.connect_clicked({
@@ -10865,6 +10032,7 @@ extern "C" fn create_text_editor_view(
         let status = status.clone();
         let title = title.clone();
         let initial_path = initial_path.clone();
+        let suppress_dirty = suppress_dirty.clone();
         move |_| {
             let path = resolve_editor_path(path_entry.text().as_str());
             let current_instance = initial_path
@@ -10874,7 +10042,14 @@ extern "C" fn create_text_editor_view(
             if !current_instance.as_os_str().is_empty() && current_instance != path {
                 open_text_editor_for_path(host, &path);
             } else {
-                queue_editor_load(&buffer, &status, &title, &path_entry, &path);
+                queue_editor_load(
+                    &buffer,
+                    &status,
+                    &title,
+                    &path_entry,
+                    &path,
+                    suppress_dirty.clone(),
+                );
                 title.set_text(&editor_title_for_path(&path));
             }
         }
@@ -10888,7 +10063,14 @@ extern "C" fn create_text_editor_view(
         move |_| {
             let path = resolve_editor_path(path_entry.text().as_str());
             let content = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
-            queue_editor_save(&status, &title, &path, content.to_string(), host as usize);
+            queue_editor_save(
+                &buffer,
+                &status,
+                &title,
+                &path,
+                content.to_string(),
+                host as usize,
+            );
         }
     });
 
@@ -10912,6 +10094,37 @@ extern "C" fn create_text_editor_view(
     }
 }
 
+extern "C" fn prepare_text_editor_teardown(
+    request: *const MzViewTeardownRequest,
+) -> MzViewTeardownResult {
+    let Some(request) = (unsafe { request.as_ref() }) else {
+        return MzViewTeardownResult {
+            decision: MzViewTeardownDecision::Blocked,
+            message: maruzzella_sdk::ffi::MzStr::from_static(
+                "The editor teardown request was invalid.",
+            ),
+        };
+    };
+    let is_dirty = decode_mzstr(request.view.instance_key).is_some_and(|instance_key| {
+        let key = resolve_editor_path(&instance_key)
+            .to_string_lossy()
+            .to_string();
+        DIRTY_TEXT_EDITORS.with(|dirty| dirty.borrow().contains(&key))
+    });
+    MzViewTeardownResult {
+        decision: if is_dirty {
+            MzViewTeardownDecision::Confirm
+        } else {
+            MzViewTeardownDecision::Ready
+        },
+        message: if is_dirty {
+            maruzzella_sdk::ffi::MzStr::from_static("This text editor has unsaved changes.")
+        } else {
+            maruzzella_sdk::ffi::MzStr::empty()
+        },
+    }
+}
+
 fn resolve_editor_path(input: &str) -> PathBuf {
     let trimmed = input.trim();
     let path = PathBuf::from(trimmed);
@@ -10928,7 +10141,9 @@ fn queue_editor_load(
     title: &Label,
     path_entry: &Entry,
     path: &Path,
+    suppress_dirty: Arc<AtomicBool>,
 ) {
+    suppress_dirty.store(true, Ordering::SeqCst);
     status.set_text(&format!("Loading {}...", path.display()));
     let (sender, receiver) = mpsc::channel::<EditorLoadMessage>();
     let buffer = glib::SendWeakRef::from(buffer.downgrade());
@@ -10937,6 +10152,7 @@ fn queue_editor_load(
     let path_entry = glib::SendWeakRef::from(path_entry.downgrade());
     let queue_error_buffer = buffer.clone();
     let queue_error_status = status.clone();
+    let completion_suppress_dirty = suppress_dirty.clone();
     let main_context = glib::MainContext::default();
     thread::spawn(move || {
         let Ok(message) = receiver.recv() else {
@@ -10946,31 +10162,39 @@ fn queue_editor_load(
             let Some(path_entry) = path_entry.upgrade() else {
                 return;
             };
-            if resolve_editor_path(path_entry.text().as_str()) == message.path {
-                let Some(buffer) = buffer.upgrade() else {
-                    return;
-                };
-                let Some(status) = status.upgrade() else {
-                    return;
-                };
-                let Some(title) = title.upgrade() else {
-                    return;
-                };
-                match message.result {
-                    Ok(content) => {
-                        buffer.set_text(&content);
-                        status.set_text(&format!("Loaded {}", message.path.display()));
-                        title.set_text(&editor_title_for_path(&message.path));
-                    }
-                    Err(error) => {
-                        buffer.set_text("");
-                        status.set_text(&format!(
-                            "Failed to open {}: {error}",
-                            message.path.display()
-                        ));
-                    }
+            if resolve_editor_path(path_entry.text().as_str()) != message.path {
+                completion_suppress_dirty.store(false, Ordering::SeqCst);
+                return;
+            }
+            let Some(buffer) = buffer.upgrade() else {
+                return;
+            };
+            let Some(status) = status.upgrade() else {
+                return;
+            };
+            let Some(title) = title.upgrade() else {
+                return;
+            };
+            match message.result {
+                Ok(content) => {
+                    buffer.set_text(&content);
+                    DIRTY_TEXT_EDITORS.with(|dirty| {
+                        dirty
+                            .borrow_mut()
+                            .remove(&message.path.to_string_lossy().to_string());
+                    });
+                    status.set_text(&format!("Loaded {}", message.path.display()));
+                    title.set_text(&editor_title_for_path(&message.path));
+                }
+                Err(error) => {
+                    buffer.set_text("");
+                    status.set_text(&format!(
+                        "Failed to open {}: {error}",
+                        message.path.display()
+                    ));
                 }
             }
+            completion_suppress_dirty.store(false, Ordering::SeqCst);
         });
     });
 
@@ -10987,15 +10211,25 @@ fn queue_editor_load(
                 path.display()
             ));
         }
+        suppress_dirty.store(false, Ordering::SeqCst);
     }
 }
 
-fn queue_editor_save(status: &Label, title: &Label, path: &Path, content: String, host_ptr: usize) {
+fn queue_editor_save(
+    buffer: &TextBuffer,
+    status: &Label,
+    title: &Label,
+    path: &Path,
+    content: String,
+    host_ptr: usize,
+) {
     status.set_text(&format!("Saving {}...", path.display()));
     let (sender, receiver) = mpsc::channel::<EditorSaveMessage>();
     let status = glib::SendWeakRef::from(status.downgrade());
     let title = glib::SendWeakRef::from(title.downgrade());
+    let buffer = glib::SendWeakRef::from(buffer.downgrade());
     let path = path.to_path_buf();
+    let saved_content = content.clone();
     let queue_error_status = status.clone();
     let main_context = glib::MainContext::default();
     thread::spawn(move || {
@@ -11011,6 +10245,16 @@ fn queue_editor_save(status: &Label, title: &Label, path: &Path, content: String
             };
             match message.result {
                 Ok(()) => {
+                    if let Some(buffer) = buffer.upgrade() {
+                        let current = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+                        if current.as_str() == saved_content {
+                            DIRTY_TEXT_EDITORS.with(|dirty| {
+                                dirty
+                                    .borrow_mut()
+                                    .remove(&message.path.to_string_lossy().to_string());
+                            });
+                        }
+                    }
                     status.set_text(&format!("Saved {}", message.path.display()));
                     let title_text = editor_title_for_path(&message.path);
                     title.set_text(&title_text);
@@ -11311,17 +10555,12 @@ fn normalized_watch_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn workspace_name_from_root(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Workspace")
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ronomepo_core::{RepositoryState, RepositorySync};
+    use ronomepo_core::{
+        default_commit_check_rules, RepositoryEntry, RepositoryState, RepositorySync,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::UNIX_EPOCH;
 
@@ -11617,134 +10856,24 @@ mod tests {
     }
 
     #[test]
-    fn validate_new_repository_entry_rejects_manifest_duplicates() {
-        let workspace_root = temp_test_dir("manifest-duplicates");
-        let manifest = WorkspaceManifest {
-            name: "Workspace".to_string(),
-            root: workspace_root,
-            repos: vec![RepositoryEntry {
-                id: "alpha".to_string(),
-                name: "alpha".to_string(),
-                dir_name: "alpha".to_string(),
-                remote_url: "git@example.com:org/alpha.git".to_string(),
-                enabled: true,
-            }],
-            shared_hooks_path: None,
-            commit_check_rules: Some(default_commit_check_rules()),
+    fn text_editor_teardown_confirms_only_for_dirty_instances() {
+        let instance_key = "/tmp/ronomepo-dirty-editor.txt";
+        DIRTY_TEXT_EDITORS.with(|dirty| dirty.borrow_mut().clear());
+        let mut request = MzViewTeardownRequest::default();
+        request.view.instance_key = maruzzella_sdk::ffi::MzStr {
+            ptr: instance_key.as_ptr(),
+            len: instance_key.len(),
         };
 
-        let remote_error =
-            validate_new_repository_entry(&manifest, "git@example.com:org/alpha.git", "beta")
-                .unwrap_err();
-        assert!(remote_error.contains("already exists in the manifest"));
+        let ready = prepare_text_editor_teardown(&request);
+        assert_eq!(ready.decision, MzViewTeardownDecision::Ready);
 
-        let dir_error =
-            validate_new_repository_entry(&manifest, "git@example.com:org/beta.git", "alpha")
-                .unwrap_err();
-        assert!(dir_error.contains("already exists in the manifest"));
-    }
-
-    #[test]
-    fn validate_new_repository_entry_rejects_existing_local_directory() {
-        let workspace_root = temp_test_dir("existing-dir");
-        fs::create_dir_all(workspace_root.join("alpha")).unwrap();
-        let manifest = WorkspaceManifest {
-            name: "Workspace".to_string(),
-            root: workspace_root,
-            repos: Vec::new(),
-            shared_hooks_path: None,
-            commit_check_rules: Some(default_commit_check_rules()),
-        };
-
-        let error =
-            validate_new_repository_entry(&manifest, "git@example.com:org/alpha.git", "alpha")
-                .unwrap_err();
-        assert!(error.contains("already exists locally"));
-    }
-
-    #[test]
-    fn save_workspace_manifest_preserves_add_dialog_selection_and_clone_flags() {
-        let workspace_root = temp_test_dir("save-manifest");
-        let result = save_workspace_manifest_from_inputs(
-            7,
-            "Workspace",
-            workspace_root.to_str().unwrap(),
-            "",
-            &[RepoEditorRowInput {
-                enabled: true,
-                name: "alpha".to_string(),
-                dir_name: "alpha".to_string(),
-                remote_url: "git@example.com:org/alpha.git".to_string(),
-            }],
-            Some("alpha".to_string()),
-            true,
-        )
-        .unwrap();
-
-        assert_eq!(result.selected_repo_id.as_deref(), Some("alpha"));
-        assert!(result.clone_after_save);
-        assert_eq!(result.manifest.repos.len(), 1);
-        assert_eq!(result.manifest.repos[0].id, "alpha");
-        assert_eq!(result.manifest.repos[0].name, "alpha");
-    }
-
-    #[test]
-    fn save_workspace_manifest_adds_repo_directories_to_gitignore() {
-        let workspace_root = temp_test_dir("save-manifest-gitignore");
-        fs::write(workspace_root.join(".gitignore"), "hooks/\n/alpha/\n").unwrap();
-
-        save_workspace_manifest_from_inputs(
-            7,
-            "Workspace",
-            workspace_root.to_str().unwrap(),
-            "",
-            &[
-                RepoEditorRowInput {
-                    enabled: true,
-                    name: "alpha".to_string(),
-                    dir_name: "alpha".to_string(),
-                    remote_url: "git@example.com:org/alpha.git".to_string(),
-                },
-                RepoEditorRowInput {
-                    enabled: true,
-                    name: "beta".to_string(),
-                    dir_name: "beta".to_string(),
-                    remote_url: "git@example.com:org/beta.git".to_string(),
-                },
-            ],
-            None,
-            false,
-        )
-        .unwrap();
-
-        let gitignore = fs::read_to_string(workspace_root.join(".gitignore")).unwrap();
-        assert!(gitignore.contains("hooks/\n"));
-        assert_eq!(gitignore.matches("/alpha/\n").count(), 1);
-        assert_eq!(gitignore.matches("/beta/\n").count(), 1);
-    }
-
-    #[test]
-    fn save_workspace_manifest_creates_gitignore_when_missing() {
-        let workspace_root = temp_test_dir("save-manifest-gitignore-create");
-
-        save_workspace_manifest_from_inputs(
-            7,
-            "Workspace",
-            workspace_root.to_str().unwrap(),
-            "",
-            &[RepoEditorRowInput {
-                enabled: true,
-                name: "alpha".to_string(),
-                dir_name: "alpha".to_string(),
-                remote_url: "git@example.com:org/alpha.git".to_string(),
-            }],
-            None,
-            false,
-        )
-        .unwrap();
-
-        let gitignore = fs::read_to_string(workspace_root.join(".gitignore")).unwrap();
-        assert_eq!(gitignore, "/alpha/\n");
+        DIRTY_TEXT_EDITORS.with(|dirty| {
+            dirty.borrow_mut().insert(instance_key.to_string());
+        });
+        let confirm = prepare_text_editor_teardown(&request);
+        assert_eq!(confirm.decision, MzViewTeardownDecision::Confirm);
+        DIRTY_TEXT_EDITORS.with(|dirty| dirty.borrow_mut().clear());
     }
 }
 
