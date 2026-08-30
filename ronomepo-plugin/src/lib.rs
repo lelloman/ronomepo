@@ -1861,7 +1861,7 @@ fn handle_worker_result(result: WorkerResult) {
             workspace_status,
             repository_items,
         } => {
-            let rerun = {
+            let (rerun, prefetch_sort_details) = {
                 let mut app_state = state().lock().expect("state mutex poisoned");
                 mark_full_workspace_scan_completed(&mut app_state, &repository_items);
                 app_state.workspace_status = workspace_status;
@@ -1869,9 +1869,26 @@ fn handle_worker_result(result: WorkerResult) {
                 app_state.repository_items_loading = false;
                 let rerun = app_state.repository_items_refresh_pending;
                 app_state.repository_items_refresh_pending = false;
-                rerun
+                let prefetch_sort_details = match app_state.monitor_view_mode {
+                    MonitorViewMode::Overview => {
+                        app_state.overview_sort_mode == MonitorSortMode::RecentActivity
+                    }
+                    MonitorViewMode::Git => {
+                        app_state.git_sort_mode == MonitorSortMode::RecentActivity
+                    }
+                    MonitorViewMode::Checks => {
+                        app_state.checks_sort_mode == MonitorSortMode::RecentActivity
+                    }
+                    MonitorViewMode::Manifest => {
+                        app_state.manifest_sort_mode == MonitorSortMode::RecentActivity
+                    }
+                };
+                (rerun, prefetch_sort_details)
             };
             sync_watch_manager_from_state();
+            if prefetch_sort_details {
+                prefetch_monitor_sort_details();
+            }
             if rerun {
                 schedule_workspace_scan();
             }
