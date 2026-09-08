@@ -160,6 +160,13 @@ fn main() {
             payload: Vec::new(),
         },
         MenuItemSpec {
+            id: "monorepo-fucina-policy".to_string(),
+            root_id: "monorepo".to_string(),
+            label: "Fucina Policy".to_string(),
+            command_id: "ronomepo.workspace.open_fucina_policy".to_string(),
+            payload: Vec::new(),
+        },
+        MenuItemSpec {
             id: "help-about".to_string(),
             root_id: "help".to_string(),
             label: "About".to_string(),
@@ -195,6 +202,10 @@ fn main() {
         CommandSpec {
             id: "ronomepo.workspace.add_repo".to_string(),
             title: "Add Repo".to_string(),
+        },
+        CommandSpec {
+            id: "ronomepo.workspace.open_fucina_policy".to_string(),
+            title: "Fucina Policy".to_string(),
         },
         CommandSpec {
             id: "ronomepo.workspace.exit".to_string(),

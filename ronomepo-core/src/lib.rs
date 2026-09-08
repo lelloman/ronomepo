@@ -12,6 +12,96 @@ use serde::{Deserialize, Serialize};
 pub const MANIFEST_FILE_NAME: &str = "ronomepo.json";
 pub const REPO_MANIFEST_FILE_NAME: &str = "ronomepo.repo.json";
 pub const REPO_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const FUCINA_POLICY_FILE_NAME: &str = "repos.toml";
+pub const FUCINA_POLICY_SCRIPT_NAME: &str = "fucina_policy.py";
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct FucinaPolicyManifest {
+    pub schema_version: u32,
+    pub repositories: Vec<FucinaRepositoryPolicy>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct FucinaRepositoryPolicy {
+    pub name: String,
+    pub role: String,
+    pub publication: String,
+    pub forgejo: String,
+    pub upstream: Option<String>,
+    pub publication_target: Option<String>,
+    pub mirror_schedule: Option<String>,
+    pub archived: bool,
+    pub backup_required: bool,
+    #[serde(default)]
+    pub backups: Vec<FucinaBackupPolicy>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct FucinaBackupPolicy {
+    pub destination: String,
+    pub mode: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FucinaPolicyAction {
+    Validate,
+    Audit,
+    ConfigurePreview,
+    ConfigureApply,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FucinaPolicyCommandResult {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub fn load_fucina_policy(workspace_root: &Path) -> Result<FucinaPolicyManifest, String> {
+    let path = workspace_root.join(FUCINA_POLICY_FILE_NAME);
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
+    toml::from_str(&raw).map_err(|error| format!("Cannot parse {}: {error}", path.display()))
+}
+
+pub fn run_fucina_policy(
+    workspace_root: &Path,
+    action: FucinaPolicyAction,
+    repositories: &[String],
+) -> Result<FucinaPolicyCommandResult, String> {
+    let script = workspace_root.join(FUCINA_POLICY_SCRIPT_NAME);
+    if !script.is_file() {
+        return Err(format!(
+            "Fucina policy engine not found at {}",
+            script.display()
+        ));
+    }
+
+    let mut command = Command::new("python3");
+    command.current_dir(workspace_root).arg(&script);
+    match action {
+        FucinaPolicyAction::Validate => {
+            command.arg("validate");
+        }
+        FucinaPolicyAction::Audit => {
+            command.arg("audit").args(repositories);
+        }
+        FucinaPolicyAction::ConfigurePreview => {
+            command.arg("configure").args(repositories);
+        }
+        FucinaPolicyAction::ConfigureApply => {
+            command.arg("configure").args(repositories).arg("--apply");
+        }
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("Cannot run {}: {error}", script.display()))?;
+    Ok(FucinaPolicyCommandResult {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceManifest {
@@ -5506,6 +5596,75 @@ mod tests {
             reason: None,
             schedule: None,
         }
+    }
+
+    #[test]
+    fn loads_fucina_policy_for_presentation() {
+        let root = temp_dir_path("fucina-policy");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(FUCINA_POLICY_FILE_NAME),
+            r#"schema_version = 2
+[[repositories]]
+name = "alpha"
+role = "mirror"
+publication = "github-public"
+forgejo = "ssh://git@fucina.homelab:2222/lelloman/alpha.git"
+upstream = "git@github.com:lelloman/alpha.git"
+mirror_schedule = "01:00 UTC"
+archived = false
+backup_required = false
+"#,
+        )
+        .unwrap();
+
+        let manifest = load_fucina_policy(&root).unwrap();
+        assert_eq!(manifest.schema_version, 2);
+        assert_eq!(manifest.repositories.len(), 1);
+        assert_eq!(manifest.repositories[0].role, "mirror");
+        assert_eq!(
+            manifest.repositories[0].upstream.as_deref(),
+            Some("git@github.com:lelloman/alpha.git")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delegates_fucina_actions_to_policy_engine_without_a_shell() {
+        let root = temp_dir_path("fucina-engine");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(FUCINA_POLICY_SCRIPT_NAME),
+            "import sys\nprint('ARGS=' + '|'.join(sys.argv[1:]))\n",
+        )
+        .unwrap();
+
+        let repository = "repo;touch-should-not-run".to_string();
+        let result =
+            run_fucina_policy(&root, FucinaPolicyAction::ConfigureApply, &[repository]).unwrap();
+        assert!(result.success);
+        assert_eq!(
+            result.stdout,
+            "ARGS=configure|repo;touch-should-not-run|--apply"
+        );
+        assert!(!root.join("touch-should-not-run").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reports_fucina_engine_failures_with_output() {
+        let root = temp_dir_path("fucina-engine-failure");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(FUCINA_POLICY_SCRIPT_NAME),
+            "import sys\nprint('unsafe remote', file=sys.stderr)\nraise SystemExit(1)\n",
+        )
+        .unwrap();
+
+        let result = run_fucina_policy(&root, FucinaPolicyAction::Validate, &[]).unwrap();
+        assert!(!result.success);
+        assert_eq!(result.stderr, "unsafe remote");
+        let _ = fs::remove_dir_all(root);
     }
 
     fn attention_test_item(

@@ -43,19 +43,20 @@ use ronomepo_core::{
     capability_next_due_at_epoch_secs, collect_capability_git_snapshot,
     collect_commit_check_report, collect_repository_details, collect_workspace_line_stats,
     current_epoch_secs, default_capability_registry_path, default_manifest_path,
-    default_repo_manifest_path, derive_attention_signals,
-    ensure_commit_check_rules_initialized, format_sync_label, list_repo_artifacts,
-    load_capability_registry, load_manifest, load_repo_manifest, normalize_workspace_root,
-    parse_capability_result_json, plan_capability_action, plan_repo_action, run_workspace_operation,
+    default_repo_manifest_path, derive_attention_signals, ensure_commit_check_rules_initialized,
+    format_sync_label, list_repo_artifacts, load_capability_registry, load_fucina_policy,
+    load_manifest, load_repo_manifest, normalize_workspace_root, parse_capability_result_json,
+    plan_capability_action, plan_repo_action, run_fucina_policy, run_workspace_operation,
     save_capability_registry, save_manifest, save_repo_manifest, scan_repo_manifest,
-    text_capability_result, upsert_capability_state,
-    verify_repo_dependencies_freshness, workspace_summary, AttentionImpact, AttentionKind,
-    AttentionLevel, AttentionSignal, AttentionSource, AttentionUrgency, CapabilityFinding,
-    CapabilityFindingSeverity, CapabilityRegistry, CapabilityResult, CapabilityResultStatus,
-    CapabilityState, CommitCheckRule, CommitCheckRuleEffect, CommitCheckRuleMatcher,
-    CommitCheckRuleScope, OperationEvent, OperationEventKind, OperationKind, PlannedCommand,
-    RepoActionExecutor, RepoManifest, RepoManifestScan, RepoManifestScanState, RepositoryDetails,
-    RepositoryListItem, RepositoryStatus, StandardActionName, WorkspaceManifest, MANIFEST_FILE_NAME,
+    text_capability_result, upsert_capability_state, verify_repo_dependencies_freshness,
+    workspace_summary, AttentionImpact, AttentionKind, AttentionLevel, AttentionSignal,
+    AttentionSource, AttentionUrgency, CapabilityFinding, CapabilityFindingSeverity,
+    CapabilityRegistry, CapabilityResult, CapabilityResultStatus, CapabilityState, CommitCheckRule,
+    CommitCheckRuleEffect, CommitCheckRuleMatcher, CommitCheckRuleScope, FucinaPolicyAction,
+    FucinaPolicyCommandResult, FucinaRepositoryPolicy, OperationEvent, OperationEventKind,
+    OperationKind, PlannedCommand, RepoActionExecutor, RepoManifest, RepoManifestScan,
+    RepoManifestScanState, RepositoryDetails, RepositoryListItem, RepositoryStatus,
+    StandardActionName, WorkspaceManifest, MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -68,7 +69,7 @@ const VIEW_MONOREPO_OVERVIEW: &str = "com.lelloman.ronomepo.monorepo_overview";
 const VIEW_REPO_OVERVIEW: &str = "com.lelloman.ronomepo.repo_overview";
 const VIEW_REPO_MANIFEST_EDITOR: &str = "com.lelloman.ronomepo.repo_manifest_editor";
 const VIEW_COMMIT_CHECK: &str = "com.lelloman.ronomepo.commit_check";
-const VIEW_WORKSPACE_SETTINGS: &str = "com.lelloman.ronomepo.workspace_settings";
+const VIEW_FUCINA_POLICY: &str = "com.lelloman.ronomepo.fucina_policy";
 const VIEW_TEXT_EDITOR: &str = "com.lelloman.ronomepo.text_editor";
 const VIEW_OPERATIONS: &str = "com.lelloman.ronomepo.operations";
 
@@ -170,6 +171,7 @@ const CMD_OPEN_OVERVIEW: &str = "ronomepo.workspace.open_overview";
 const CMD_OPEN_COMMIT_CHECK: &str = "ronomepo.workspace.open_commit_check";
 const CMD_FILTER: &str = "ronomepo.workspace.filter";
 const CMD_ADD_REPO: &str = "ronomepo.workspace.add_repo";
+const CMD_OPEN_FUCINA_POLICY: &str = "ronomepo.workspace.open_fucina_policy";
 const CMD_EXIT: &str = "ronomepo.workspace.exit";
 const CMD_REFRESH_LOGS: &str = "ronomepo.logs.refresh";
 const CMD_CLEAR_LOGS: &str = "ronomepo.logs.clear";
@@ -671,7 +673,7 @@ thread_local! {
     static MONOREPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static REPO_OVERVIEWS: RefCell<Vec<RepoOverviewViewHandle>> = const { RefCell::new(Vec::new()) };
     static COMMIT_CHECK_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
-    static WORKSPACE_SETTINGS_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
+    static FUCINA_POLICY_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_BUFFERS: RefCell<Vec<glib::WeakRef<TextBuffer>>> = const { RefCell::new(Vec::new()) };
     static OPERATION_SUMMARIES: RefCell<Vec<glib::WeakRef<Label>>> = const { RefCell::new(Vec::new()) };
     static OPERATION_FOLLOWERS: RefCell<Vec<OperationFollowHandle>> = const { RefCell::new(Vec::new()) };
@@ -780,7 +782,7 @@ fn current_view_registry_counts() -> (usize, usize, usize, usize, usize, usize, 
     let monorepo_views = MONOREPO_OVERVIEWS.with(|views| views.borrow().len());
     let repo_views = REPO_OVERVIEWS.with(|views| views.borrow().len());
     let commit_check_views = COMMIT_CHECK_VIEWS.with(|views| views.borrow().len());
-    let workspace_settings_views = WORKSPACE_SETTINGS_VIEWS.with(|views| views.borrow().len());
+    let workspace_settings_views = FUCINA_POLICY_VIEWS.with(|views| views.borrow().len());
     let operation_buffers = OPERATION_BUFFERS.with(|buffers| buffers.borrow().len());
     let operation_summaries = OPERATION_SUMMARIES.with(|labels| labels.borrow().len());
     (
@@ -1132,6 +1134,10 @@ impl Plugin for RonomepoPlugin {
             CommandSpec::new(PLUGIN_ID, CMD_ADD_REPO, "Add Repo").with_handler(command_add_repo),
         )?;
         host.register_command(
+            CommandSpec::new(PLUGIN_ID, CMD_OPEN_FUCINA_POLICY, "Fucina Policy")
+                .with_handler(command_open_fucina_policy),
+        )?;
+        host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_EXIT, "Exit").with_handler(command_exit),
         )?;
         host.register_command(
@@ -1187,8 +1193,8 @@ impl Plugin for RonomepoPlugin {
         ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
-            VIEW_WORKSPACE_SETTINGS,
-            "Workspace Settings",
+            VIEW_FUCINA_POLICY,
+            "Fucina Policy",
             MzViewPlacement::Workbench,
             create_workspace_settings_view,
         ))?;
@@ -1419,6 +1425,22 @@ extern "C" fn command_open_commit_check(
 }
 
 extern "C" fn command_add_repo(
+    _payload: maruzzella_sdk::ffi::MzBytes,
+) -> maruzzella_sdk::ffi::MzStatus {
+    match open_workspace_settings_tab() {
+        Ok(()) => {
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::OK
+        }
+        Err(message) => {
+            append_log(message);
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
+        }
+    }
+}
+
+extern "C" fn command_open_fucina_policy(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
     match open_workspace_settings_tab() {
@@ -2152,7 +2174,7 @@ fn refresh_commit_check_views_now() {
 }
 
 fn refresh_workspace_settings_views(snapshot: &StateSnapshot) {
-    WORKSPACE_SETTINGS_VIEWS.with(|views| {
+    FUCINA_POLICY_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
         views.retain(|handle| match handle.root.upgrade() {
             Some(root) => {
@@ -2260,28 +2282,38 @@ fn open_workspace_settings_tab() -> Result<(), String> {
     let host_ptr = current_host_ptr();
     if host_ptr.is_null() {
         return Err(
-            "Cannot open Workspace Settings because the Maruzzella host handle is unavailable."
+            "Cannot open Fucina Policy because the Maruzzella host handle is unavailable."
                 .to_string(),
         );
     }
 
     let host = unsafe { HostApi::from_raw(&*host_ptr) };
-    let request = OpenViewRequest::new(
-        PLUGIN_ID,
-        VIEW_WORKSPACE_SETTINGS,
-        MzViewPlacement::Workbench,
-    );
+    let request = OpenViewRequest::new(PLUGIN_ID, VIEW_FUCINA_POLICY, MzViewPlacement::Workbench);
     match host.open_view(&request) {
         Ok(MzViewOpenDisposition::Opened) => {
-            append_log("Opened Workspace Settings.".to_string());
+            append_log("Opened Fucina Policy.".to_string());
             Ok(())
         }
         Ok(MzViewOpenDisposition::FocusedExisting) => {
-            append_log("Focused existing Workspace Settings tab.".to_string());
+            append_log("Focused existing Fucina Policy tab.".to_string());
             Ok(())
         }
-        Err(status) => Err(format!("Failed to open Workspace Settings: {status:?}")),
+        Err(status) => Err(format!("Failed to open Fucina Policy: {status:?}")),
     }
+}
+
+fn open_operations_panel() -> Result<(), String> {
+    let host_ptr = current_host_ptr();
+    if host_ptr.is_null() {
+        return Err(
+            "Cannot open Operations because the Maruzzella host handle is unavailable.".to_string(),
+        );
+    }
+    let host = unsafe { HostApi::from_raw(&*host_ptr) };
+    let request = OpenViewRequest::new(PLUGIN_ID, VIEW_OPERATIONS, MzViewPlacement::BottomPanel);
+    host.open_view(&request)
+        .map(|_| ())
+        .map_err(|status| format!("Failed to open Operations: {status:?}"))
 }
 
 #[derive(Clone)]
@@ -5967,6 +5999,7 @@ extern "C" fn create_monorepo_overview_view(
     remember_host_ptr(host);
 
     let root = GtkBox::new(Orientation::Vertical, 18);
+    root.set_vexpand(true);
     root.set_margin_top(24);
     root.set_margin_bottom(24);
     root.set_margin_start(24);
@@ -6894,7 +6927,7 @@ extern "C" fn create_workspace_settings_view(
 
     let root_ref = glib::WeakRef::new();
     root_ref.set(Some(&root));
-    WORKSPACE_SETTINGS_VIEWS.with(|views| {
+    FUCINA_POLICY_VIEWS.with(|views| {
         views.borrow_mut().push(ContainerViewHandle {
             root: root_ref,
             host_ptr: host as usize,
@@ -6909,10 +6942,374 @@ extern "C" fn create_workspace_settings_view(
 
 fn render_workspace_settings_into(
     root: &GtkBox,
-    _snapshot: &StateSnapshot,
+    snapshot: &StateSnapshot,
     _host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
     clear_box(root);
+    let policy_root =
+        fucina_policy_root(&snapshot.workspace_root, snapshot.manifest_path.as_deref());
+
+    let heading = Label::new(Some("Fucina repository policy"));
+    heading.set_xalign(0.0);
+    heading.add_css_class("title-2");
+    root.append(&heading);
+
+    let explanation = Label::new(Some(
+        "repos.toml is authoritative. Ronomepo delegates validation, audits, and safe remote configuration to fucina_policy.py.",
+    ));
+    explanation.set_xalign(0.0);
+    explanation.set_wrap(true);
+    root.append(&explanation);
+
+    let action_status = Label::new(Some("Ready · detailed results appear in Operations"));
+    action_status.set_xalign(0.0);
+    action_status.set_wrap(true);
+
+    match load_fucina_policy(&policy_root) {
+        Ok(policy) => {
+            let summary = Label::new(Some(&format!(
+                "Schema {} · {} repositories",
+                policy.schema_version,
+                policy.repositories.len()
+            )));
+            summary.set_xalign(0.0);
+            summary.add_css_class("title-4");
+            root.append(&summary);
+
+            let actions = GtkBox::new(Orientation::Horizontal, 8);
+            let validate = clickable_button_with_label("Validate");
+            let audit = clickable_button_with_label("Audit all");
+            let preview = clickable_button_with_label("Preview configuration");
+            let apply = clickable_button_with_label("Apply configuration…");
+            actions.append(&validate);
+            actions.append(&audit);
+            actions.append(&preview);
+            actions.append(&apply);
+            root.append(&actions);
+
+            connect_fucina_action(
+                &validate,
+                policy_root.clone(),
+                FucinaPolicyAction::Validate,
+                Vec::new(),
+                action_status.clone(),
+            );
+            connect_fucina_action(
+                &audit,
+                policy_root.clone(),
+                FucinaPolicyAction::Audit,
+                Vec::new(),
+                action_status.clone(),
+            );
+            connect_fucina_action(
+                &preview,
+                policy_root.clone(),
+                FucinaPolicyAction::ConfigurePreview,
+                Vec::new(),
+                action_status.clone(),
+            );
+            connect_fucina_apply(&apply, policy_root.clone(), action_status.clone());
+            root.append(&action_status);
+
+            let repository_list = GtkBox::new(Orientation::Vertical, 6);
+            for repository in &policy.repositories {
+                repository_list.append(&fucina_repository_row(
+                    repository,
+                    &policy_root,
+                    &action_status,
+                ));
+            }
+            let repositories = ScrolledWindow::builder()
+                .hscrollbar_policy(PolicyType::Automatic)
+                .vscrollbar_policy(PolicyType::Automatic)
+                .min_content_height(280)
+                .vexpand(true)
+                .child(&repository_list)
+                .build();
+            root.append(&repositories);
+        }
+        Err(message) => {
+            let error = Label::new(Some(&message));
+            error.set_xalign(0.0);
+            error.set_wrap(true);
+            error.add_css_class("error");
+            root.append(&error);
+        }
+    }
+}
+
+fn fucina_policy_root(workspace_root: &Path, manifest_path: Option<&Path>) -> PathBuf {
+    if let Some(manifest_directory) = manifest_path.and_then(Path::parent) {
+        if manifest_directory.join("repos.toml").is_file()
+            && manifest_directory.join("fucina_policy.py").is_file()
+        {
+            return manifest_directory.to_path_buf();
+        }
+    }
+    workspace_root.to_path_buf()
+}
+
+fn fucina_repository_row(
+    repository: &FucinaRepositoryPolicy,
+    workspace_root: &Path,
+    action_status: &Label,
+) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 12);
+    row.add_css_class("card");
+    row.set_margin_top(4);
+    row.set_margin_bottom(4);
+    row.set_margin_start(4);
+    row.set_margin_end(4);
+
+    let details = GtkBox::new(Orientation::Vertical, 2);
+    details.set_hexpand(true);
+    let title = Label::new(Some(&format!(
+        "{} · {} · {}{}",
+        repository.name,
+        repository.role,
+        repository.publication,
+        if repository.archived {
+            " · archived"
+        } else {
+            ""
+        }
+    )));
+    title.set_xalign(0.0);
+    title.add_css_class("title-5");
+    details.append(&title);
+    let remotes = Label::new(Some(&fucina_repository_remotes(repository)));
+    remotes.set_xalign(0.0);
+    remotes.set_selectable(true);
+    remotes.set_wrap(true);
+    details.append(&remotes);
+    let backup = Label::new(Some(&fucina_repository_backup(repository)));
+    backup.set_xalign(0.0);
+    backup.set_wrap(true);
+    if repository.backup_required && repository.backups.is_empty() {
+        backup.add_css_class("warning");
+    }
+    details.append(&backup);
+    row.append(&details);
+
+    let audit = clickable_button_with_label("Audit");
+    connect_fucina_action(
+        &audit,
+        workspace_root.to_path_buf(),
+        FucinaPolicyAction::Audit,
+        vec![repository.name.clone()],
+        action_status.clone(),
+    );
+    row.append(&audit);
+    let preview = clickable_button_with_label("Preview");
+    connect_fucina_action(
+        &preview,
+        workspace_root.to_path_buf(),
+        FucinaPolicyAction::ConfigurePreview,
+        vec![repository.name.clone()],
+        action_status.clone(),
+    );
+    row.append(&preview);
+    row
+}
+
+fn fucina_repository_remotes(repository: &FucinaRepositoryPolicy) -> String {
+    let mut values = vec![format!("Fucina: {}", repository.forgejo)];
+    if let Some(upstream) = &repository.upstream {
+        values.push(format!("Upstream: {upstream}"));
+    }
+    if let Some(target) = &repository.publication_target {
+        values.push(format!("Publication: {target}"));
+    }
+    if let Some(schedule) = &repository.mirror_schedule {
+        values.push(format!("Pull schedule: {schedule}"));
+    }
+    values.join(" · ")
+}
+
+fn fucina_repository_backup(repository: &FucinaRepositoryPolicy) -> String {
+    if repository.backups.is_empty() {
+        return if repository.backup_required {
+            "Backup required · destination unresolved".to_string()
+        } else {
+            "Backup not required".to_string()
+        };
+    }
+    repository
+        .backups
+        .iter()
+        .map(|backup| format!("Backup {}: {}", backup.mode, backup.destination))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn connect_fucina_action(
+    button: &Button,
+    workspace_root: PathBuf,
+    action: FucinaPolicyAction,
+    repositories: Vec<String>,
+    action_status: Label,
+) {
+    button.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        action_status.set_text("Running · see Operations for details");
+        let button = button.clone();
+        let action_status = action_status.clone();
+        run_fucina_action_async(
+            workspace_root.clone(),
+            action,
+            repositories.clone(),
+            move |result| {
+                button.set_sensitive(true);
+                present_fucina_result(action, result, &action_status);
+            },
+        );
+    });
+}
+
+fn connect_fucina_apply(button: &Button, workspace_root: PathBuf, action_status: Label) {
+    button.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        action_status.set_text("Previewing · see Operations for details");
+        let button = button.clone();
+        let action_status = action_status.clone();
+        let workspace_root = workspace_root.clone();
+        run_fucina_action_async(
+            workspace_root.clone(),
+            FucinaPolicyAction::ConfigurePreview,
+            Vec::new(),
+            move |preview| {
+                button.set_sensitive(true);
+                present_fucina_result(
+                    FucinaPolicyAction::ConfigurePreview,
+                    preview.clone(),
+                    &action_status,
+                );
+                if fucina_preview_allows_confirmation(&preview) {
+                    show_fucina_apply_confirmation(workspace_root.clone(), action_status.clone());
+                }
+            },
+        );
+    });
+}
+
+fn fucina_preview_allows_confirmation(preview: &Result<FucinaPolicyCommandResult, String>) -> bool {
+    matches!(preview, Ok(result) if result.success)
+}
+
+fn show_fucina_apply_confirmation(workspace_root: PathBuf, action_status: Label) {
+    let dialog = Dialog::builder()
+        .title("Apply Fucina configuration?")
+        .modal(true)
+        .build();
+    dialog.add_button("Cancel", ResponseType::Cancel);
+    let apply = dialog.add_button("Apply", ResponseType::Accept);
+    apply.add_css_class("destructive-action");
+    dialog.set_default_response(ResponseType::Cancel);
+    let content = Label::new(Some(
+        "The preview succeeded. Apply only the safe changes accepted by the policy engine? Unexpected remotes and unresolved backup gates will still be refused.",
+    ));
+    content.set_wrap(true);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    dialog.content_area().append(&content);
+    dialog.connect_response(move |dialog, response| {
+        dialog.close();
+        if response != ResponseType::Accept {
+            return;
+        }
+        action_status.set_text("Applying · see Operations for details");
+        let action_status = action_status.clone();
+        run_fucina_action_async(
+            workspace_root.clone(),
+            FucinaPolicyAction::ConfigureApply,
+            Vec::new(),
+            move |result| {
+                present_fucina_result(FucinaPolicyAction::ConfigureApply, result, &action_status)
+            },
+        );
+    });
+    dialog.present();
+}
+
+fn run_fucina_action_async(
+    workspace_root: PathBuf,
+    action: FucinaPolicyAction,
+    repositories: Vec<String>,
+    completion: impl Fn(Result<FucinaPolicyCommandResult, String>) + 'static,
+) {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(run_fucina_policy(&workspace_root, action, &repositories));
+    });
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        match receiver.try_recv() {
+            Ok(result) => {
+                completion(result);
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                completion(Err("Fucina policy worker stopped unexpectedly".to_string()));
+                glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn present_fucina_result(
+    action: FucinaPolicyAction,
+    result: Result<FucinaPolicyCommandResult, String>,
+    action_status: &Label,
+) {
+    let successful = matches!(&result, Ok(result) if result.success);
+    let label = fucina_action_label(action);
+    let status = if successful {
+        format!("{label} succeeded · details in Operations")
+    } else {
+        format!("{label} refused or failed · details in Operations")
+    };
+    action_status.set_text(&status);
+    append_log(format!(
+        "Fucina {label}\n{}",
+        fucina_command_result_text(result)
+    ));
+    refresh_log_surfaces();
+    if let Err(message) = open_operations_panel() {
+        append_log(message);
+        refresh_log_surfaces();
+    }
+}
+
+fn fucina_action_label(action: FucinaPolicyAction) -> &'static str {
+    match action {
+        FucinaPolicyAction::Validate => "validation",
+        FucinaPolicyAction::Audit => "audit",
+        FucinaPolicyAction::ConfigurePreview => "configuration preview",
+        FucinaPolicyAction::ConfigureApply => "configuration apply",
+    }
+}
+
+fn fucina_command_result_text(result: Result<FucinaPolicyCommandResult, String>) -> String {
+    match result {
+        Err(message) => format!("ERROR\n{message}"),
+        Ok(result) => {
+            let status = if result.success {
+                "SUCCESS"
+            } else {
+                "REFUSED / FAILED"
+            };
+            let mut parts = vec![status.to_string()];
+            if !result.stdout.is_empty() {
+                parts.push(result.stdout);
+            }
+            if !result.stderr.is_empty() {
+                parts.push(format!("stderr:\n{}", result.stderr));
+            }
+            parts.join("\n\n")
+        }
+    }
 }
 
 fn labeled_field(label: &str, widget: &impl IsA<gtk::Widget>) -> GtkBox {
@@ -8635,7 +9032,7 @@ fn monorepo_selection_actions(
     ));
     scope_row.append(&clear_selection_button(selected_count));
 
-    let settings = clickable_button_with_label("Workspace Settings");
+    let settings = clickable_button_with_label("Fucina Policy");
     settings.connect_clicked(move |_| {
         if let Err(message) = open_workspace_settings_tab() {
             append_log(message);
@@ -10601,6 +10998,74 @@ mod tests {
         assert_eq!(descriptor.id, PLUGIN_ID);
         assert_eq!(descriptor.dependencies.len(), 1);
         assert_eq!(descriptor.dependencies[0].plugin_id, "maruzzella.base");
+    }
+
+    #[test]
+    fn fucina_presentation_exposes_policy_and_unresolved_backup_gate() {
+        let repository = FucinaRepositoryPolicy {
+            name: "private-repo".to_string(),
+            role: "primary".to_string(),
+            publication: "local-only".to_string(),
+            forgejo: "ssh://git@fucina.homelab:2222/lelloman/private-repo.git".to_string(),
+            upstream: None,
+            publication_target: None,
+            mirror_schedule: None,
+            archived: false,
+            backup_required: true,
+            backups: Vec::new(),
+        };
+
+        assert!(fucina_repository_remotes(&repository).contains("Fucina:"));
+        assert_eq!(
+            fucina_repository_backup(&repository),
+            "Backup required · destination unresolved"
+        );
+    }
+
+    #[test]
+    fn fucina_failure_output_is_actionable() {
+        let text = fucina_command_result_text(Ok(FucinaPolicyCommandResult {
+            success: false,
+            stdout: "REFUSE private-repo".to_string(),
+            stderr: "required backup destination unresolved".to_string(),
+        }));
+        assert!(text.contains("REFUSED / FAILED"));
+        assert!(text.contains("REFUSE private-repo"));
+        assert!(text.contains("required backup destination unresolved"));
+    }
+
+    #[test]
+    fn fucina_apply_confirmation_requires_successful_preview() {
+        let success = Ok(FucinaPolicyCommandResult {
+            success: true,
+            stdout: "PLAN alpha".to_string(),
+            stderr: String::new(),
+        });
+        let refusal = Ok(FucinaPolicyCommandResult {
+            success: false,
+            stdout: "REFUSE alpha".to_string(),
+            stderr: String::new(),
+        });
+        assert!(fucina_preview_allows_confirmation(&success));
+        assert!(!fucina_preview_allows_confirmation(&refusal));
+        assert!(!fucina_preview_allows_confirmation(&Err(
+            "worker failed".to_string()
+        )));
+    }
+
+    #[test]
+    fn fucina_policy_is_resolved_from_manifest_directory_not_relative_root() {
+        let workspace = temp_test_dir("fucina-relative-root");
+        let configured_root = workspace.join("..");
+        let manifest = workspace.join("ronomepo.json");
+        fs::write(&manifest, "{}").unwrap();
+        fs::write(workspace.join("repos.toml"), "schema_version = 2").unwrap();
+        fs::write(workspace.join("fucina_policy.py"), "# policy engine").unwrap();
+
+        assert_eq!(
+            fucina_policy_root(&configured_root, Some(&manifest)),
+            workspace
+        );
     }
 
     #[test]

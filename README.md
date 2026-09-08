@@ -147,6 +147,17 @@ Core surfaces:
 
 The most important view is a sortable, filterable repository table with compact Git state summaries and obvious batch actions.
 
+### Fucina policy control surface
+
+When the workspace contains `repos.toml` and `fucina_policy.py`, choose
+**Monorepo → Fucina Policy** to inspect every repository's role, publication
+policy, declared remotes, lifecycle state, and backup policy. Validation,
+remote/ref audits, and configuration previews run through the policy engine.
+Applying configuration always follows a successful preview and an explicit
+confirmation; the engine remains responsible for every safety decision. The
+policy table fills the workbench tab while detailed command output is kept in
+the Operations bottom panel.
+
 ## Integration With Maruzzella
 
 Ronomepo should use Maruzzella through its plugin runtime and shell API:
