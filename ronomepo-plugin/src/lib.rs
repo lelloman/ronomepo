@@ -3407,6 +3407,15 @@ fn mark_repo_stale(app_state: &mut AppState, repo_id: &str) -> bool {
     !was_stale
 }
 
+fn mark_repos_stale(app_state: &mut AppState, repo_ids: &HashSet<String>) -> bool {
+    let mut any_marked = false;
+    for repo_id in repo_ids {
+        // Every repository must be invalidated, even after one needs a rescan.
+        any_marked |= mark_repo_stale(app_state, repo_id);
+    }
+    any_marked
+}
+
 fn schedule_pending_local_rescans() {
     let scheduled = {
         let app_state = state().lock().expect("state mutex poisoned");
@@ -3670,7 +3679,12 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
     let repos = manifest
         .repos
         .iter()
-        .map(|repo| (repo.id.clone(), workspace_root.join(&repo.dir_name)))
+        .map(|repo| {
+            (
+                repo.id.clone(),
+                normalized_watch_path(&workspace_root.join(&repo.dir_name)),
+            )
+        })
         .filter(|(_, path)| path.exists())
         .collect::<Vec<_>>();
 
@@ -3826,9 +3840,7 @@ fn handle_watch_paths(paths: Vec<PathBuf>) {
             }
         }
 
-        let any_marked = touched
-            .iter()
-            .any(|repo_id| mark_repo_stale(&mut app_state, repo_id));
+        let any_marked = mark_repos_stale(&mut app_state, &touched);
         (workspace_touched, any_marked)
     };
 
@@ -3887,7 +3899,7 @@ fn repo_id_for_watch_path(manifest: &WorkspaceManifest, path: &Path) -> Option<S
         .repos
         .iter()
         .filter_map(|repo| {
-            let repo_root = workspace_root.join(&repo.dir_name);
+            let repo_root = normalized_watch_path(&workspace_root.join(&repo.dir_name));
             let relative = path.strip_prefix(&repo_root).ok()?;
             if !watch_path_is_relevant(relative) {
                 return None;
@@ -11216,6 +11228,54 @@ mod tests {
             repo_id_for_watch_path(&manifest, &repo_event_path).as_deref(),
             Some("maruzzella")
         );
+    }
+
+    #[test]
+    fn sibling_repository_matches_absolute_watch_paths_even_after_file_deletion() {
+        let workspace_root = temp_test_dir("sibling-watch");
+        let manifest = WorkspaceManifest {
+            name: "Workspace".to_string(),
+            root: workspace_root.join("workspace"),
+            repos: vec![RepositoryEntry {
+                id: "simple-ai".to_string(),
+                name: "simple-ai".to_string(),
+                dir_name: "../simple-ai".to_string(),
+                remote_url: String::new(),
+                enabled: true,
+            }],
+            shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
+        };
+
+        for relative in [".git/index", "deleted-untracked-file"] {
+            let event_path = workspace_root.join("simple-ai").join(relative);
+            assert!(!event_path.exists());
+            assert_eq!(
+                repo_id_for_watch_path(&manifest, &event_path).as_deref(),
+                Some("simple-ai")
+            );
+        }
+    }
+
+    #[test]
+    fn watch_batch_invalidates_every_repository() {
+        let mut app_state = AppState::default();
+        let touched = ["alpha", "beta", "gamma"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+
+        assert!(mark_repos_stale(&mut app_state, &touched));
+        for repo_id in &touched {
+            assert!(app_state.repo_runtime[repo_id].needs_rescan());
+            assert_eq!(app_state.repo_runtime[repo_id].invalidation_seq, 1);
+        }
+
+        // Further events still invalidate every repo while scans are pending.
+        assert!(!mark_repos_stale(&mut app_state, &touched));
+        for repo_id in &touched {
+            assert_eq!(app_state.repo_runtime[repo_id].invalidation_seq, 2);
+        }
     }
 
     #[test]
