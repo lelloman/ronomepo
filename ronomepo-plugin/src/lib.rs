@@ -920,7 +920,7 @@ fn worker_loop(receiver: Arc<Mutex<mpsc::Receiver<QueuedJob>>>) {
 
 fn run_worker_job(queued_job: QueuedJob) {
     let key = queued_job.key.clone();
-    match queued_job.job {
+    let result = match queued_job.job {
         WorkerJob::OperationBatch {
             manifest,
             selected_repo_ids,
@@ -935,6 +935,7 @@ fn run_worker_job(queued_job: QueuedJob) {
                 main_context
                     .invoke(move || handle_operation_event(batch_id, operation, manifest, event));
             });
+            None
         }
         WorkerJob::WorkspaceScan {
             workspace_root,
@@ -945,19 +946,19 @@ fn run_worker_job(queued_job: QueuedJob) {
                 .as_ref()
                 .map(build_repository_list)
                 .unwrap_or_default();
-            dispatch_worker_result(WorkerResult::WorkspaceScanCompleted {
+            Some(WorkerResult::WorkspaceScanCompleted {
                 workspace_status,
                 repository_items,
-            });
+            })
         }
         WorkerJob::WorkspaceRootStatusRefresh { workspace_root } => {
             let workspace_status = ronomepo_core::collect_repository_status(&workspace_root);
-            dispatch_worker_result(WorkerResult::WorkspaceRootStatusRefreshed { workspace_status });
+            Some(WorkerResult::WorkspaceRootStatusRefreshed { workspace_status })
         }
         WorkerJob::RepositoryStatusRefresh { mut item } => {
             item.status = ronomepo_core::collect_repository_status(&item.status.repo_path);
             item.repo_manifest = Some(scan_repo_manifest(&item.status.repo_path));
-            dispatch_worker_result(WorkerResult::RepositoryStatusRefreshed { item });
+            Some(WorkerResult::RepositoryStatusRefreshed { item })
         }
         WorkerJob::RepositoryRemoteFetch {
             repo_id,
@@ -965,31 +966,31 @@ fn run_worker_job(queued_job: QueuedJob) {
             repo_path,
         } => {
             let result = fetch_repository_remote(&repo_path);
-            dispatch_worker_result(WorkerResult::RepositoryRemoteFetchCompleted {
+            Some(WorkerResult::RepositoryRemoteFetchCompleted {
                 repo_id,
                 repo_name,
                 result,
-            });
+            })
         }
         WorkerJob::RepoDetailsLoad { repo_id, repo_path } => {
             let details = collect_repository_details(&repo_path);
-            dispatch_worker_result(WorkerResult::RepoDetailsLoaded { repo_id, details });
+            Some(WorkerResult::RepoDetailsLoaded { repo_id, details })
         }
         WorkerJob::WatchManagerSync { manifest, sync_seq } => {
             let result = manifest
                 .map(|manifest| build_watch_manager(&manifest))
                 .transpose();
-            dispatch_worker_result(WorkerResult::WatchManagerSyncCompleted { sync_seq, result });
+            Some(WorkerResult::WatchManagerSyncCompleted { sync_seq, result })
         }
         WorkerJob::RefreshWorkspace {
             workspace_root,
             status_sender,
         } => {
             let result = load_workspace_manifest(&workspace_root);
-            dispatch_worker_result(WorkerResult::RefreshWorkspaceCompleted {
+            Some(WorkerResult::RefreshWorkspaceCompleted {
                 result,
                 status_sender,
-            });
+            })
         }
         WorkerJob::HistoryReport {
             manifest,
@@ -997,14 +998,14 @@ fn run_worker_job(queued_job: QueuedJob) {
             num_commits,
         } => {
             let result = build_history_report(&manifest, &selected_repo_ids, num_commits);
-            dispatch_worker_result(WorkerResult::HistoryReportCompleted { result });
+            Some(WorkerResult::HistoryReportCompleted { result })
         }
         WorkerJob::LineStats {
             manifest,
             since_date,
         } => {
             let result = build_line_stats_report(&manifest, since_date.as_deref());
-            dispatch_worker_result(WorkerResult::LineStatsCompleted { result });
+            Some(WorkerResult::LineStatsCompleted { result })
         }
         WorkerJob::CapabilityChecks {
             workspace_root,
@@ -1012,11 +1013,12 @@ fn run_worker_job(queued_job: QueuedJob) {
             run_reason,
         } => {
             let result = run_capability_checks(&workspace_root, targets, &run_reason);
-            dispatch_worker_result(WorkerResult::CapabilityChecksCompleted { result });
+            Some(WorkerResult::CapabilityChecksCompleted { result })
         }
         WorkerJob::EditorLoad { path, reply } => {
             let result = fs::read_to_string(&path).map_err(|error| error.to_string());
             let _ = reply.send(EditorLoadMessage { path, result });
+            None
         }
         WorkerJob::EditorSave {
             path,
@@ -1025,16 +1027,31 @@ fn run_worker_job(queued_job: QueuedJob) {
         } => {
             let result = fs::write(&path, content).map_err(|error| error.to_string());
             let _ = reply.send(EditorSaveMessage { path, result });
+            None
         }
-    }
+    };
 
+    complete_worker_job(&executor().in_flight, key, || {
+        if let Some(result) = result {
+            dispatch_worker_result(result);
+        }
+    });
+}
+
+fn complete_worker_job(
+    in_flight: &Mutex<HashSet<JobKey>>,
+    key: Option<JobKey>,
+    publish_result: impl FnOnce(),
+) {
+    // Completion may immediately schedule another job with the same key. Release
+    // the key (and mutex) before making the result visible to the main thread.
     if let Some(key) = key {
-        let mut in_flight = executor()
-            .in_flight
+        in_flight
             .lock()
-            .expect("executor mutex poisoned");
-        in_flight.remove(&key);
+            .expect("executor mutex poisoned")
+            .remove(&key);
     }
+    publish_result();
 }
 
 fn dispatch_worker_result(result: WorkerResult) {
@@ -11276,6 +11293,23 @@ mod tests {
         for repo_id in &touched {
             assert_eq!(app_state.repo_runtime[repo_id].invalidation_seq, 2);
         }
+    }
+
+    #[test]
+    fn worker_completion_allows_immediate_follow_up_with_same_key() {
+        let key = JobKey::RepoStatus("alpha".to_string());
+        let in_flight = Mutex::new(HashSet::from([key.clone()]));
+
+        complete_worker_job(&in_flight, Some(key.clone()), || {
+            // Simulate the UI consuming completion before the worker returns.
+            // The follow-up must be accepted, and the mutex must be unlocked.
+            let mut jobs = in_flight.try_lock().expect("completion holds job mutex");
+            assert!(
+                jobs.insert(key.clone()),
+                "follow-up scan was coalesced away"
+            );
+        });
+        assert!(in_flight.lock().unwrap().contains(&key));
     }
 
     #[test]
