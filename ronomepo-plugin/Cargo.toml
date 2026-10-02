@@ -15,7 +15,7 @@ path = "src/lib.rs"
 gtk = { package = "gtk4", version = "0.9" }
 libc = "0.2"
 maruzzella_sdk = "0.1.2"
-notify = "6"
+notify = "8.2"
 ronomepo-core = { path = "../ronomepo-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

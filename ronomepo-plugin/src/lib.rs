@@ -3741,7 +3741,7 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
 }
 
 fn create_watch_backend() -> Result<(WatchBackend, WatchBackendKind), String> {
-    let config = NotifyConfig::default();
+    let config = repository_watch_config();
     match RecommendedWatcher::new(dispatch_watch_event_result, config) {
         Ok(watcher) => Ok((
             WatchBackend::Recommended(watcher),
@@ -3754,6 +3754,12 @@ fn create_watch_backend() -> Result<(WatchBackend, WatchBackendKind), String> {
         .map(|watcher| (WatchBackend::Poll(watcher), WatchBackendKind::Poll))
         .map_err(|error| error.to_string()),
     }
+}
+
+fn repository_watch_config() -> NotifyConfig {
+    // Repository symlinks (for example Wine's z: -> /) must not make
+    // recursive registration or polling traverse unrelated filesystem trees.
+    NotifyConfig::default().with_follow_symlinks(false)
 }
 
 fn watch_backend_mut(backend: &mut WatchBackend) -> &mut dyn Watcher {
@@ -11169,6 +11175,63 @@ mod tests {
         assert!(!watch_path_is_relevant(Path::new("src/lib.rs.swp")));
         assert!(watch_path_is_relevant(Path::new(".git/HEAD")));
         assert!(watch_path_is_relevant(Path::new("src/lib.rs")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_watchers_skip_symlink_targets_and_still_report_local_changes() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::sync::mpsc;
+
+        for polling in [false, true] {
+            let root = temp_test_dir(if polling {
+                "poll-symlinks"
+            } else {
+                "native-symlinks"
+            });
+            let repo = root.join("repo");
+            let blocked = root.join("blocked");
+            fs::create_dir_all(repo.join("src")).unwrap();
+            fs::create_dir(&blocked).unwrap();
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+            symlink(&blocked, repo.join("z:")).unwrap();
+            symlink(&repo, repo.join("loop")).unwrap();
+            symlink(root.join("missing"), repo.join("broken")).unwrap();
+
+            let (tx, rx) = mpsc::channel();
+            let config = repository_watch_config();
+            let mut backend = if polling {
+                WatchBackend::Poll(PollWatcher::new(tx, config.with_manual_polling()).unwrap())
+            } else {
+                WatchBackend::Recommended(RecommendedWatcher::new(tx, config).unwrap())
+            };
+            let registration =
+                watch_backend_mut(&mut backend).watch(&repo, RecursiveMode::Recursive);
+            // Restore permissions even if registration failed, so cleanup is possible.
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+            registration.unwrap();
+            for event in rx.try_iter() {
+                event.expect("symlinks must not cause watcher errors");
+            }
+
+            let file = repo.join("src/new.rs");
+            fs::write(&file, "fn main() {}\n").unwrap();
+            if let WatchBackend::Poll(watcher) = &backend {
+                watcher.poll().unwrap();
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let event = rx
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .expect("local file creation must still be reported")
+                    .expect("symlinks must not cause watcher errors");
+                if event.paths.contains(&file) {
+                    break;
+                }
+            }
+            drop(backend);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
