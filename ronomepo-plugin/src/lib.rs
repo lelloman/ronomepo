@@ -1917,7 +1917,7 @@ fn handle_worker_result(result: WorkerResult) {
             };
             if refresh_path.is_some() {
                 if let Some(item) = repository_item_from_state(&repo_id) {
-                    schedule_repository_status_refresh(&item);
+                    request_repository_status_refresh(&item);
                 }
             }
             append_log(message);
@@ -2078,7 +2078,7 @@ fn schedule_refresh_for_operation_event(manifest: &WorkspaceManifest, event: &Op
         },
         repo_manifest: Some(scan_repo_manifest(&manifest.root.join(&repo.dir_name))),
     };
-    schedule_repository_status_refresh(&item);
+    request_repository_status_refresh(&item);
 }
 
 fn refresh_views() {
@@ -3424,6 +3424,35 @@ fn mark_repo_stale(app_state: &mut AppState, repo_id: &str) -> bool {
     !was_stale
 }
 
+/// Invalidates the repo and claims a scan for the new invalidation, unless one is
+/// already in flight (its completion then issues a follow-up scan).
+fn begin_repo_status_refresh(app_state: &mut AppState, repo_id: &str) -> bool {
+    mark_repo_stale(app_state, repo_id);
+    let runtime = app_state
+        .repo_runtime
+        .get_mut(repo_id)
+        .expect("mark_repo_stale creates runtime state");
+    if runtime.local_refresh_in_flight {
+        return false;
+    }
+    runtime.local_refresh_in_flight = true;
+    runtime.scheduled_scan_seq = runtime.invalidation_seq;
+    true
+}
+
+/// Status refreshes must go through the invalidation sequence: submitting a
+/// job directly would let a later watcher scan coalesce into it and record
+/// state read before the change as up to date.
+fn request_repository_status_refresh(item: &RepositoryListItem) {
+    let should_submit = {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        begin_repo_status_refresh(&mut app_state, &item.id)
+    };
+    if should_submit {
+        schedule_repository_status_refresh(item);
+    }
+}
+
 fn mark_repos_stale(app_state: &mut AppState, repo_ids: &HashSet<String>) -> bool {
     let mut any_marked = false;
     for repo_id in repo_ids {
@@ -3773,7 +3802,10 @@ fn dispatch_watch_event_result(event: notify::Result<notify::Event>) {
     let main_context = glib::MainContext::default();
     match event {
         Ok(event) => {
-            if event.paths.is_empty() {
+            // The backend dropped events (e.g. inotify queue overflow) and
+            // reports it as a path-less Rescan event.
+            let needs_rescan = event.need_rescan();
+            if event.paths.is_empty() && !needs_rescan {
                 return;
             }
             WATCH_EVENTS_RECEIVED.fetch_add(1, Ordering::Relaxed);
@@ -3781,7 +3813,10 @@ fn dispatch_watch_event_result(event: notify::Result<notify::Event>) {
                 let mut pending = pending_watch_events()
                     .lock()
                     .expect("pending watch events mutex poisoned");
-                if !pending.overflowed {
+                if needs_rescan {
+                    pending.paths.clear();
+                    pending.overflowed = true;
+                } else if !pending.overflowed {
                     pending.paths.extend(event.paths);
                     if pending.paths.len() > MAX_PENDING_WATCH_PATHS {
                         pending.paths.clear();
@@ -3846,7 +3881,7 @@ fn flush_pending_watch_events() {
 }
 
 fn handle_watch_paths(paths: Vec<PathBuf>) {
-    let (workspace_touched, any_marked) = {
+    let (workspace_touched, any_touched) = {
         let mut touched = HashSet::new();
         let mut app_state = state().lock().expect("state mutex poisoned");
         let Some(manifest) = app_state.manifest.clone() else {
@@ -3863,8 +3898,8 @@ fn handle_watch_paths(paths: Vec<PathBuf>) {
             }
         }
 
-        let any_marked = mark_repos_stale(&mut app_state, &touched);
-        (workspace_touched, any_marked)
+        mark_repos_stale(&mut app_state, &touched);
+        (workspace_touched, !touched.is_empty())
     };
 
     if workspace_touched {
@@ -3874,7 +3909,9 @@ fn handle_watch_paths(paths: Vec<PathBuf>) {
         };
         schedule_workspace_root_status_refresh(workspace_root);
     }
-    if any_marked {
+    // Repos already scanning are skipped and get a follow-up on completion;
+    // stale repos whose scan failed to start are retried here.
+    if any_touched {
         schedule_pending_local_rescans();
     }
 }
@@ -11356,6 +11393,32 @@ mod tests {
         for repo_id in &touched {
             assert_eq!(app_state.repo_runtime[repo_id].invalidation_seq, 2);
         }
+    }
+
+    #[test]
+    fn refresh_requested_during_running_scan_is_not_lost() {
+        let repo_path = temp_test_dir("refresh-coalesce");
+        let repo_id = "alpha";
+        let mut app_state = AppState::default();
+        app_state.repository_items.push(RepositoryListItem {
+            id: repo_id.to_string(),
+            name: "alpha".to_string(),
+            dir_name: "alpha".to_string(),
+            remote_url: "git@example.com:org/alpha.git".to_string(),
+            status: empty_repository_status(repo_path.clone()),
+            repo_manifest: None,
+        });
+
+        // E.g. an operation finishes and requests a scan, which starts running.
+        assert!(begin_repo_status_refresh(&mut app_state, repo_id));
+        // A commit lands while that scan is running; no second job is submitted.
+        assert!(!begin_repo_status_refresh(&mut app_state, repo_id));
+
+        // The running scan must not be credited with the later change.
+        let follow_up = finalize_repo_status_refresh(&mut app_state, repo_id);
+        assert_eq!(follow_up, Some(repo_path.clone()));
+        assert!(finalize_repo_status_refresh(&mut app_state, repo_id).is_none());
+        assert!(!app_state.repo_runtime[repo_id].needs_rescan());
     }
 
     #[test]
