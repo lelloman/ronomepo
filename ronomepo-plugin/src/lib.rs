@@ -37,7 +37,10 @@ use maruzzella_sdk::{
     MzViewTeardownResult, OpenViewRequest, Plugin, PluginDependency, PluginDescriptor,
     SurfaceContributionSpec, ToolbarWidgetSpec, Version, ViewFactorySpec,
 };
-use notify::{Config as NotifyConfig, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::{AccessKind, AccessMode};
+use notify::{
+    Config as NotifyConfig, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use ronomepo_core::{
     assess_repo_capability_policy, attention_rank, build_repository_list, capability_due_reason,
     capability_next_due_at_epoch_secs, collect_capability_git_snapshot,
@@ -3810,7 +3813,7 @@ fn dispatch_watch_event_result(manifest: &WorkspaceManifest, event: notify::Resu
     let main_context = glib::MainContext::default();
     match event {
         Ok(event) => {
-            if event.paths.is_empty() && !event.need_rescan() {
+            if !watch_event_may_change_status(&event) {
                 return;
             }
             WATCH_EVENTS_RECEIVED.fetch_add(1, Ordering::Relaxed);
@@ -3837,6 +3840,23 @@ fn dispatch_watch_event_result(manifest: &WorkspaceManifest, event: notify::Resu
             let message = error.to_string();
             main_context.invoke(move || append_log(format!("Repository watcher error: {message}")));
         }
+    }
+}
+
+/// The inotify backend also reports opens and read-only closes. Our own status
+/// scans open files across every repo, so treating those as changes makes each
+/// refresh trigger the next one (and floods the kernel queue into overflow).
+fn watch_event_may_change_status(event: &notify::Event) -> bool {
+    if event.need_rescan() {
+        return true;
+    }
+    if event.paths.is_empty() {
+        return false;
+    }
+    match event.kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_) => false,
+        _ => true,
     }
 }
 
@@ -11271,6 +11291,94 @@ mod tests {
         }
     }
 
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Feeds whatever the real watcher reports until it goes quiet.
+    fn collect_watch_events(
+        rx: &mpsc::Receiver<notify::Result<notify::Event>>,
+        manifest: &WorkspaceManifest,
+    ) -> PendingWatchEvents {
+        let mut pending = PendingWatchEvents::default();
+        while let Ok(event) = rx.recv_timeout(Duration::from_millis(500)) {
+            let event = event.unwrap();
+            if watch_event_may_change_status(&event) {
+                record_watch_event(&mut pending, manifest, &event);
+            }
+        }
+        pending
+    }
+
+    #[test]
+    fn real_watcher_reports_commits_but_not_status_scans() {
+        let root = temp_test_dir("watch-commit");
+        let manifest = two_repo_watch_manifest(&root);
+        for id in ["alpha", "beta"] {
+            let repo = root.join(id);
+            fs::create_dir_all(repo.join("src")).unwrap();
+            fs::write(repo.join("src/lib.rs"), "// v1\n").unwrap();
+            run_git(&repo, &["init", "-q", "-b", "main"]);
+            run_git(&repo, &["add", "."]);
+            run_git(&repo, &["commit", "-q", "-m", "initial"]);
+            // Backdate files so status does not keep rewriting a racily-clean index.
+            let old = SystemTime::now() - Duration::from_secs(3600);
+            fs::File::options()
+                .write(true)
+                .open(repo.join("src/lib.rs"))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            run_git(&repo, &["status", "--porcelain"]);
+        }
+        let alpha = root.join("alpha");
+        fs::write(alpha.join("src/lib.rs"), "// v2\n").unwrap();
+        run_git(&alpha, &["add", "."]);
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = RecommendedWatcher::new(tx, repository_watch_config()).unwrap();
+        for id in ["alpha", "beta"] {
+            watcher
+                .watch(&root.join(id), RecursiveMode::Recursive)
+                .unwrap();
+        }
+        collect_watch_events(&rx, &manifest);
+
+        // The scanner's own status collection must not invalidate anything.
+        for id in ["alpha", "beta"] {
+            ronomepo_core::collect_repository_status(&root.join(id));
+        }
+        let pending = collect_watch_events(&rx, &manifest);
+        assert!(!pending.backend_rescan);
+        assert!(pending.repo_ids.is_empty(), "{:?}", pending.repo_ids);
+
+        // A commit with no working tree change must still invalidate the repo.
+        run_git(&alpha, &["commit", "-q", "-m", "second"]);
+        let pending = collect_watch_events(&rx, &manifest);
+        assert!(!pending.backend_rescan);
+        assert_eq!(pending.repo_ids, HashSet::from(["alpha".to_string()]));
+
+        drop(watcher);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn workspace_watch_matches_root_git_events() {
         let workspace_root = temp_test_dir("workspace-watch-root-git");
@@ -11412,6 +11520,31 @@ mod tests {
         assert!(!pending.backend_rescan);
         assert!(!pending.workspace_touched);
         assert_eq!(pending.repo_ids, HashSet::from(["alpha".to_string()]));
+    }
+
+    #[test]
+    fn read_only_access_events_do_not_invalidate_status() {
+        let path = PathBuf::from("/workspace/alpha/src/lib.rs");
+        let event = |kind| notify::Event::new(kind).add_path(path.clone());
+
+        // Opens and read-only closes come from scans themselves (git status).
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Read),
+        ] {
+            assert!(!watch_event_may_change_status(&event(kind)));
+        }
+        for kind in [
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Modify(notify::event::ModifyKind::Any),
+            EventKind::Create(notify::event::CreateKind::Any),
+            EventKind::Remove(notify::event::RemoveKind::Any),
+        ] {
+            assert!(watch_event_may_change_status(&event(kind)));
+        }
+        let rescan = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        assert!(watch_event_may_change_status(&rescan));
     }
 
     #[test]

@@ -3998,8 +3998,8 @@ fn collect_repo_line_stats(
         };
     }
 
-    let mut command = Command::new("git");
-    command.arg("-C").arg(repo_path).arg("log");
+    let mut command = read_only_git(repo_path);
+    command.arg("log");
     if let Some(since_date) = since_date {
         command.arg(format!("--since={since_date}"));
     }
@@ -4094,13 +4094,17 @@ fn repository_sync(repo_path: &Path) -> RepositorySync {
     }
 }
 
+/// Status scans must not write: `git status` otherwise takes `.git/index.lock`
+/// and may rewrite the index, which the repository watcher reports as a change
+/// and answers with another scan.
+fn read_only_git(repo_path: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("--no-optional-locks").arg("-C").arg(repo_path);
+    command
+}
+
 fn git_stdout<const N: usize>(repo_path: &Path, args: [&str; N]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(args)
-        .output()
-        .ok()?;
+    let output = read_only_git(repo_path).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -4108,9 +4112,7 @@ fn git_stdout<const N: usize>(repo_path: &Path, args: [&str; N]) -> Option<Strin
 }
 
 fn git_success<const N: usize>(repo_path: &Path, args: [&str; N]) -> Option<bool> {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
+    read_only_git(repo_path)
         .args(args)
         .status()
         .ok()
