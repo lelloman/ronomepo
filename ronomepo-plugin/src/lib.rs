@@ -196,7 +196,6 @@ const REMOTE_FETCH_INTERVAL_SECS: u64 = 60 * 60;
 const REMOTE_FETCH_JITTER_SECS: u64 = 30 * 60;
 const REMOTE_FETCH_CONCURRENCY: usize = 1;
 const WATCH_POLL_FALLBACK_SECS: u64 = 15;
-const MAX_PENDING_WATCH_PATHS: usize = 4_096;
 const UI_REFRESH_DEBOUNCE_MILLIS: u64 = 75;
 const MAX_LOG_ENTRIES: usize = 500;
 const RUNTIME_PROFILE_ENV: &str = "RONOMEPO_PROFILE";
@@ -418,9 +417,12 @@ struct WatchManager {
 
 #[derive(Default)]
 struct PendingWatchEvents {
-    paths: HashSet<PathBuf>,
+    // Paths are routed to their repo on arrival, so the pending batch is bounded
+    // by the repo count no matter how many files a build touches.
+    workspace_touched: bool,
+    repo_ids: HashSet<String>,
     flush_scheduled: bool,
-    overflowed: bool,
+    backend_rescan: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -698,8 +700,8 @@ static WATCH_SYNC_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static WATCH_SYNC_PENDING_COLLAPSES: AtomicUsize = AtomicUsize::new(0);
 static WATCH_EVENTS_RECEIVED: AtomicUsize = AtomicUsize::new(0);
 static WATCH_EVENT_FLUSHES: AtomicUsize = AtomicUsize::new(0);
-static PENDING_WATCH_PATHS: AtomicUsize = AtomicUsize::new(0);
-static PENDING_WATCH_PATHS_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+static PENDING_WATCH_REPOS: AtomicUsize = AtomicUsize::new(0);
+static PENDING_WATCH_REPOS_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
 static LOCAL_RESCAN_TICKS: AtomicUsize = AtomicUsize::new(0);
 static REMOTE_FETCH_TICKS: AtomicUsize = AtomicUsize::new(0);
 static DISPATCHED_JOBS: AtomicUsize = AtomicUsize::new(0);
@@ -802,7 +804,7 @@ fn runtime_profile_summary(reason: &str) -> Option<String> {
     }
 
     let app_state = state().lock().expect("state mutex poisoned");
-    let pending_watch_paths = PENDING_WATCH_PATHS.load(Ordering::Relaxed);
+    let pending_watch_repos = PENDING_WATCH_REPOS.load(Ordering::Relaxed);
     let in_flight_jobs = executor()
         .in_flight
         .lock()
@@ -818,14 +820,14 @@ fn runtime_profile_summary(reason: &str) -> Option<String> {
         operation_summaries,
     ) = current_view_registry_counts();
     let mut line = format!(
-        "[runtime:{reason}] watch_backend={} watched_paths={} repo_runtime={} repo_details_cache={} repo_details_loading={} pending_watch_paths={} pending_watch_paths_high_water={} watch_sync_requests={} watch_sync_completions={} watch_sync_failures={} watch_sync_pending_collapses={} watch_events={} watch_event_flushes={} local_rescan_ticks={} remote_fetch_ticks={} dispatched_jobs={} in_flight_jobs={} view_refreshes={} log_refreshes={} repository_views={} monorepo_views={} repo_views={} commit_check_views={} workspace_settings_views={} operation_buffers={} operation_summaries={}",
+        "[runtime:{reason}] watch_backend={} watched_paths={} repo_runtime={} repo_details_cache={} repo_details_loading={} pending_watch_repos={} pending_watch_repos_high_water={} watch_sync_requests={} watch_sync_completions={} watch_sync_failures={} watch_sync_pending_collapses={} watch_events={} watch_event_flushes={} local_rescan_ticks={} remote_fetch_ticks={} dispatched_jobs={} in_flight_jobs={} view_refreshes={} log_refreshes={} repository_views={} monorepo_views={} repo_views={} commit_check_views={} workspace_settings_views={} operation_buffers={} operation_summaries={}",
         watch_backend_kind_label(current_watch_backend_kind()),
         WATCHED_PATH_COUNT.load(Ordering::Relaxed),
         app_state.repo_runtime.len(),
         app_state.repo_details_cache.len(),
         app_state.repo_details_loading.len(),
-        pending_watch_paths,
-        PENDING_WATCH_PATHS_HIGH_WATER.load(Ordering::Relaxed),
+        pending_watch_repos,
+        PENDING_WATCH_REPOS_HIGH_WATER.load(Ordering::Relaxed),
         WATCH_SYNC_REQUESTS.load(Ordering::Relaxed),
         WATCH_SYNC_COMPLETIONS.load(Ordering::Relaxed),
         WATCH_SYNC_FAILURES.load(Ordering::Relaxed),
@@ -3734,7 +3736,7 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
         .filter(|(_, path)| path.exists())
         .collect::<Vec<_>>();
 
-    let (mut backend, backend_kind) = create_watch_backend()?;
+    let (mut backend, backend_kind) = create_watch_backend(Arc::new(manifest.clone()))?;
     let workspace_git_dir = workspace_root.join(".git");
     let mut watched_paths = 0;
 
@@ -3769,15 +3771,21 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
     })
 }
 
-fn create_watch_backend() -> Result<(WatchBackend, WatchBackendKind), String> {
+fn create_watch_backend(
+    manifest: Arc<WorkspaceManifest>,
+) -> Result<(WatchBackend, WatchBackendKind), String> {
     let config = repository_watch_config();
-    match RecommendedWatcher::new(dispatch_watch_event_result, config) {
+    let poll_manifest = Arc::clone(&manifest);
+    match RecommendedWatcher::new(
+        move |event| dispatch_watch_event_result(&manifest, event),
+        config,
+    ) {
         Ok(watcher) => Ok((
             WatchBackend::Recommended(watcher),
             WatchBackendKind::Recommended,
         )),
         Err(_) => PollWatcher::new(
-            dispatch_watch_event_result,
+            move |event| dispatch_watch_event_result(&poll_manifest, event),
             config.with_poll_interval(Duration::from_secs(WATCH_POLL_FALLBACK_SECS)),
         )
         .map(|watcher| (WatchBackend::Poll(watcher), WatchBackendKind::Poll))
@@ -3798,14 +3806,11 @@ fn watch_backend_mut(backend: &mut WatchBackend) -> &mut dyn Watcher {
     }
 }
 
-fn dispatch_watch_event_result(event: notify::Result<notify::Event>) {
+fn dispatch_watch_event_result(manifest: &WorkspaceManifest, event: notify::Result<notify::Event>) {
     let main_context = glib::MainContext::default();
     match event {
         Ok(event) => {
-            // The backend dropped events (e.g. inotify queue overflow) and
-            // reports it as a path-less Rescan event.
-            let needs_rescan = event.need_rescan();
-            if event.paths.is_empty() && !needs_rescan {
+            if event.paths.is_empty() && !event.need_rescan() {
                 return;
             }
             WATCH_EVENTS_RECEIVED.fetch_add(1, Ordering::Relaxed);
@@ -3813,23 +3818,10 @@ fn dispatch_watch_event_result(event: notify::Result<notify::Event>) {
                 let mut pending = pending_watch_events()
                     .lock()
                     .expect("pending watch events mutex poisoned");
-                if needs_rescan {
-                    pending.paths.clear();
-                    pending.overflowed = true;
-                } else if !pending.overflowed {
-                    pending.paths.extend(event.paths);
-                    if pending.paths.len() > MAX_PENDING_WATCH_PATHS {
-                        pending.paths.clear();
-                        pending.overflowed = true;
-                    }
-                }
-                let pending_len = if pending.overflowed {
-                    MAX_PENDING_WATCH_PATHS
-                } else {
-                    pending.paths.len()
-                };
-                PENDING_WATCH_PATHS.store(pending_len, Ordering::Relaxed);
-                update_max_atomic(&PENDING_WATCH_PATHS_HIGH_WATER, pending_len);
+                record_watch_event(&mut pending, manifest, &event);
+                let pending_len = pending.repo_ids.len() + usize::from(pending.workspace_touched);
+                PENDING_WATCH_REPOS.store(pending_len, Ordering::Relaxed);
+                update_max_atomic(&PENDING_WATCH_REPOS_HIGH_WATER, pending_len);
                 if pending.flush_scheduled {
                     false
                 } else {
@@ -3848,6 +3840,29 @@ fn dispatch_watch_event_result(event: notify::Result<notify::Event>) {
     }
 }
 
+fn record_watch_event(
+    pending: &mut PendingWatchEvents,
+    manifest: &WorkspaceManifest,
+    event: &notify::Event,
+) {
+    // The backend dropped events (e.g. inotify queue overflow) and reports it
+    // as a path-less Rescan event.
+    if event.need_rescan() {
+        pending.backend_rescan = true;
+    }
+    if pending.backend_rescan {
+        return;
+    }
+    for path in &event.paths {
+        if workspace_watch_path_matches(manifest, path) {
+            pending.workspace_touched = true;
+        }
+        if let Some(repo_id) = repo_id_for_watch_path(manifest, path) {
+            pending.repo_ids.insert(repo_id);
+        }
+    }
+}
+
 fn schedule_watch_event_flush() {
     glib::timeout_add_local(Duration::from_millis(UI_REFRESH_DEBOUNCE_MILLIS), || {
         flush_pending_watch_events();
@@ -3857,49 +3872,33 @@ fn schedule_watch_event_flush() {
 
 fn flush_pending_watch_events() {
     WATCH_EVENT_FLUSHES.fetch_add(1, Ordering::Relaxed);
-    let (paths, overflowed) = {
+    let pending = {
         let mut pending = pending_watch_events()
             .lock()
             .expect("pending watch events mutex poisoned");
-        pending.flush_scheduled = false;
-        let overflowed = pending.overflowed;
-        pending.overflowed = false;
-        PENDING_WATCH_PATHS.store(0, Ordering::Relaxed);
-        (std::mem::take(&mut pending.paths), overflowed)
+        PENDING_WATCH_REPOS.store(0, Ordering::Relaxed);
+        std::mem::take(&mut *pending)
     };
 
-    if overflowed {
-        handle_overflow_watch_paths();
+    if pending.backend_rescan {
+        handle_watch_backend_rescan();
         return;
     }
 
-    if paths.is_empty() {
-        return;
-    }
-
-    handle_watch_paths(paths.into_iter().collect());
+    handle_watch_touches(pending.workspace_touched, pending.repo_ids);
 }
 
-fn handle_watch_paths(paths: Vec<PathBuf>) {
-    let (workspace_touched, any_touched) = {
-        let mut touched = HashSet::new();
+fn handle_watch_touches(workspace_touched: bool, mut repo_ids: HashSet<String>) {
+    let any_touched = {
         let mut app_state = state().lock().expect("state mutex poisoned");
-        let Some(manifest) = app_state.manifest.clone() else {
+        let Some(manifest) = app_state.manifest.as_ref() else {
             return;
         };
-        let mut workspace_touched = false;
-
-        for path in paths {
-            if workspace_watch_path_matches(&manifest, &path) {
-                workspace_touched = true;
-            }
-            if let Some(repo_id) = repo_id_for_watch_path(&manifest, &path) {
-                touched.insert(repo_id);
-            }
-        }
-
-        mark_repos_stale(&mut app_state, &touched);
-        (workspace_touched, !touched.is_empty())
+        // Events routed by a watcher built for an older manifest may name repos
+        // that no longer exist.
+        repo_ids.retain(|repo_id| manifest.repos.iter().any(|repo| &repo.id == repo_id));
+        mark_repos_stale(&mut app_state, &repo_ids);
+        !repo_ids.is_empty()
     };
 
     if workspace_touched {
@@ -3916,14 +3915,15 @@ fn handle_watch_paths(paths: Vec<PathBuf>) {
     }
 }
 
-fn handle_overflow_watch_paths() {
+fn handle_watch_backend_rescan() {
     let workspace_root = {
         let app_state = state().lock().expect("state mutex poisoned");
         app_state.workspace_root.clone()
     };
     mark_all_repos_stale();
     append_log(
-        "Repository watcher overflowed pending events; forcing a full local refresh.".to_string(),
+        "Repository watcher backend dropped events (e.g. inotify queue overflow); forcing a full local refresh."
+            .to_string(),
     );
     schedule_workspace_root_status_refresh(workspace_root);
     schedule_pending_local_rescans();
@@ -11372,6 +11372,63 @@ mod tests {
                 Some("simple-ai")
             );
         }
+    }
+
+    fn two_repo_watch_manifest(root: &Path) -> WorkspaceManifest {
+        WorkspaceManifest {
+            name: "Workspace".to_string(),
+            root: root.to_path_buf(),
+            repos: ["alpha", "beta"]
+                .into_iter()
+                .map(|id| RepositoryEntry {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    dir_name: id.to_string(),
+                    remote_url: String::new(),
+                    enabled: true,
+                })
+                .collect(),
+            shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
+        }
+    }
+
+    #[test]
+    fn watch_event_burst_is_routed_per_repository_without_overflow() {
+        let root = temp_test_dir("watch-burst");
+        let manifest = two_repo_watch_manifest(&root);
+        let mut pending = PendingWatchEvents::default();
+
+        // A build writing far more files than any path-based cap would allow.
+        let mut event = notify::Event::new(notify::EventKind::Any);
+        for index in 0..10_000 {
+            event = event.add_path(root.join(format!("alpha/target/debug/deps/{index}.o")));
+        }
+        record_watch_event(&mut pending, &manifest, &event);
+        let objects = notify::Event::new(notify::EventKind::Any)
+            .add_path(root.join("beta/.git/objects/ab/cdef"));
+        record_watch_event(&mut pending, &manifest, &objects);
+
+        assert!(!pending.backend_rescan);
+        assert!(!pending.workspace_touched);
+        assert_eq!(pending.repo_ids, HashSet::from(["alpha".to_string()]));
+    }
+
+    #[test]
+    fn watch_backend_rescan_event_forces_full_refresh() {
+        let root = temp_test_dir("watch-rescan");
+        let manifest = two_repo_watch_manifest(&root);
+        let mut pending = PendingWatchEvents::default();
+
+        let rescan =
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        record_watch_event(&mut pending, &manifest, &rescan);
+        let later =
+            notify::Event::new(notify::EventKind::Any).add_path(root.join("beta/src/lib.rs"));
+        record_watch_event(&mut pending, &manifest, &later);
+
+        assert!(pending.backend_rescan);
+        assert!(pending.repo_ids.is_empty());
     }
 
     #[test]
