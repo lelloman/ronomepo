@@ -316,6 +316,10 @@ struct AppState {
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
+    last_log_message: Option<String>,
+    last_log_repeats: usize,
+    last_watch_failure: Option<String>,
+    last_unreadable_watch_paths: Vec<PathBuf>,
     next_operation_batch: usize,
     history_report: Vec<String>,
     history_report_loading: bool,
@@ -356,6 +360,10 @@ impl Default for AppState {
             selected_repo_ids: Vec::new(),
             active_repo_id: None,
             logs: Vec::new(),
+            last_log_message: None,
+            last_log_repeats: 0,
+            last_watch_failure: None,
+            last_unreadable_watch_paths: Vec::new(),
             next_operation_batch: 0,
             history_report: Vec::new(),
             history_report_loading: false,
@@ -416,6 +424,7 @@ struct WatchManager {
     _backend: WatchBackend,
     backend_kind: WatchBackendKind,
     watched_paths: usize,
+    unreadable_paths: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -1311,10 +1320,11 @@ fn initialize_state(config: &RonomepoPluginConfig) {
     app_state.manifest_sort_descending = config.manifest_sort_descending;
     sync_repo_runtime_state(&mut app_state);
     if app_state.logs.is_empty() {
-        app_state.logs.push(format!(
+        let message = format!(
             "Ronomepo initialized for workspace {}",
             workspace_root.display()
-        ));
+        );
+        push_log_line(&mut app_state, message);
     }
     drop(app_state);
     emit_runtime_profile("startup");
@@ -1392,12 +1402,10 @@ extern "C" fn command_open_overview(
 
     match host.open_view(&request) {
         Ok(MzViewOpenDisposition::Opened) => {
-            append_log("Opened Monorepo Overview.".to_string());
             refresh_views();
             maruzzella_sdk::ffi::MzStatus::OK
         }
         Ok(MzViewOpenDisposition::FocusedExisting) => {
-            append_log("Focused existing Monorepo Overview.".to_string());
             refresh_views();
             maruzzella_sdk::ffi::MzStatus::OK
         }
@@ -1429,12 +1437,10 @@ extern "C" fn command_open_commit_check(
 ) -> maruzzella_sdk::ffi::MzStatus {
     match open_commit_check_view() {
         Ok(MzViewOpenDisposition::Opened) => {
-            append_log("Opened Commit Check.".to_string());
             refresh_views();
             maruzzella_sdk::ffi::MzStatus::OK
         }
         Ok(MzViewOpenDisposition::FocusedExisting) => {
-            append_log("Focused existing Commit Check.".to_string());
             refresh_views();
             maruzzella_sdk::ffi::MzStatus::OK
         }
@@ -1530,7 +1536,8 @@ extern "C" fn command_clear_logs(
     {
         let mut app_state = state().lock().expect("state mutex poisoned");
         app_state.logs.clear();
-        app_state.logs.push("Operations log cleared.".to_string());
+        app_state.last_log_message = None;
+        push_log_line(&mut app_state, "Operations log cleared.".to_string());
     }
     refresh_views();
     maruzzella_sdk::ffi::MzStatus::OK
@@ -1626,13 +1633,38 @@ fn queue_line_stats_report_from_state() -> Result<(), String> {
 
 fn append_log(message: String) {
     let mut app_state = state().lock().expect("state mutex poisoned");
-    app_state.logs.push(message);
+    push_log_line(&mut app_state, message);
+    drop(app_state);
+    schedule_log_surface_refresh();
+}
+
+/// Timestamps `message` and collapses consecutive repeats into the last line.
+fn push_log_line(app_state: &mut AppState, message: String) {
+    let stamp = log_timestamp();
+    let repeated = app_state.last_log_message.as_deref() == Some(message.as_str())
+        && !app_state.logs.is_empty();
+    if repeated {
+        app_state.last_log_repeats += 1;
+        let line = format!("{stamp} {message} (x{})", app_state.last_log_repeats);
+        if let Some(last) = app_state.logs.last_mut() {
+            *last = line;
+        }
+        return;
+    }
+    app_state.logs.push(format!("{stamp} {message}"));
+    app_state.last_log_message = Some(message);
+    app_state.last_log_repeats = 1;
     if app_state.logs.len() > MAX_LOG_ENTRIES {
         let excess = app_state.logs.len() - MAX_LOG_ENTRIES;
         app_state.logs.drain(0..excess);
     }
-    drop(app_state);
-    schedule_log_surface_refresh();
+}
+
+fn log_timestamp() -> String {
+    glib::DateTime::now_local()
+        .and_then(|now| now.format("%H:%M:%S"))
+        .map(|stamp| stamp.to_string())
+        .unwrap_or_else(|_| "--:--:--".to_string())
 }
 
 fn schedule_log_surface_refresh() {
@@ -1955,6 +1987,11 @@ fn handle_worker_result(result: WorkerResult) {
 
             match result {
                 Ok(manager) => {
+                    let unreadable = manager
+                        .as_ref()
+                        .map(|manager| manager.unreadable_paths.clone())
+                        .unwrap_or_default();
+                    log_watch_sync_outcome(None, unreadable);
                     LAST_WATCH_SYNC_SEQ_COMPLETED.store(sync_seq, Ordering::Relaxed);
                     WATCH_SYNC_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                     {
@@ -1976,7 +2013,7 @@ fn handle_worker_result(result: WorkerResult) {
                         *slot = None;
                         record_watch_manager_metrics(None, "watch-backend-changed");
                     }
-                    append_log(format!("Repository watcher setup failed: {message}"));
+                    log_watch_sync_outcome(Some(message), Vec::new());
                     emit_runtime_profile("watch-sync-failed");
                 }
             }
@@ -2312,14 +2349,7 @@ fn open_workspace_settings_tab() -> Result<(), String> {
     let host = unsafe { HostApi::from_raw(&*host_ptr) };
     let request = OpenViewRequest::new(PLUGIN_ID, VIEW_FUCINA_POLICY, MzViewPlacement::Workbench);
     match host.open_view(&request) {
-        Ok(MzViewOpenDisposition::Opened) => {
-            append_log("Opened Fucina Policy.".to_string());
-            Ok(())
-        }
-        Ok(MzViewOpenDisposition::FocusedExisting) => {
-            append_log("Focused existing Fucina Policy tab.".to_string());
-            Ok(())
-        }
+        Ok(_) => Ok(()),
         Err(status) => Err(format!("Failed to open Fucina Policy: {status:?}")),
     }
 }
@@ -3697,6 +3727,40 @@ fn schedule_repo_details_load(repo_id: &str, repo_path: &Path) {
     }
 }
 
+/// Watch syncs rerun on every manifest change and rescan, so only log when the
+/// outcome differs from the previous sync instead of repeating it each time.
+fn log_watch_sync_outcome(failure: Option<String>, unreadable: Vec<PathBuf>) {
+    let mut messages = Vec::new();
+    {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        if app_state.last_watch_failure != failure {
+            match &failure {
+                Some(message) => {
+                    messages.push(format!("Repository watcher setup failed: {message}"))
+                }
+                None => messages.push("Repository watcher recovered.".to_string()),
+            }
+            app_state.last_watch_failure = failure;
+        }
+        if app_state.last_watch_failure.is_none()
+            && app_state.last_unreadable_watch_paths != unreadable
+        {
+            for path in &unreadable {
+                if !app_state.last_unreadable_watch_paths.contains(path) {
+                    messages.push(format!(
+                        "Repository watcher skipping unreadable directory: {}",
+                        path.display()
+                    ));
+                }
+            }
+            app_state.last_unreadable_watch_paths = unreadable;
+        }
+    }
+    for message in messages {
+        append_log(message);
+    }
+}
+
 fn sync_watch_manager_from_state() {
     let manifest = {
         let mut app_state = state().lock().expect("state mutex poisoned");
@@ -3756,10 +3820,14 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
         watched_paths += 1;
     }
 
+    let mut unreadable_paths = Vec::new();
     for (_, path) in &repos {
-        watch_backend_mut(&mut backend)
-            .watch(path, RecursiveMode::Recursive)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        watch_tree_skipping_unreadable(
+            watch_backend_mut(&mut backend),
+            path,
+            &mut unreadable_paths,
+        )
+        .map_err(|error| format!("{}: {error}", path.display()))?;
         watched_paths += 1;
     }
 
@@ -3771,7 +3839,50 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
         _backend: backend,
         backend_kind,
         watched_paths,
+        unreadable_paths,
     })
+}
+
+/// Watches `root` recursively, skipping subdirectories the current user cannot
+/// read (e.g. root-owned capture dirs inside a repo). One such directory makes
+/// a recursive inotify registration fail as a whole, so on permission errors
+/// `root` is watched non-recursively and each child subtree is retried.
+fn watch_tree_skipping_unreadable(
+    watcher: &mut dyn Watcher,
+    root: &Path,
+    unreadable: &mut Vec<PathBuf>,
+) -> notify::Result<()> {
+    let error = match watcher.watch(root, RecursiveMode::Recursive) {
+        Ok(()) => return Ok(()),
+        Err(error) if is_permission_denied(&error) => error,
+        Err(error) => return Err(error),
+    };
+    // Drop whatever the failed registration added before hitting the error.
+    let _ = watcher.unwatch(root);
+
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(read_error) if read_error.kind() == std::io::ErrorKind::PermissionDenied => {
+            unreadable.push(root.to_path_buf());
+            return Ok(());
+        }
+        Err(_) => return Err(error),
+    };
+    watcher.watch(root, RecursiveMode::NonRecursive)?;
+    for entry in entries.flatten() {
+        // `file_type` does not follow symlinks, matching `follow_symlinks(false)`.
+        if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            watch_tree_skipping_unreadable(watcher, &entry.path(), unreadable)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_permission_denied(error: &notify::Error) -> bool {
+    matches!(
+        &error.kind,
+        notify::ErrorKind::Io(io_error) if io_error.kind() == std::io::ErrorKind::PermissionDenied
+    )
 }
 
 fn create_watch_backend(
@@ -4046,16 +4157,7 @@ fn open_repo_manifest_editor(
     request.payload = instance_key.as_bytes();
 
     match host.open_view(&request) {
-        Ok(MzViewOpenDisposition::Opened) => {
-            append_log(format!("Opened repo manifest editor for {repo_name}."));
-            Ok(())
-        }
-        Ok(MzViewOpenDisposition::FocusedExisting) => {
-            append_log(format!(
-                "Focused existing repo manifest editor for {repo_name}."
-            ));
-            Ok(())
-        }
+        Ok(_) => Ok(()),
         Err(status) => Err(format!(
             "Failed to open repo manifest editor for {repo_name}: {status:?}"
         )),
@@ -4074,14 +4176,7 @@ fn open_repo_overview_for_item(
     request.payload = item.id.as_bytes();
 
     match host.open_view(&request) {
-        Ok(MzViewOpenDisposition::Opened) => {
-            append_log(format!("Opened repo overview for {}.", item.name));
-            Ok(())
-        }
-        Ok(MzViewOpenDisposition::FocusedExisting) => {
-            append_log(format!("Focused existing repo overview for {}.", item.name));
-            Ok(())
-        }
+        Ok(_) => Ok(()),
         Err(status) => Err(format!(
             "Failed to open repo overview for {}: {status:?}",
             item.name
@@ -8830,7 +8925,6 @@ fn clear_selection_button(selected_count: usize) -> Button {
     let button = action_button("Clear Selection", selected_count);
     button.connect_clicked(move |_| {
         update_selected_repo_ids(Vec::new());
-        append_log("Cleared repository selection.".to_string());
         refresh_views();
     });
     button
@@ -8852,10 +8946,8 @@ fn report_button(
 fn repo_target_button(item: &RepositoryListItem) -> Button {
     let button = clickable_button_with_label("Target");
     let repo_id = item.id.clone();
-    let repo_name = item.name.clone();
     button.connect_clicked(move |_| {
         update_selected_repo_ids(vec![repo_id.clone()]);
-        append_log(format!("Targeted {repo_name} as the active selection."));
         refresh_views();
     });
     button
@@ -9012,7 +9104,6 @@ fn repo_overview_action_button(
     button.connect_clicked(move |_| match label {
         "Target This Repo" => {
             set_selected_repo_ids(vec![repo_id.clone()]);
-            append_log(format!("Targeted {repo_id} as the active selection."));
         }
         "Open Folder" => {
             open_path_in_file_manager(&repo_path, &repo_name);
@@ -9470,18 +9561,7 @@ fn open_text_editor_for_path(host_ptr: *const maruzzella_sdk::ffi::MzHostApi, pa
     request.payload = instance_key.as_bytes();
 
     match host.open_view(&request) {
-        Ok(MzViewOpenDisposition::Opened) => {
-            append_log(format!(
-                "Opened {} in a Ronomepo editor tab.",
-                resolved.display()
-            ));
-        }
-        Ok(MzViewOpenDisposition::FocusedExisting) => {
-            append_log(format!(
-                "Focused existing Ronomepo editor tab for {}.",
-                resolved.display()
-            ));
-        }
+        Ok(_) => {}
         Err(status) => append_log(format!(
             "Failed to open {} in a Ronomepo editor tab: {status:?}",
             resolved.display()
@@ -11325,6 +11405,51 @@ mod tests {
             }
         }
         pending
+    }
+
+    #[test]
+    fn log_lines_are_timestamped_and_consecutive_repeats_collapse() {
+        let mut app_state = AppState::default();
+        for message in ["watch failed", "watch failed", "other", "watch failed"] {
+            push_log_line(&mut app_state, message.to_string());
+        }
+        assert_eq!(app_state.logs.len(), 3);
+        assert!(app_state.logs[0].ends_with(" watch failed (x2)"));
+        assert!(app_state.logs[1].ends_with(" other"));
+        assert!(app_state.logs[2].ends_with(" watch failed"));
+        let stamp = app_state.logs[1].split(' ').next().unwrap();
+        assert_eq!(stamp.len(), 8, "{stamp}");
+        assert_eq!(stamp.matches(':').count(), 2, "{stamp}");
+    }
+
+    #[test]
+    fn unreadable_subdirectory_is_skipped_without_losing_the_repository() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_test_dir("watch-unreadable");
+        let manifest = two_repo_watch_manifest(&root);
+        let alpha = root.join("alpha");
+        let locked = alpha.join("captures/run-locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::create_dir_all(alpha.join("src/nested")).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            // Running with CAP_DAC_OVERRIDE (e.g. as root): nothing to test.
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = RecommendedWatcher::new(tx, repository_watch_config()).unwrap();
+        let mut unreadable = Vec::new();
+        let result = watch_tree_skipping_unreadable(&mut watcher, &alpha, &mut unreadable);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
+        assert_eq!(unreadable, vec![locked]);
+
+        fs::write(alpha.join("src/nested/lib.rs"), "// v1\n").unwrap();
+        let pending = collect_watch_events(&rx, &manifest);
+        assert!(pending.repo_ids.contains("alpha"), "{:?}", pending.repo_ids);
     }
 
     #[test]
