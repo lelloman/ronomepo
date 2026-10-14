@@ -7,6 +7,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Write as _;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -202,6 +203,7 @@ const REMOTE_FETCH_JITTER_SECS: u64 = 30 * 60;
 const REMOTE_FETCH_CONCURRENCY: usize = 3;
 const WATCH_POLL_FALLBACK_SECS: u64 = 15;
 const UI_REFRESH_DEBOUNCE_MILLIS: u64 = 75;
+const CONFIG_PERSIST_DEBOUNCE_MILLIS: u64 = 300;
 const MAX_LOG_ENTRIES: usize = 500;
 const RUNTIME_PROFILE_ENV: &str = "RONOMEPO_PROFILE";
 
@@ -800,6 +802,7 @@ thread_local! {
     static OPERATION_FOLLOWERS: RefCell<Vec<OperationFollowHandle>> = const { RefCell::new(Vec::new()) };
     static DIRTY_TEXT_EDITORS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     static HOST_APIS: RefCell<Vec<&'static maruzzella_sdk::ffi::MzHostApi>> = const { RefCell::new(Vec::new()) };
+    static PENDING_CONFIG_UPDATES: RefCell<Vec<PluginConfigUpdate>> = const { RefCell::new(Vec::new()) };
 }
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -8393,13 +8396,13 @@ fn labeled_field(label: &str, widget: &impl IsA<gtk::Widget>) -> GtkBox {
 }
 
 fn persist_monitor_view_mode(mode: MonitorViewMode) {
-    persist_plugin_config_direct(|config| {
+    persist_plugin_config_direct(move |config| {
         config.monitor_view_mode = mode;
     });
 }
 
 fn persist_monitor_filter_mode(view: MonitorViewMode, mode: MonitorFilterMode) {
-    persist_plugin_config_direct(|config| match view {
+    persist_plugin_config_direct(move |config| match view {
         MonitorViewMode::Overview => config.overview_filter_mode = mode,
         MonitorViewMode::Git => config.git_filter_mode = mode,
         MonitorViewMode::Checks => config.checks_filter_mode = mode,
@@ -8408,7 +8411,7 @@ fn persist_monitor_filter_mode(view: MonitorViewMode, mode: MonitorFilterMode) {
 }
 
 fn persist_monitor_sort_mode(view: MonitorViewMode, mode: MonitorSortMode) {
-    persist_plugin_config_direct(|config| match view {
+    persist_plugin_config_direct(move |config| match view {
         MonitorViewMode::Overview => config.overview_sort_mode = mode,
         MonitorViewMode::Git => config.git_sort_mode = mode,
         MonitorViewMode::Checks => config.checks_sort_mode = mode,
@@ -8417,7 +8420,7 @@ fn persist_monitor_sort_mode(view: MonitorViewMode, mode: MonitorSortMode) {
 }
 
 fn persist_monitor_sort_descending(view: MonitorViewMode, descending: bool) {
-    persist_plugin_config_direct(|config| match view {
+    persist_plugin_config_direct(move |config| match view {
         MonitorViewMode::Overview => config.overview_sort_descending = descending,
         MonitorViewMode::Git => config.git_sort_descending = descending,
         MonitorViewMode::Checks => config.checks_sort_descending = descending,
@@ -8425,7 +8428,36 @@ fn persist_monitor_sort_descending(view: MonitorViewMode, descending: bool) {
     });
 }
 
-fn persist_plugin_config_direct(update: impl FnOnce(&mut RonomepoPluginConfig)) {
+type PluginConfigUpdate = Box<dyn FnOnce(&mut RonomepoPluginConfig)>;
+
+/// Applies `update` to the stored plugin config. Monitor toggles call this on
+/// every click, so updates are batched into one write shortly after.
+fn persist_plugin_config_direct(update: impl FnOnce(&mut RonomepoPluginConfig) + 'static) {
+    if !glib::MainContext::default().is_owner() {
+        write_plugin_config(&persisted_plugin_configs_path(), vec![Box::new(update)]);
+        return;
+    }
+    let first = PENDING_CONFIG_UPDATES.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        pending.push(Box::new(update));
+        pending.len() == 1
+    });
+    if first {
+        glib::timeout_add_local_once(
+            Duration::from_millis(CONFIG_PERSIST_DEBOUNCE_MILLIS),
+            || {
+                let updates = PENDING_CONFIG_UPDATES.with(|pending| pending.take());
+                write_plugin_config(&persisted_plugin_configs_path(), updates);
+            },
+        );
+    }
+}
+
+/// Edits the plugin's entry in the host's plugins.json in place, leaving other
+/// plugins' entries alone. The host reads the file from disk on each view
+/// config access, so writing it directly is safe; a file or entry that cannot
+/// be decoded is left untouched rather than replaced by defaults.
+fn write_plugin_config(path: &Path, updates: Vec<PluginConfigUpdate>) {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum StoredPluginConfigEntry {
@@ -8437,25 +8469,54 @@ fn persist_plugin_config_direct(update: impl FnOnce(&mut RonomepoPluginConfig)) 
         },
     }
 
-    let path = persisted_plugin_configs_path("ronomepo");
-    let mut document = fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<std::collections::HashMap<String, Value>>(&raw).ok())
-        .unwrap_or_default();
-
-    let mut config = document
-        .get(PLUGIN_ID)
-        .cloned()
-        .and_then(|value| serde_json::from_value::<StoredPluginConfigEntry>(value).ok())
-        .and_then(|entry| match entry {
-            StoredPluginConfigEntry::Legacy(payload) => RonomepoPluginConfig::decode(&payload).ok(),
-            StoredPluginConfigEntry::Versioned { payload, .. } => {
-                RonomepoPluginConfig::decode(&payload).ok()
+    let mut document = match fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<HashMap<String, Value>>(&raw) {
+            Ok(document) => document,
+            Err(error) => {
+                diag::log(format!(
+                    "not saving plugin config: {} is not valid: {error}",
+                    path.display()
+                ));
+                return;
             }
-        })
-        .unwrap_or_default();
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(error) => {
+            diag::log(format!(
+                "not saving plugin config: cannot read {}: {error}",
+                path.display()
+            ));
+            return;
+        }
+    };
 
-    update(&mut config);
+    let mut config = match document.get(PLUGIN_ID).cloned() {
+        None => RonomepoPluginConfig::default(),
+        Some(value) => {
+            let decoded = serde_json::from_value::<StoredPluginConfigEntry>(value)
+                .map_err(|error| error.to_string())
+                .and_then(|entry| {
+                    let payload = match entry {
+                        StoredPluginConfigEntry::Legacy(payload) => payload,
+                        StoredPluginConfigEntry::Versioned { payload, .. } => payload,
+                    };
+                    RonomepoPluginConfig::decode(&payload).map_err(|error| error.to_string())
+                });
+            match decoded {
+                Ok(config) => config,
+                Err(error) => {
+                    diag::log(format!(
+                        "not saving plugin config: stored entry is invalid: {error}"
+                    ));
+                    return;
+                }
+            }
+        }
+    };
+
+    for update in updates {
+        update(&mut config);
+    }
 
     let Ok(payload) = serde_json::to_vec(&config) else {
         return;
@@ -8468,25 +8529,78 @@ fn persist_plugin_config_direct(update: impl FnOnce(&mut RonomepoPluginConfig)) 
         }),
     );
 
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(raw) = serde_json::to_string_pretty(&document) {
-        let _ = fs::write(path, raw);
+    let written = serde_json::to_vec_pretty(&document)
+        .map_err(std::io::Error::other)
+        .and_then(|raw| write_file_atomically(path, &raw));
+    if let Err(error) = written {
+        diag::log(format!(
+            "failed to save plugin config to {}: {error}",
+            path.display()
+        ));
     }
 }
 
-fn persisted_plugin_configs_path(persistence_id: &str) -> PathBuf {
-    let mut path = if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
+/// Replaces `path` with `bytes` through a synced temporary file and a rename,
+/// so a crash or a concurrent reader never sees a partially written file.
+fn write_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        if let Ok(metadata) = fs::metadata(path) {
+            file.set_permissions(metadata.permissions())?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Persistence id the app hands to Maruzzella; the host keeps its layouts and
+/// the plugin configs under `<config root>/<id>`.
+pub const PERSISTENCE_ID: &str = "ronomepo";
+
+/// The directory Maruzzella persists configs and layouts under. It must match
+/// the host's own lookup (an empty `XDG_CONFIG_HOME` included) because the
+/// plugin edits files the host reads; the app clears an empty
+/// `XDG_CONFIG_HOME` at startup so both resolve to a sensible path.
+pub fn persisted_config_root() -> PathBuf {
+    if let Some(dir) = env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(dir)
-    } else if let Ok(home) = env::var("HOME") {
+    } else if let Some(home) = env::var_os("HOME") {
         PathBuf::from(home).join(".config")
     } else {
         PathBuf::from(".")
-    };
-    path.push(persistence_id);
-    path.push("plugins.json");
-    path
+    }
+}
+
+fn persisted_plugin_configs_path() -> PathBuf {
+    persisted_config_root()
+        .join(PERSISTENCE_ID)
+        .join("plugins.json")
 }
 
 fn load_workspace_manifest(workspace_root: &Path) -> Result<RefreshWorkspaceResult, String> {
@@ -13109,6 +13223,45 @@ mod tests {
 
         assert!(RonomepoPluginConfig::decode(b"not json").is_err());
         assert!(RonomepoPluginConfig::decode(b"").is_ok());
+    }
+
+    #[test]
+    fn plugin_config_writes_keep_other_entries_and_never_clobber_bad_files() {
+        let dir = temp_test_dir("plugin-config");
+        let path = dir.join("ronomepo").join("plugins.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"other.plugin": {"schema_version": 3, "payload": [1, 2]}}"#,
+        )
+        .unwrap();
+
+        write_plugin_config(
+            &path,
+            vec![
+                Box::new(|config: &mut RonomepoPluginConfig| {
+                    config.git_sort_mode = MonitorSortMode::Branch;
+                }),
+                Box::new(|config: &mut RonomepoPluginConfig| {
+                    config.git_sort_descending = true;
+                }),
+            ],
+        );
+        let document: HashMap<String, Value> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(document["other.plugin"]["schema_version"], 3);
+        let payload: Vec<u8> =
+            serde_json::from_value(document[PLUGIN_ID]["payload"].clone()).unwrap();
+        let config = RonomepoPluginConfig::decode(&payload).unwrap();
+        assert_eq!(config.git_sort_mode, MonitorSortMode::Branch);
+        assert!(config.git_sort_descending);
+        let leftovers = fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "temporary file left behind");
+
+        fs::write(&path, "{ truncated").unwrap();
+        write_plugin_config(&path, vec![Box::new(|_: &mut RonomepoPluginConfig| {})]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ truncated");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
