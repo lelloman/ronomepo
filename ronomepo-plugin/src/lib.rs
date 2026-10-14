@@ -331,6 +331,9 @@ struct AppState {
     repo_runtime: HashMap<String, RepoRuntimeState>,
     watch_manager_sync_in_flight: bool,
     watch_manager_sync_pending: bool,
+    /// Parsed `.ronomepo/capability-state.json`, re-read only when capability
+    /// checks write it or a workspace scan completes.
+    capability_registry: Arc<CapabilityRegistry>,
 }
 
 impl Default for AppState {
@@ -375,6 +378,7 @@ impl Default for AppState {
             repo_runtime: HashMap::new(),
             watch_manager_sync_in_flight: false,
             watch_manager_sync_pending: false,
+            capability_registry: Arc::new(CapabilityRegistry::default()),
         }
     }
 }
@@ -1308,9 +1312,11 @@ fn initialize_state(config: &RonomepoPluginConfig) {
         .unwrap_or_else(|| PathBuf::from("."));
     let manifest_path = default_manifest_path(&workspace_root);
     let manifest = load_manifest_if_present(&manifest_path);
+    let capability_registry = read_capability_registry(&workspace_root);
 
     let mut app_state = state().lock().expect("state mutex poisoned");
     app_state.workspace_root = workspace_root.clone();
+    app_state.capability_registry = capability_registry;
     app_state.manifest_path = manifest.as_ref().map(|_| manifest_path.clone());
     app_state.manifest = manifest;
     app_state.workspace_status = empty_repository_status(workspace_root.clone());
@@ -1922,6 +1928,7 @@ fn handle_worker_result(result: WorkerResult) {
                 };
                 (rerun, prefetch_sort_details)
             };
+            reload_capability_registry();
             sync_watch_manager_from_state();
             if prefetch_sort_details {
                 prefetch_monitor_sort_details();
@@ -2149,6 +2156,7 @@ fn handle_worker_result(result: WorkerResult) {
                 Err(message) => format!("Capability checks failed: {message}"),
             };
             append_log(message);
+            reload_capability_registry();
             schedule_workspace_scan();
             refresh_views();
         }
@@ -2461,7 +2469,7 @@ struct StateSnapshot {
     line_stats_report: Vec<String>,
     line_stats_loading: bool,
     line_stats_since: String,
-    capability_registry: CapabilityRegistry,
+    capability_registry: Arc<CapabilityRegistry>,
 }
 
 fn snapshot() -> StateSnapshot {
@@ -2496,10 +2504,7 @@ fn snapshot() -> StateSnapshot {
         line_stats_report: app_state.line_stats_report.clone(),
         line_stats_loading: app_state.line_stats_loading,
         line_stats_since: app_state.line_stats_since.clone(),
-        capability_registry: load_capability_registry(&default_capability_registry_path(
-            &app_state.workspace_root,
-        ))
-        .unwrap_or_default(),
+        capability_registry: Arc::clone(&app_state.capability_registry),
     }
 }
 
@@ -3351,23 +3356,33 @@ fn update_monitor_sort_descending(descending: bool) {
 }
 
 fn update_monitor_view_mode(mode: MonitorViewMode) {
-    {
+    let sort_mode = {
         let mut app_state = state().lock().expect("state mutex poisoned");
         app_state.monitor_view_mode = mode;
-    }
-    if matches!(
-        active_monitor_sort_mode(&snapshot()),
-        MonitorSortMode::RecentActivity
-    ) {
+        match mode {
+            MonitorViewMode::Overview => app_state.overview_sort_mode,
+            MonitorViewMode::Git => app_state.git_sort_mode,
+            MonitorViewMode::Checks => app_state.checks_sort_mode,
+            MonitorViewMode::Manifest => app_state.manifest_sort_mode,
+        }
+    };
+    if sort_mode == MonitorSortMode::RecentActivity {
         prefetch_monitor_sort_details();
     }
     persist_monitor_view_mode(mode);
 }
 
 fn prefetch_monitor_sort_details() {
-    let snapshot = snapshot();
-    for item in snapshot.repository_items {
-        schedule_repo_details_load(&item.id, &item.status.repo_path);
+    let targets = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        app_state
+            .repository_items
+            .iter()
+            .map(|item| (item.id.clone(), item.status.repo_path.clone()))
+            .collect::<Vec<_>>()
+    };
+    for (repo_id, repo_path) in targets {
+        schedule_repo_details_load(&repo_id, &repo_path);
     }
 }
 
@@ -6630,7 +6645,7 @@ fn render_monorepo_overview_into(
     }
 
     let actions = overview_actions(false);
-    let selection_actions = monorepo_selection_actions(host_ptr, &items);
+    let selection_actions = monorepo_selection_actions(snapshot, host_ptr, &items);
     let report_actions = monorepo_report_actions(snapshot);
     let file_actions = overview_file_actions(snapshot, host_ptr);
     let command_area = GtkBox::new(Orientation::Vertical, 8);
@@ -6674,7 +6689,7 @@ fn render_monorepo_overview_into(
         &sections,
         "Needs Attention",
         "Repos with open git, manifest, or capability attention signals.",
-        &attention_items(&items),
+        &attention_items(snapshot, &items),
         Some(8),
         host_ptr,
     );
@@ -8303,8 +8318,30 @@ fn apply_loaded_manifest(
     app_state.repo_details_loading.clear();
     sync_repo_runtime_state(&mut app_state);
     drop(app_state);
+    reload_capability_registry();
     sync_watch_manager_from_state();
     schedule_workspace_scan();
+}
+
+fn read_capability_registry(workspace_root: &Path) -> Arc<CapabilityRegistry> {
+    Arc::new(
+        load_capability_registry(&default_capability_registry_path(workspace_root))
+            .unwrap_or_default(),
+    )
+}
+
+/// Re-reads the capability registry into the state cache. The file is read
+/// outside the state lock.
+fn reload_capability_registry() {
+    let workspace_root = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        app_state.workspace_root.clone()
+    };
+    let registry = read_capability_registry(&workspace_root);
+    let mut app_state = state().lock().expect("state mutex poisoned");
+    if app_state.workspace_root == workspace_root {
+        app_state.capability_registry = registry;
+    }
 }
 
 fn repo_overview_page_root() -> GtkBox {
@@ -9438,6 +9475,7 @@ fn overview_file_actions(
 }
 
 fn monorepo_selection_actions(
+    snapshot: &StateSnapshot,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
     items: &[RepositoryListItem],
 ) -> GtkBox {
@@ -9445,16 +9483,13 @@ fn monorepo_selection_actions(
     let bucket_row = GtkBox::new(Orientation::Horizontal, 8);
     let scope_row = GtkBox::new(Orientation::Horizontal, 8);
 
-    let current_snapshot = snapshot();
-    let selected_ids = current_snapshot.selected_repo_ids.clone();
+    let selected_ids = snapshot.selected_repo_ids.clone();
     let selected_count = selected_ids.len();
 
     for button in [
         select_repo_bucket(
             "Select Attention",
-            collect_repo_ids(items, |item| {
-                repo_attention_rank(&current_snapshot, item) < 7
-            }),
+            collect_repo_ids(items, |item| repo_attention_rank(snapshot, item) < 7),
         ),
         select_repo_bucket(
             "Select Dirty",
@@ -9691,11 +9726,13 @@ fn append_log_section(container: &GtkBox, heading: &str, logs: &[String], limit:
     container.append(&Separator::new(Orientation::Horizontal));
 }
 
-fn attention_items(items: &[RepositoryListItem]) -> Vec<RepositoryListItem> {
-    let current_snapshot = snapshot();
+fn attention_items(
+    snapshot: &StateSnapshot,
+    items: &[RepositoryListItem],
+) -> Vec<RepositoryListItem> {
     let mut attention = items
         .iter()
-        .filter(|item| repo_attention_rank(&current_snapshot, item) < 7)
+        .filter(|item| repo_attention_rank(snapshot, item) < 7)
         .cloned()
         .collect::<Vec<_>>();
     attention.sort_by_key(repo_monitor_sort_key);
@@ -10972,7 +11009,8 @@ fn resolve_editor_path(input: &str) -> PathBuf {
     if path.is_absolute() {
         path
     } else {
-        snapshot().workspace_root.join(path)
+        let app_state = state().lock().expect("state mutex poisoned");
+        app_state.workspace_root.join(path)
     }
 }
 
