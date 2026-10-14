@@ -35,9 +35,11 @@ static WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
 static MAIN_ACTIVITY: Mutex<Option<&'static str>> = Mutex::new(None);
 
 fn log_path() -> PathBuf {
-    let mut path = if let Ok(dir) = env::var("XDG_STATE_HOME") {
+    // Empty values count as unset (XDG base directory spec).
+    let var = |name| env::var_os(name).filter(|value| !value.is_empty());
+    let mut path = if let Some(dir) = var("XDG_STATE_HOME") {
         PathBuf::from(dir)
-    } else if let Ok(home) = env::var("HOME") {
+    } else if let Some(home) = var("HOME") {
         PathBuf::from(home).join(".local").join("state")
     } else {
         env::temp_dir()

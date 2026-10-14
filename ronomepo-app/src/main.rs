@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gtk::gio::prelude::ApplicationExtManual;
 use maruzzella::{
@@ -9,10 +9,12 @@ use maruzzella::{
     ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec,
 };
 use ronomepo_core::normalize_workspace_root;
+use ronomepo_plugin::{persisted_config_root, PERSISTENCE_ID};
 
 fn main() {
     configure_gtk_input_method();
-    reset_stale_persisted_layout();
+    clear_empty_xdg_dirs();
+    reset_stale_persisted_layouts();
 
     let workspace_root = parse_workspace_root_arg()
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -336,7 +338,7 @@ fn main() {
     );
 
     let config = MaruzzellaConfig::new("com.lelloman.ronomepo")
-        .with_persistence_id("ronomepo")
+        .with_persistence_id(PERSISTENCE_ID)
         .with_product(product)
         .with_builtin_plugin(embedded_ronomepo_plugin);
 
@@ -371,9 +373,35 @@ fn env_var_uses_ibus(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn reset_stale_persisted_layout() {
-    let path = persisted_layout_path("ronomepo");
-    let Ok(raw) = fs::read_to_string(&path) else {
+/// The XDG base directory spec says an empty variable counts as unset, but
+/// Maruzzella would treat an empty XDG_CONFIG_HOME as a relative path and put
+/// configs and layouts under the current directory.
+fn clear_empty_xdg_dirs() {
+    for name in ["XDG_CONFIG_HOME", "XDG_STATE_HOME"] {
+        if env::var_os(name).is_some_and(|value| value.is_empty()) {
+            env::remove_var(name);
+        }
+    }
+}
+
+/// Removes stale layouts from the main layout slot and from every scoped slot
+/// (`<persistence id>--<slot>`) Maruzzella keeps next to it.
+fn reset_stale_persisted_layouts() {
+    let slot_prefix = format!("{PERSISTENCE_ID}--");
+    let Ok(entries) = fs::read_dir(persisted_config_root()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == PERSISTENCE_ID || name.starts_with(&slot_prefix) {
+            reset_stale_persisted_layout(&entry.path().join("layout.json"));
+        }
+    }
+}
+
+fn reset_stale_persisted_layout(path: &Path) {
+    let Ok(raw) = fs::read_to_string(path) else {
         return;
     };
 
@@ -403,19 +431,6 @@ fn reset_stale_persisted_layout() {
     if has_stale_layout {
         let _ = fs::remove_file(path);
     }
-}
-
-fn persisted_layout_path(persistence_id: &str) -> PathBuf {
-    let mut path = if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(dir)
-    } else if let Ok(home) = env::var("HOME") {
-        PathBuf::from(home).join(".config")
-    } else {
-        PathBuf::from(".")
-    };
-    path.push(persistence_id);
-    path.push("layout.json");
-    path
 }
 
 fn parse_workspace_root_arg() -> Option<PathBuf> {
