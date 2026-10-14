@@ -175,7 +175,6 @@ const CMD_PUSH: &str = "ronomepo.workspace.push";
 const CMD_OPEN_OVERVIEW: &str = "ronomepo.workspace.open_overview";
 const CMD_OPEN_COMMIT_CHECK: &str = "ronomepo.workspace.open_commit_check";
 const CMD_FILTER: &str = "ronomepo.workspace.filter";
-const CMD_ADD_REPO: &str = "ronomepo.workspace.add_repo";
 const CMD_OPEN_FUCINA_POLICY: &str = "ronomepo.workspace.open_fucina_policy";
 const CMD_EXIT: &str = "ronomepo.workspace.exit";
 const CMD_REFRESH_LOGS: &str = "ronomepo.logs.refresh";
@@ -1190,9 +1189,6 @@ impl Plugin for RonomepoPlugin {
                 .with_handler(command_filter),
         )?;
         host.register_command(
-            CommandSpec::new(PLUGIN_ID, CMD_ADD_REPO, "Add Repo").with_handler(command_add_repo),
-        )?;
-        host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_OPEN_FUCINA_POLICY, "Fucina Policy")
                 .with_handler(command_open_fucina_policy),
         )?;
@@ -1412,105 +1408,31 @@ extern "C" fn command_apply_hooks(
 extern "C" fn command_open_overview(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    let host_ptr = current_host_ptr();
-    if host_ptr.is_null() {
-        append_log(
-            "Cannot focus Monorepo Overview because the Maruzzella host handle is unavailable."
-                .to_string(),
-        );
-        refresh_views();
-        return maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError);
-    }
-
-    let host = unsafe { HostApi::from_raw(&*host_ptr) };
-    let request = OpenViewRequest::new(
-        PLUGIN_ID,
-        VIEW_MONOREPO_OVERVIEW,
-        MzViewPlacement::Workbench,
-    );
-
-    match host.open_view(&request) {
-        Ok(MzViewOpenDisposition::Opened) => {
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::OK
-        }
-        Ok(MzViewOpenDisposition::FocusedExisting) => {
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::OK
-        }
-        Err(status) => {
-            append_log(format!("Failed to open Monorepo Overview: {status:?}"));
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
-        }
-    }
-}
-
-fn open_commit_check_view() -> Result<MzViewOpenDisposition, String> {
-    let host_ptr = current_host_ptr();
-    if host_ptr.is_null() {
-        return Err(
-            "Cannot focus Commit Check because the Maruzzella host handle is unavailable."
-                .to_string(),
-        );
-    }
-
-    let host = unsafe { HostApi::from_raw(&*host_ptr) };
-    let request = OpenViewRequest::new(PLUGIN_ID, VIEW_COMMIT_CHECK, MzViewPlacement::Workbench);
-    host.open_view(&request)
-        .map_err(|status| format!("Failed to open Commit Check: {status:?}"))
+    open_workbench_view_command(VIEW_MONOREPO_OVERVIEW, "Monorepo Overview")
 }
 
 extern "C" fn command_open_commit_check(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    match open_commit_check_view() {
-        Ok(MzViewOpenDisposition::Opened) => {
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::OK
-        }
-        Ok(MzViewOpenDisposition::FocusedExisting) => {
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::OK
-        }
-        Err(message) => {
-            append_log(message);
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
-        }
-    }
-}
-
-extern "C" fn command_add_repo(
-    _payload: maruzzella_sdk::ffi::MzBytes,
-) -> maruzzella_sdk::ffi::MzStatus {
-    match open_workspace_settings_tab() {
-        Ok(()) => {
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::OK
-        }
-        Err(message) => {
-            append_log(message);
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
-        }
-    }
+    open_workbench_view_command(VIEW_COMMIT_CHECK, "Commit Check")
 }
 
 extern "C" fn command_open_fucina_policy(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    match open_workspace_settings_tab() {
-        Ok(()) => {
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::OK
-        }
+    open_workbench_view_command(VIEW_FUCINA_POLICY, "Fucina Policy")
+}
+
+fn open_workbench_view_command(view_id: &str, title: &str) -> maruzzella_sdk::ffi::MzStatus {
+    let status = match open_plugin_view(view_id, MzViewPlacement::Workbench, title) {
+        Ok(_) => maruzzella_sdk::ffi::MzStatus::OK,
         Err(message) => {
             append_log(message);
-            refresh_views();
             maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
         }
-    }
+    };
+    refresh_views();
+    status
 }
 
 extern "C" fn command_exit(
@@ -2426,35 +2348,32 @@ fn current_host_ptr() -> *const maruzzella_sdk::ffi::MzHostApi {
     LAST_HOST_PTR.load(Ordering::Relaxed) as *const _
 }
 
-fn open_workspace_settings_tab() -> Result<(), String> {
-    let host_ptr = current_host_ptr();
-    if host_ptr.is_null() {
-        return Err(
-            "Cannot open Fucina Policy because the Maruzzella host handle is unavailable."
-                .to_string(),
-        );
-    }
+/// Opens one of the plugin's views, or focuses it when already open.
+fn open_plugin_view(
+    view_id: &str,
+    placement: MzViewPlacement,
+    title: &str,
+) -> Result<MzViewOpenDisposition, String> {
+    let Some(host) = (unsafe { current_host_ptr().as_ref() }).map(HostApi::from_raw) else {
+        return Err(format!(
+            "Cannot open {title} because the Maruzzella host handle is unavailable."
+        ));
+    };
+    host.open_view(&OpenViewRequest::new(PLUGIN_ID, view_id, placement))
+        .map_err(|status| format!("Failed to open {title}: {status:?}"))
+}
 
-    let host = unsafe { HostApi::from_raw(&*host_ptr) };
-    let request = OpenViewRequest::new(PLUGIN_ID, VIEW_FUCINA_POLICY, MzViewPlacement::Workbench);
-    match host.open_view(&request) {
-        Ok(_) => Ok(()),
-        Err(status) => Err(format!("Failed to open Fucina Policy: {status:?}")),
-    }
+fn open_workspace_settings_tab() -> Result<(), String> {
+    open_plugin_view(
+        VIEW_FUCINA_POLICY,
+        MzViewPlacement::Workbench,
+        "Fucina Policy",
+    )
+    .map(|_| ())
 }
 
 fn open_operations_panel() -> Result<(), String> {
-    let host_ptr = current_host_ptr();
-    if host_ptr.is_null() {
-        return Err(
-            "Cannot open Operations because the Maruzzella host handle is unavailable.".to_string(),
-        );
-    }
-    let host = unsafe { HostApi::from_raw(&*host_ptr) };
-    let request = OpenViewRequest::new(PLUGIN_ID, VIEW_OPERATIONS, MzViewPlacement::BottomPanel);
-    host.open_view(&request)
-        .map(|_| ())
-        .map_err(|status| format!("Failed to open Operations: {status:?}"))
+    open_plugin_view(VIEW_OPERATIONS, MzViewPlacement::BottomPanel, "Operations").map(|_| ())
 }
 
 #[derive(Clone)]
