@@ -2368,7 +2368,7 @@ fn gradle_command(
     };
 
     Some(PlannedCommand {
-        program: "./gradlew".to_string(),
+        program: gradle_wrapper_program(&workdir),
         args,
         workdir,
         env: BTreeMap::new(),
@@ -2391,13 +2391,20 @@ fn gradle_android_command(
     };
 
     Some(PlannedCommand {
-        program: "./gradlew".to_string(),
+        program: gradle_wrapper_program(&workdir),
         args,
         workdir,
         env: BTreeMap::new(),
         timeout_seconds: None,
         output: ActionOutputMode::Text,
     })
+}
+
+/// The wrapper is addressed by full path: a relative "./gradlew" would be
+/// resolved against the spawning process's directory on some platforms
+/// rather than the command's workdir.
+fn gradle_wrapper_program(workdir: &Path) -> String {
+    workdir.join("gradlew").to_string_lossy().to_string()
 }
 
 fn python_command(
@@ -2423,7 +2430,7 @@ fn python_command(
     };
 
     Some(PlannedCommand {
-        program: "python".to_string(),
+        program: "python3".to_string(),
         args,
         workdir,
         env: BTreeMap::new(),
@@ -2438,13 +2445,14 @@ fn node_supported_actions(repo_root: &Path, item: &RepoItem) -> Vec<StandardActi
         StandardActionName::VerifyDependenciesFreshness,
     ];
 
+    let scripts = node_package_scripts(repo_root, item);
     for action in [
         StandardActionName::Build,
         StandardActionName::Test,
         StandardActionName::Clean,
         StandardActionName::Deploy,
     ] {
-        if node_command(repo_root, item, action).is_some() {
+        if node_script_name(item, action).is_some_and(|script| scripts.contains(&script)) {
             actions.push(action);
         }
     }
@@ -2458,7 +2466,7 @@ fn node_command(
     action: StandardActionName,
 ) -> Option<PlannedCommand> {
     let script = node_script_name(item, action)?;
-    if !node_has_script(repo_root, item, &script) {
+    if !node_package_scripts(repo_root, item).contains(&script) {
         return None;
     }
 
@@ -2509,20 +2517,27 @@ fn node_script_name(item: &RepoItem, action: StandardActionName) -> Option<Strin
     }
 }
 
-fn node_has_script(repo_root: &Path, item: &RepoItem, script: &str) -> bool {
+/// Names of the non-empty scripts in the item's package.json.
+fn node_package_scripts(repo_root: &Path, item: &RepoItem) -> BTreeSet<String> {
     let package_json = resolve_item_path(repo_root, item).join("package.json");
     let Ok(content) = fs::read_to_string(package_json) else {
-        return false;
+        return BTreeSet::new();
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return false;
+        return BTreeSet::new();
     };
 
     value
         .get("scripts")
-        .and_then(|scripts| scripts.get(script))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|script_body| !script_body.trim().is_empty())
+        .and_then(serde_json::Value::as_object)
+        .map(|scripts| {
+            scripts
+                .iter()
+                .filter(|(_, body)| body.as_str().is_some_and(|body| !body.trim().is_empty()))
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn cargo_manifest_path(repo_root: &Path, item: &RepoItem) -> PathBuf {
@@ -4914,6 +4929,29 @@ mod tests {
 
         let report = verify_item_dependencies_freshness(&repo_root, &manifest, "web").unwrap();
         assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn built_in_commands_use_python3_and_an_absolute_gradle_wrapper() {
+        let repo_root = Path::new("/tmp/repo");
+        let item = |item_type: &str| RepoItem {
+            id: "app".to_string(),
+            item_type: item_type.to_string(),
+            path: PathBuf::from("app"),
+            config: None,
+            artifacts: Vec::new(),
+            actions: Vec::new(),
+        };
+
+        for item_type in ["gradle", "gradle_android"] {
+            let command =
+                built_in_command(repo_root, &item(item_type), StandardActionName::Build).unwrap();
+            assert_eq!(command.program, "/tmp/repo/app/gradlew");
+            assert_eq!(command.workdir, PathBuf::from("/tmp/repo/app"));
+        }
+        let command =
+            built_in_command(repo_root, &item("python"), StandardActionName::Test).unwrap();
+        assert_eq!(command.program, "python3");
     }
 
     #[test]
