@@ -796,6 +796,28 @@ struct RepositoryViewHandle {
 /// A Fucina Policy view. The policy part is rebuilt only when repos.toml
 /// changes; the action status label lives outside it so running actions keep
 /// reporting into a live label.
+/// A repo manifest editor tab that has not shown the editor yet, because the
+/// workspace state was still loading or the repo was missing when it rendered.
+/// Once the editor is shown the handle is dropped, so refreshes never rebuild
+/// it (and never discard unsaved edits).
+struct RepoManifestEditorHandle {
+    root: glib::WeakRef<GtkBox>,
+    repo_id: String,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+    shown: Cell<RepoTargetState>,
+}
+
+/// What a view targeting one repo can show for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepoTargetState {
+    /// The repo is in the manifest but the workspace scan has not produced
+    /// its item yet (e.g. a tab restored at startup).
+    Loading,
+    /// The repo is not in the workspace manifest.
+    Missing,
+    Ready,
+}
+
 struct FucinaPolicyViewHandle {
     root: glib::WeakRef<GtkBox>,
     policy_area: GtkBox,
@@ -955,6 +977,7 @@ thread_local! {
     static REPO_OVERVIEWS: RefCell<Vec<Rc<RepoOverviewView>>> = const { RefCell::new(Vec::new()) };
     static COMMIT_CHECK_VIEWS: RefCell<Vec<CommitCheckViewHandle>> = const { RefCell::new(Vec::new()) };
     static FUCINA_POLICY_VIEWS: RefCell<Vec<FucinaPolicyViewHandle>> = const { RefCell::new(Vec::new()) };
+    static REPO_MANIFEST_EDITORS: RefCell<Vec<RepoManifestEditorHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_BUFFERS: RefCell<Vec<OperationBufferHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_SUMMARY_CURSOR: Cell<Option<LogCursor>> = const { Cell::new(None) };
     static OPERATION_SUMMARIES: RefCell<Vec<OperationSummaryHandle>> = const { RefCell::new(Vec::new()) };
@@ -2810,6 +2833,7 @@ fn refresh_views_now() {
     refresh_repository_views(&snapshot);
     refresh_overview_views(&snapshot);
     refresh_workspace_settings_views(&snapshot);
+    refresh_repo_manifest_editors(&snapshot);
     refresh_operation_views(&snapshot);
     refresh_operation_buttons();
 }
@@ -3683,6 +3707,32 @@ fn append_monitor_name_cell(row: &GtkBox, item: &RepositoryListItem, show_branch
     cell.append(&name);
     cell.append(&branch);
     row.append(&cell);
+}
+
+/// Whether `repo_id` can be shown yet. Every manifest repo becomes a
+/// repository item once the workspace scan completes, so a repo that is in
+/// the manifest but has no item yet is still loading.
+fn repo_target_state(snapshot: &StateSnapshot, repo_id: &str) -> RepoTargetState {
+    repo_target_state_in(
+        snapshot.manifest.as_ref(),
+        &snapshot.repository_items,
+        repo_id,
+    )
+}
+
+fn repo_target_state_in(
+    manifest: Option<&WorkspaceManifest>,
+    repository_items: &[RepositoryListItem],
+    repo_id: &str,
+) -> RepoTargetState {
+    if repository_items.iter().any(|item| item.id == repo_id) {
+        RepoTargetState::Ready
+    } else if manifest.is_some_and(|manifest| manifest.repos.iter().any(|repo| repo.id == repo_id))
+    {
+        RepoTargetState::Loading
+    } else {
+        RepoTargetState::Missing
+    }
 }
 
 fn repository_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
@@ -9657,6 +9707,12 @@ fn render_repo_overview_page(
     };
 
     let Some(item) = repo_item_by_id(snapshot, active_repo_id) else {
+        // A restored tab renders before the first workspace scan; refreshes
+        // re-render it once the repo is available.
+        if repo_target_state(snapshot, active_repo_id) == RepoTargetState::Loading {
+            render_repo_overview_muted_page(root, "Loading the repository status...");
+            return;
+        }
         if page == RepoOverviewPage::Summary {
             render_repo_overview_empty_page(
                 root,
@@ -10202,13 +10258,26 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
 
     let target_repo_id = instance_key.or(snapshot.active_repo_id.as_deref());
     let Some(item) = target_repo_id.and_then(|repo_id| repo_item_by_id(snapshot, repo_id)) else {
+        // Replaced by sync_repo_terminal_panel once the repo is available.
         panel.add_css_class("repo-terminal-empty");
-        body.append(&ui::empty_state(
-            "utilities-terminal-symbolic",
-            "No terminal",
-            "No repository target is attached to this tab, so no terminal session can be started.",
-            None,
-        ));
+        let loading = target_repo_id.is_some_and(|repo_id| {
+            repo_target_state(snapshot, repo_id) == RepoTargetState::Loading
+        });
+        body.append(&if loading {
+            ui::empty_state(
+                "utilities-terminal-symbolic",
+                "Terminal",
+                "Loading the repository status...",
+                None,
+            )
+        } else {
+            ui::empty_state(
+                "utilities-terminal-symbolic",
+                "No terminal",
+                "No repository target is attached to this tab, so no terminal session can be started.",
+                None,
+            )
+        });
         return panel;
     };
 
@@ -11219,32 +11288,65 @@ fn create_repo_manifest_editor_view(
         return into_view_ptr(root);
     };
 
-    render_repo_manifest_editor_into(&root, &snapshot, &repo_id, host);
+    let shown = render_repo_manifest_editor_into(&root, &snapshot, &repo_id, host);
+    if shown != RepoTargetState::Ready {
+        REPO_MANIFEST_EDITORS.with(|editors| {
+            editors.borrow_mut().push(RepoManifestEditorHandle {
+                root: root.downgrade(),
+                repo_id,
+                host_ptr: host,
+                shown: Cell::new(shown),
+            });
+        });
+    }
 
     let scroller = vertical_view_scroller(&root);
 
     into_view_ptr(scroller)
 }
 
+/// Shows the editors still waiting for their repo once it is available.
+fn refresh_repo_manifest_editors(snapshot: &StateSnapshot) {
+    REPO_MANIFEST_EDITORS.with(|editors| {
+        editors.borrow_mut().retain(|handle| {
+            let Some(root) = handle.root.upgrade() else {
+                return false;
+            };
+            if repo_target_state(snapshot, &handle.repo_id) == handle.shown.get() {
+                return true;
+            }
+            let shown =
+                render_repo_manifest_editor_into(&root, snapshot, &handle.repo_id, handle.host_ptr);
+            handle.shown.set(shown);
+            shown != RepoTargetState::Ready
+        });
+    });
+}
+
+/// Renders the editor for `repo_id`, or a loading or missing state, and
+/// returns which one it rendered.
 fn render_repo_manifest_editor_into(
     root: &GtkBox,
     snapshot: &StateSnapshot,
     repo_id: &str,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-) {
+) -> RepoTargetState {
     clear_box(root);
 
-    let Some(item) = repository_items(snapshot)
-        .into_iter()
-        .find(|item| item.id == repo_id)
-    else {
+    let Some(item) = repo_item_by_id(snapshot, repo_id) else {
+        let state = repo_target_state(snapshot, repo_id);
+        let message = if state == RepoTargetState::Loading {
+            format!("Loading the workspace state for {repo_id}...")
+        } else {
+            format!("Repository {repo_id} is not present in the current workspace manifest.")
+        };
         root.append(&ui::empty_state(
             "document-edit-symbolic",
             "Repo Manifest Editor",
-            &format!("Repository {repo_id} is not present in the current workspace manifest."),
+            &message,
             None,
         ));
-        return;
+        return state;
     };
 
     let manifest_path = default_repo_manifest_path(&item.status.repo_path);
@@ -11473,6 +11575,7 @@ fn render_repo_manifest_editor_into(
             frame
         },
     );
+    RepoTargetState::Ready
 }
 
 fn append_repo_manifest_editor_section(
@@ -13966,6 +14069,36 @@ mod tests {
             shared_hooks_path: None,
             commit_check_rules: Some(default_commit_check_rules()),
         }
+    }
+
+    #[test]
+    fn restored_repo_targets_load_until_the_workspace_scan_lists_them() {
+        let mut manifest = empty_test_manifest(PathBuf::from("/workspace"));
+        manifest.repos.push(RepositoryEntry {
+            id: "peerlo".to_string(),
+            name: "peerlo".to_string(),
+            dir_name: "peerlo".to_string(),
+            remote_url: String::new(),
+            enabled: true,
+        });
+
+        assert_eq!(
+            repo_target_state_in(Some(&manifest), &[], "peerlo"),
+            RepoTargetState::Loading
+        );
+        assert_eq!(
+            repo_target_state_in(Some(&manifest), &[], "gone"),
+            RepoTargetState::Missing
+        );
+        assert_eq!(
+            repo_target_state_in(None, &[], "peerlo"),
+            RepoTargetState::Missing
+        );
+        let items = build_repository_list(&manifest);
+        assert_eq!(
+            repo_target_state_in(Some(&manifest), &items, "peerlo"),
+            RepoTargetState::Ready
+        );
     }
 
     #[test]
