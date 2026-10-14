@@ -678,10 +678,17 @@ struct EditorSaveMessage {
 
 struct RepositoryViewHandle {
     list: glib::WeakRef<ListBox>,
-    scroller: glib::WeakRef<ScrolledWindow>,
     store: gio::ListStore,
+    filter_model: gtk::FilterListModel,
     filter: CustomFilter,
     sorter: CustomSorter,
+    /// Filter and sort settings read by `filter` and `sorter`.
+    query: Rc<RefCell<MonitorQuery>>,
+    /// Mirror of the rows in `store`, used to update only rows that changed.
+    rows: RefCell<Vec<MonitorRow>>,
+    /// Whether the empty placeholder currently shown was built for a loaded
+    /// manifest; `None` while the list has rows.
+    placeholder_for_manifest: Cell<Option<bool>>,
 }
 
 #[derive(Default)]
@@ -2222,10 +2229,7 @@ fn refresh_repository_views(snapshot: &StateSnapshot) {
             let Some(list) = handle.list.upgrade() else {
                 return false;
             };
-            let Some(scroller) = handle.scroller.upgrade() else {
-                return false;
-            };
-            refresh_repository_view_handle(handle, &list, &scroller, &snapshot);
+            refresh_repository_view_handle(handle, &list, snapshot);
             true
         });
     });
@@ -2511,16 +2515,58 @@ fn snapshot() -> StateSnapshot {
 fn refresh_repository_view_handle(
     handle: &RepositoryViewHandle,
     list: &ListBox,
-    _scroller: &ScrolledWindow,
     snapshot: &StateSnapshot,
 ) {
-    sync_repository_monitor_store(&handle.store, &all_monitor_items(snapshot));
-    handle.filter.changed(FilterChange::Different);
-    handle.sorter.changed(SorterChange::Different);
-    sync_repository_monitor_selection(list, &snapshot.selected_repo_ids);
+    let query = monitor_query(snapshot);
+    let (filter_changed, sort_changed) = {
+        let mut current = handle.query.borrow_mut();
+        let filter_changed =
+            current.filter_mode != query.filter_mode || current.filter_text != query.filter_text;
+        let sort_changed =
+            current.sort_mode != query.sort_mode || current.descending != query.descending;
+        *current = query;
+        (filter_changed, sort_changed)
+    };
 
-    let filtered_items = visible_monitor_items(snapshot);
-    update_repository_monitor_empty_state(list, snapshot, filtered_items.is_empty());
+    let next_rows = monitor_rows(snapshot);
+    let update = monitor_store_update(&handle.rows.borrow(), &next_rows);
+    match update {
+        MonitorStoreUpdate::Unchanged => {}
+        MonitorStoreUpdate::Positions(positions) => {
+            for position in positions {
+                handle.store.splice(
+                    position as u32,
+                    1,
+                    &[BoxedAnyObject::new(next_rows[position].clone())],
+                );
+            }
+        }
+        MonitorStoreUpdate::Replace => {
+            let objects = next_rows
+                .iter()
+                .cloned()
+                .map(BoxedAnyObject::new)
+                .collect::<Vec<_>>();
+            handle.store.splice(0, handle.store.n_items(), &objects);
+        }
+    }
+    *handle.rows.borrow_mut() = next_rows;
+
+    // Changed rows are re-filtered and re-sorted by the models themselves; a
+    // full pass is only needed when the criteria change.
+    if filter_changed {
+        handle.filter.changed(FilterChange::Different);
+    }
+    if sort_changed {
+        handle.sorter.changed(SorterChange::Different);
+    }
+    sync_repository_monitor_selection(list, &snapshot.selected_repo_ids);
+    update_repository_monitor_empty_state(
+        handle,
+        list,
+        snapshot,
+        handle.filter_model.n_items() == 0,
+    );
 }
 
 fn status_label(state: &ronomepo_core::RepositoryState) -> &'static str {
@@ -2599,22 +2645,16 @@ fn branch_label(item: &RepositoryListItem) -> &str {
     item.status.branch.as_deref().unwrap_or("detached")
 }
 
-fn all_monitor_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
-    let mut items = vec![monorepo_monitor_item(snapshot)];
-    items.extend(repository_items(snapshot));
-    items
-}
-
-fn sync_repository_monitor_store(store: &gio::ListStore, next_items: &[RepositoryListItem]) {
-    let boxed_items = next_items
-        .iter()
-        .cloned()
-        .map(BoxedAnyObject::new)
-        .collect::<Vec<_>>();
-    store.splice(0, store.n_items(), &boxed_items);
-}
-
-fn update_repository_monitor_empty_state(list: &ListBox, snapshot: &StateSnapshot, is_empty: bool) {
+fn update_repository_monitor_empty_state(
+    handle: &RepositoryViewHandle,
+    list: &ListBox,
+    snapshot: &StateSnapshot,
+    is_empty: bool,
+) {
+    let next = is_empty.then_some(snapshot.manifest.is_some());
+    if handle.placeholder_for_manifest.replace(next) == next {
+        return;
+    }
     if is_empty {
         list.add_css_class("repo-monitor-empty");
         list.set_placeholder(Some(&repository_monitor_empty_placeholder(snapshot)));
@@ -2684,43 +2724,151 @@ fn repo_id_from_list_box_row(row: &ListBoxRow) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
-fn repo_item_from_object(object: &glib::Object) -> Option<RepositoryListItem> {
+fn with_monitor_row<T>(object: &glib::Object, read: impl FnOnce(&MonitorRow) -> T) -> Option<T> {
     object
         .downcast_ref::<BoxedAnyObject>()
-        .map(|boxed| boxed.borrow::<RepositoryListItem>().clone())
+        .map(|boxed| read(&boxed.borrow::<MonitorRow>()))
 }
 
-fn repo_monitor_filter_matches(item: &RepositoryListItem, snapshot: &StateSnapshot) -> bool {
-    if !matches_filter_mode(item, active_monitor_filter_mode(snapshot), snapshot) {
-        return false;
+/// One repository monitor row: the item plus every derived value the row
+/// widgets, filter and sorter read, computed once per refresh. Rows whose
+/// inputs did not change compare equal and keep their widgets.
+#[derive(Clone, Debug, PartialEq)]
+struct MonitorRow {
+    item: RepositoryListItem,
+    view_mode: MonitorViewMode,
+    name_key: String,
+    attention_signals: Vec<AttentionSignal>,
+    attention_rank: u8,
+    capability: CapabilityMonitorSummary,
+    enabled: Option<bool>,
+    last_commit_epoch_secs: i64,
+    /// Lowercased searchable fields, separated so a filter cannot match
+    /// across two of them.
+    search_text: String,
+}
+
+/// Filter and sort settings applied by the monitor list models.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MonitorQuery {
+    filter_mode: MonitorFilterMode,
+    /// Trimmed and lowercased; empty matches everything.
+    filter_text: String,
+    sort_mode: MonitorSortMode,
+    descending: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MonitorStoreUpdate {
+    Unchanged,
+    /// Same rows in the same order; only these positions changed.
+    Positions(Vec<usize>),
+    Replace,
+}
+
+fn monitor_query(snapshot: &StateSnapshot) -> MonitorQuery {
+    MonitorQuery {
+        filter_mode: active_monitor_filter_mode(snapshot),
+        filter_text: snapshot.monitor_filter.trim().to_ascii_lowercase(),
+        sort_mode: active_monitor_sort_mode(snapshot),
+        descending: active_monitor_sort_descending(snapshot),
     }
-    let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
-    if filter.is_empty() {
-        return true;
+}
+
+fn monitor_rows(snapshot: &StateSnapshot) -> Vec<MonitorRow> {
+    std::iter::once(monorepo_monitor_item(snapshot))
+        .chain(snapshot.repository_items.iter().cloned())
+        .map(|item| {
+            let enabled = workspace_repo_enabled(snapshot, &item);
+            let last_commit_epoch_secs = snapshot
+                .repo_details_cache
+                .get(&item.id)
+                .and_then(|details| details.last_commit.as_ref())
+                .map(|commit| commit.committed_at_epoch_secs)
+                .unwrap_or(i64::MIN);
+            build_monitor_row(
+                item,
+                snapshot.monitor_view_mode,
+                &snapshot.capability_registry,
+                enabled,
+                last_commit_epoch_secs,
+            )
+        })
+        .collect()
+}
+
+fn build_monitor_row(
+    item: RepositoryListItem,
+    view_mode: MonitorViewMode,
+    registry: &CapabilityRegistry,
+    enabled: Option<bool>,
+    last_commit_epoch_secs: i64,
+) -> MonitorRow {
+    let attention_signals = derive_attention_signals(&item, None, registry);
+    let attention_rank = attention_signals_rank(&attention_signals);
+    let capability = capability_monitor_summary(&item, registry);
+    let search_text = [
+        item.name.as_str(),
+        item.dir_name.as_str(),
+        item.remote_url.as_str(),
+        branch_label(&item),
+        &format_sync_label(&item.status.sync),
+        status_label(&item.status.state),
+        manifest_presence_search_text(item.repo_manifest.as_ref()),
+        &capability_monitor_search_text(&capability),
+        &attention_monitor_search_text(&attention_signals),
+    ]
+    .join("\u{1f}")
+    .to_ascii_lowercase();
+    MonitorRow {
+        name_key: item.name.to_ascii_lowercase(),
+        item,
+        view_mode,
+        attention_signals,
+        attention_rank,
+        capability,
+        enabled,
+        last_commit_epoch_secs,
+        search_text,
     }
-    let branch = branch_label(item).to_ascii_lowercase();
-    let sync = format_sync_label(&item.status.sync).to_ascii_lowercase();
-    let state = status_label(&item.status.state).to_ascii_lowercase();
-    let manifest = manifest_presence_search_text(item.repo_manifest.as_ref()).to_ascii_lowercase();
-    let capability = capability_monitor_search_text(item, snapshot).to_ascii_lowercase();
-    let attention =
-        attention_monitor_search_text(&repo_attention_signals(snapshot, item)).to_ascii_lowercase();
-    item.name.to_ascii_lowercase().contains(&filter)
-        || item.dir_name.to_ascii_lowercase().contains(&filter)
-        || item.remote_url.to_ascii_lowercase().contains(&filter)
-        || branch.contains(&filter)
-        || sync.contains(&filter)
-        || state.contains(&filter)
-        || manifest.contains(&filter)
-        || capability.contains(&filter)
-        || attention.contains(&filter)
+}
+
+fn monitor_store_update(current: &[MonitorRow], next: &[MonitorRow]) -> MonitorStoreUpdate {
+    if current.len() != next.len()
+        || current
+            .iter()
+            .zip(next)
+            .any(|(current, next)| current.item.id != next.item.id)
+    {
+        return MonitorStoreUpdate::Replace;
+    }
+    let changed = current
+        .iter()
+        .zip(next)
+        .enumerate()
+        .filter(|(_, (current, next))| current != next)
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    if changed.is_empty() {
+        MonitorStoreUpdate::Unchanged
+    } else if changed.len() * 2 > next.len() {
+        // One splice rebuilds everything at once instead of re-sorting per row.
+        MonitorStoreUpdate::Replace
+    } else {
+        MonitorStoreUpdate::Positions(changed)
+    }
+}
+
+fn monitor_row_matches(row: &MonitorRow, query: &MonitorQuery) -> bool {
+    monitor_row_matches_mode(row, query.filter_mode)
+        && (query.filter_text.is_empty() || row.search_text.contains(&query.filter_text))
 }
 
 fn build_repo_monitor_row(
-    item: &RepositoryListItem,
+    row: &MonitorRow,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> GtkBox {
-    let current_snapshot = snapshot();
+    let item = &row.item;
     let content = GtkBox::new(Orientation::Horizontal, 10);
     mark_clickable(&content);
     content.set_margin_top(8);
@@ -2736,11 +2884,11 @@ fn build_repo_monitor_row(
     )));
 
     append_monitor_name_cell(&content, item);
-    match current_snapshot.monitor_view_mode {
+    match row.view_mode {
         MonitorViewMode::Overview => {
             content.append(&monitor_state_cell(&item.status.state));
             content.append(&monitor_sync_cell(&item.status.sync));
-            content.append(&monitor_attention_cell(&current_snapshot, item));
+            content.append(&monitor_attention_cell(&row.attention_signals));
         }
         MonitorViewMode::Git => {
             content.append(&monitor_text_cell(
@@ -2754,13 +2902,13 @@ fn build_repo_monitor_row(
         }
         MonitorViewMode::Checks => {
             content.append(&monitor_manifest_cell(item.repo_manifest.as_ref()));
-            content.append(&monitor_capability_cell(item, &current_snapshot));
-            content.append(&monitor_attention_cell(&current_snapshot, item));
+            content.append(&monitor_capability_cell(&row.capability));
+            content.append(&monitor_attention_cell(&row.attention_signals));
         }
         MonitorViewMode::Manifest => {
             content.append(&monitor_manifest_cell(item.repo_manifest.as_ref()));
             content.append(&monitor_manifest_actions_cell(item));
-            content.append(&monitor_enabled_cell(&current_snapshot, item));
+            content.append(&monitor_enabled_cell(row.enabled));
             content.append(&monitor_text_cell(
                 &item.remote_url,
                 MONITOR_BRANCH_COL_CHARS,
@@ -2771,6 +2919,18 @@ fn build_repo_monitor_row(
     }
     attach_repo_monitor_context_menu(&content, host_ptr);
     content
+}
+
+fn build_repo_monitor_list_row(
+    row: &MonitorRow,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) -> ListBoxRow {
+    let list_row = ListBoxRow::new();
+    list_row.set_child(Some(&build_repo_monitor_row(row, host_ptr)));
+    // Selection only ever targets repositories, so the monorepo row would be
+    // deselected again on the next refresh.
+    list_row.set_selectable(row.item.id != MONOREPO_ROW_ID);
+    list_row
 }
 
 fn append_monitor_name_cell(row: &GtkBox, item: &RepositoryListItem) {
@@ -2799,10 +2959,6 @@ fn monorepo_monitor_item(snapshot: &StateSnapshot) -> RepositoryListItem {
     }
 }
 
-fn visible_monitor_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
-    filtered_repository_items(snapshot, all_monitor_items(snapshot))
-}
-
 fn active_monitor_filter_mode(snapshot: &StateSnapshot) -> MonitorFilterMode {
     match snapshot.monitor_view_mode {
         MonitorViewMode::Overview => snapshot.overview_filter_mode,
@@ -2828,26 +2984,6 @@ fn active_monitor_sort_descending(snapshot: &StateSnapshot) -> bool {
         MonitorViewMode::Checks => snapshot.checks_sort_descending,
         MonitorViewMode::Manifest => snapshot.manifest_sort_descending,
     }
-}
-
-fn filtered_repository_items(
-    snapshot: &StateSnapshot,
-    mut items: Vec<RepositoryListItem>,
-) -> Vec<RepositoryListItem> {
-    items.sort_by(|left, right| repo_monitor_sort_cmp(snapshot, left, right));
-
-    let mode = active_monitor_filter_mode(snapshot);
-    items.retain(|item| matches_filter_mode(item, mode, snapshot));
-
-    let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
-    if filter.is_empty() {
-        return items;
-    }
-
-    items
-        .into_iter()
-        .filter(|item| repo_monitor_filter_matches(item, snapshot))
-        .collect()
 }
 
 fn repo_monitor_sort_key(item: &RepositoryListItem) -> (u8, String) {
@@ -3000,101 +3136,57 @@ fn monitor_sort_direction_label(descending: bool) -> &'static str {
     }
 }
 
-fn repo_monitor_sort_cmp(
-    snapshot: &StateSnapshot,
-    left: &RepositoryListItem,
-    right: &RepositoryListItem,
+fn monitor_row_cmp(
+    query: &MonitorQuery,
+    left: &MonitorRow,
+    right: &MonitorRow,
 ) -> std::cmp::Ordering {
     let monorepo_rank =
-        u8::from(left.id == MONOREPO_ROW_ID).cmp(&u8::from(right.id == MONOREPO_ROW_ID));
+        u8::from(left.item.id == MONOREPO_ROW_ID).cmp(&u8::from(right.item.id == MONOREPO_ROW_ID));
     if monorepo_rank != std::cmp::Ordering::Equal {
         return monorepo_rank;
     }
 
-    let ordering = match active_monitor_sort_mode(snapshot) {
-        MonitorSortMode::Name => left
-            .name
+    let by_name = || left.name_key.cmp(&right.name_key);
+    let ordering = match query.sort_mode {
+        MonitorSortMode::Name => by_name(),
+        MonitorSortMode::Branch => branch_label(&left.item)
             .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase()),
-        MonitorSortMode::Branch => branch_label(left)
-            .to_ascii_lowercase()
-            .cmp(&branch_label(right).to_ascii_lowercase())
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            }),
+            .cmp(&branch_label(&right.item).to_ascii_lowercase())
+            .then_with(by_name),
         MonitorSortMode::SyncState => {
-            repo_sync_state_sort_key(left).cmp(&repo_sync_state_sort_key(right))
+            repo_sync_state_sort_key(&left.item).cmp(&repo_sync_state_sort_key(&right.item))
         }
-        MonitorSortMode::RecentActivity => repo_last_activity_sort_key(snapshot, left)
-            .cmp(&repo_last_activity_sort_key(snapshot, right))
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            }),
-        MonitorSortMode::Attention => repo_attention_rank(snapshot, left)
-            .cmp(&repo_attention_rank(snapshot, right))
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            }),
-        MonitorSortMode::CheckState => capability_sort_key(snapshot, left)
-            .cmp(&capability_sort_key(snapshot, right))
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            }),
-        MonitorSortMode::Manifest => manifest_sort_key(left)
-            .cmp(&manifest_sort_key(right))
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            }),
-        MonitorSortMode::Actions => manifest_action_count_sort_key(left)
-            .cmp(&manifest_action_count_sort_key(right))
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            }),
+        MonitorSortMode::RecentActivity => (left.last_commit_epoch_secs, left.attention_rank)
+            .cmp(&(right.last_commit_epoch_secs, right.attention_rank))
+            .then_with(by_name),
+        MonitorSortMode::Attention => left
+            .attention_rank
+            .cmp(&right.attention_rank)
+            .then_with(by_name),
+        MonitorSortMode::CheckState => capability_sort_key(&left.capability)
+            .cmp(&capability_sort_key(&right.capability))
+            .then_with(by_name),
+        MonitorSortMode::Manifest => manifest_sort_key(&left.item)
+            .cmp(&manifest_sort_key(&right.item))
+            .then_with(by_name),
+        MonitorSortMode::Actions => manifest_action_count_sort_key(&left.item)
+            .cmp(&manifest_action_count_sort_key(&right.item))
+            .then_with(by_name),
     };
 
-    if active_monitor_sort_descending(snapshot) {
+    if query.descending {
         ordering.reverse()
     } else {
         ordering
     }
 }
 
-fn repo_last_activity_sort_key(
-    snapshot: &StateSnapshot,
-    item: &RepositoryListItem,
-) -> (i64, u8, String) {
-    let committed_at_epoch_secs = snapshot
-        .repo_details_cache
-        .get(&item.id)
-        .and_then(|details| details.last_commit.as_ref())
-        .map(|commit| commit.committed_at_epoch_secs)
-        .unwrap_or(i64::MIN);
-    (
-        committed_at_epoch_secs,
-        repo_attention_rank(snapshot, item),
-        item.name.to_ascii_lowercase(),
-    )
-}
-
-fn matches_filter_mode(
-    item: &RepositoryListItem,
-    mode: MonitorFilterMode,
-    snapshot: &StateSnapshot,
-) -> bool {
+fn monitor_row_matches_mode(row: &MonitorRow, mode: MonitorFilterMode) -> bool {
     use ronomepo_core::{RepositoryState, RepositorySync};
 
+    let item = &row.item;
+    let summary = &row.capability;
     match mode {
         MonitorFilterMode::All => true,
         MonitorFilterMode::Dirty => {
@@ -3116,12 +3208,11 @@ fn matches_filter_mode(
                     RepositorySync::UpToDate | RepositorySync::NoUpstream
                 )
         }
-        MonitorFilterMode::Issues => !repo_attention_signals(snapshot, item).is_empty(),
-        MonitorFilterMode::NeedsAttention => repo_attention_rank(snapshot, item) <= 2,
-        MonitorFilterMode::Healthy => repo_attention_signals(snapshot, item).is_empty(),
-        MonitorFilterMode::Due => repo_needs_capability_attention(snapshot, item),
+        MonitorFilterMode::Issues => !row.attention_signals.is_empty(),
+        MonitorFilterMode::NeedsAttention => row.attention_rank <= 2,
+        MonitorFilterMode::Healthy => row.attention_signals.is_empty(),
+        MonitorFilterMode::Due => capability_summary_needs_attention(summary),
         MonitorFilterMode::Failing => {
-            let summary = capability_monitor_summary(item, snapshot);
             summary.policy_issues > 0
                 || summary.unsupported > 0
                 || summary.error > 0
@@ -3136,22 +3227,24 @@ fn matches_filter_mode(
                 )
         }
         MonitorFilterMode::NoChecks => {
-            let summary = capability_monitor_summary(item, snapshot);
             item.id != MONOREPO_ROW_ID && summary.declared == 0 && summary.stored == 0
         }
-        MonitorFilterMode::Enabled => workspace_repo_enabled(snapshot, item) == Some(true),
-        MonitorFilterMode::Disabled => workspace_repo_enabled(snapshot, item) == Some(false),
+        MonitorFilterMode::Enabled => row.enabled == Some(true),
+        MonitorFilterMode::Disabled => row.enabled == Some(false),
         MonitorFilterMode::HasActions => manifest_action_count(item) > 0,
     }
 }
 
 fn repo_attention_rank(snapshot: &StateSnapshot, item: &RepositoryListItem) -> u8 {
-    let signals = repo_attention_signals(snapshot, item);
+    attention_signals_rank(&repo_attention_signals(snapshot, item))
+}
+
+fn attention_signals_rank(signals: &[AttentionSignal]) -> u8 {
     if signals.is_empty() {
         return 7;
     }
 
-    match attention_rank(&signals) {
+    match attention_rank(signals) {
         0 => 0,
         1 => 1,
         2 => 3,
@@ -3170,8 +3263,7 @@ fn repo_sync_state_sort_key(item: &RepositoryListItem) -> (u8, usize, u8, String
     )
 }
 
-fn capability_sort_key(snapshot: &StateSnapshot, item: &RepositoryListItem) -> (u8, usize, String) {
-    let summary = capability_monitor_summary(item, snapshot);
+fn capability_sort_key(summary: &CapabilityMonitorSummary) -> (u8, usize) {
     let rank = if summary.policy_issues > 0 || summary.unsupported > 0 {
         0
     } else if summary.error > 0 {
@@ -3199,7 +3291,6 @@ fn capability_sort_key(snapshot: &StateSnapshot, item: &RepositoryListItem) -> (
                 .saturating_add(summary.stored)
                 .saturating_add(summary.policy_issues)
                 .saturating_add(summary.unsupported),
-        item.name.to_ascii_lowercase(),
     )
 }
 
@@ -5444,9 +5535,8 @@ extern "C" fn create_repo_monitor_view(
         dropdown.connect_selected_notify(move |dropdown| {
             let mode = monitor_sort_mode_from_index(view, dropdown.selected());
             update_monitor_sort_mode(mode);
-            let snapshot = snapshot();
-            refresh_repository_views(&snapshot);
-            refresh_views();
+            // Sorting only affects the monitor lists, so skip the full refresh.
+            refresh_repository_views(&snapshot());
         });
         sort_stack.add_named(&dropdown, Some(monitor_view_mode_key(view)));
     }
@@ -5472,9 +5562,7 @@ extern "C" fn create_repo_monitor_view(
             sort_direction.set(next);
             sort_indicator_label.set_text(monitor_sort_direction_label(next));
             update_monitor_sort_descending(next);
-            let snapshot = snapshot();
-            refresh_repository_views(&snapshot);
-            refresh_views();
+            refresh_repository_views(&snapshot());
         }
     });
     sort_box.append(&sort_indicator);
@@ -5524,19 +5612,24 @@ extern "C" fn create_repo_monitor_view(
     controls.append(&filter_sort_row);
 
     let store = gio::ListStore::new::<BoxedAnyObject>();
-    let filter = CustomFilter::new(|object| {
-        let snapshot = snapshot();
-        repo_item_from_object(object)
-            .is_some_and(|item| repo_monitor_filter_matches(&item, &snapshot))
+    let query = Rc::new(RefCell::new(monitor_query(&initial_snapshot)));
+    let filter = CustomFilter::new({
+        let query = Rc::clone(&query);
+        move |object| {
+            with_monitor_row(object, |row| monitor_row_matches(row, &query.borrow()))
+                .unwrap_or(false)
+        }
     });
     let filter_model = gtk::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
-    let sorter = CustomSorter::new(|left, right| {
-        let snapshot = snapshot();
-        let left = repo_item_from_object(left);
-        let right = repo_item_from_object(right);
-        match (left, right) {
-            (Some(left), Some(right)) => repo_monitor_sort_cmp(&snapshot, &left, &right).into(),
-            _ => gtk::Ordering::Equal,
+    let sorter = CustomSorter::new({
+        let query = Rc::clone(&query);
+        move |left, right| {
+            let query = query.borrow();
+            with_monitor_row(left, |left| {
+                with_monitor_row(right, |right| monitor_row_cmp(&query, left, right))
+            })
+            .flatten()
+            .map_or(gtk::Ordering::Equal, Into::into)
         }
     });
     let sort_model = SortListModel::new(Some(filter_model.clone()), Some(sorter.clone()));
@@ -5548,9 +5641,8 @@ extern "C" fn create_repo_monitor_view(
     list.set_valign(Align::Start);
     list.set_selection_mode(SelectionMode::Multiple);
     list.bind_model(Some(&sort_model), move |object| {
-        repo_item_from_object(object)
-            .map(|item| build_repo_monitor_row(&item, host))
-            .unwrap_or_else(|| GtkBox::new(Orientation::Horizontal, 0))
+        with_monitor_row(object, |row| build_repo_monitor_list_row(row, host))
+            .unwrap_or_else(|| ListBoxRow::new())
             .upcast()
     });
     {
@@ -5641,39 +5733,25 @@ extern "C" fn create_repo_monitor_view(
     scroller.set_valign(Align::Fill);
     scroller.set_propagate_natural_height(false);
 
-    let snapshot = snapshot();
     content.append(&controls);
     content.append(&header_stack);
     content.append(&scroller);
 
-    sync_repository_monitor_store(&store, &all_monitor_items(&snapshot));
-    filter.changed(FilterChange::Different);
-    sorter.changed(SorterChange::Different);
-    refresh_repository_view_handle(
-        &RepositoryViewHandle {
-            list: glib::WeakRef::new(),
-            scroller: glib::WeakRef::new(),
-            store: store.clone(),
-            filter: filter.clone(),
-            sorter: sorter.clone(),
-        },
-        &list,
-        &scroller,
-        &snapshot,
-    );
-
     let list_ref = glib::WeakRef::new();
     list_ref.set(Some(&list));
-    let scroller_ref = glib::WeakRef::new();
-    scroller_ref.set(Some(&scroller));
+    let handle = RepositoryViewHandle {
+        list: list_ref,
+        store,
+        filter_model,
+        filter,
+        sorter,
+        query,
+        rows: RefCell::new(Vec::new()),
+        placeholder_for_manifest: Cell::new(None),
+    };
+    refresh_repository_view_handle(&handle, &list, &initial_snapshot);
     REPOSITORY_VIEWS.with(|views| {
-        views.borrow_mut().push(RepositoryViewHandle {
-            list: list_ref,
-            scroller: scroller_ref,
-            store,
-            filter,
-            sorter,
-        });
+        views.borrow_mut().push(handle);
     });
 
     unsafe {
@@ -5796,7 +5874,7 @@ fn monitor_text_cell(text: &str, width_chars: i32, width_px: i32, expand: bool) 
     label
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CapabilityMonitorSummary {
     declared: usize,
     stored: usize,
@@ -5813,7 +5891,7 @@ struct CapabilityMonitorSummary {
 
 fn capability_monitor_summary(
     item: &RepositoryListItem,
-    snapshot: &StateSnapshot,
+    registry: &CapabilityRegistry,
 ) -> CapabilityMonitorSummary {
     if item.id == MONOREPO_ROW_ID {
         return CapabilityMonitorSummary::default();
@@ -5839,8 +5917,7 @@ fn capability_monitor_summary(
         ronomepo_core::RepositoryState::Dirty | ronomepo_core::RepositoryState::Untracked
     );
 
-    for state in snapshot
-        .capability_registry
+    for state in registry
         .states
         .iter()
         .filter(|state| state.repo_id == item.id)
@@ -5956,11 +6033,10 @@ fn capability_monitor_tooltip(summary: &CapabilityMonitorSummary) -> String {
     )
 }
 
-fn capability_monitor_search_text(item: &RepositoryListItem, snapshot: &StateSnapshot) -> String {
-    let summary = capability_monitor_summary(item, snapshot);
+fn capability_monitor_search_text(summary: &CapabilityMonitorSummary) -> String {
     format!(
         "capabilities {} policy {} unsupported {} stale {} warning {} failed {} error {} unknown {}",
-        capability_monitor_label(&summary),
+        capability_monitor_label(summary),
         summary.policy_issues,
         summary.unsupported,
         summary.stale,
@@ -6049,20 +6125,19 @@ fn attention_monitor_search_text(signals: &[AttentionSignal]) -> String {
     text
 }
 
-fn monitor_attention_cell(snapshot: &StateSnapshot, item: &RepositoryListItem) -> Label {
-    let signals = repo_attention_signals(snapshot, item);
-    let text = attention_monitor_label(&signals);
+fn monitor_attention_cell(signals: &[AttentionSignal]) -> Label {
+    let text = attention_monitor_label(signals);
     let label = monitor_text_cell(
         text,
         MONITOR_ATTENTION_COL_CHARS,
         MONITOR_ATTENTION_COL_WIDTH,
         false,
     );
-    attach_text_tooltip(&label, attention_monitor_tooltip(&signals));
+    attach_text_tooltip(&label, attention_monitor_tooltip(signals));
     let escaped = glib::markup_escape_text(text);
     label.set_markup(&format!(
         "<span foreground=\"{}\">{escaped}</span>",
-        attention_monitor_color(&signals)
+        attention_monitor_color(signals)
     ));
     label
 }
@@ -6310,7 +6385,13 @@ fn capability_finding_severity_label(severity: CapabilityFindingSeverity) -> &'s
 }
 
 fn repo_needs_capability_attention(snapshot: &StateSnapshot, item: &RepositoryListItem) -> bool {
-    let summary = capability_monitor_summary(item, snapshot);
+    capability_summary_needs_attention(&capability_monitor_summary(
+        item,
+        &snapshot.capability_registry,
+    ))
+}
+
+fn capability_summary_needs_attention(summary: &CapabilityMonitorSummary) -> bool {
     summary.policy_issues > 0
         || summary.unsupported > 0
         || summary.error > 0
@@ -6320,20 +6401,19 @@ fn repo_needs_capability_attention(snapshot: &StateSnapshot, item: &RepositoryLi
         || summary.unknown > 0
 }
 
-fn monitor_capability_cell(item: &RepositoryListItem, snapshot: &StateSnapshot) -> Label {
-    let summary = capability_monitor_summary(item, snapshot);
-    let text = capability_monitor_label(&summary);
+fn monitor_capability_cell(summary: &CapabilityMonitorSummary) -> Label {
+    let text = capability_monitor_label(summary);
     let label = monitor_text_cell(
         text,
         MONITOR_CAPABILITY_COL_CHARS,
         MONITOR_CAPABILITY_COL_WIDTH,
         false,
     );
-    attach_text_tooltip(&label, capability_monitor_tooltip(&summary));
+    attach_text_tooltip(&label, capability_monitor_tooltip(summary));
     let escaped = glib::markup_escape_text(text);
     label.set_markup(&format!(
         "<span foreground=\"{}\">{escaped}</span>",
-        capability_monitor_color(&summary)
+        capability_monitor_color(summary)
     ));
     label
 }
@@ -6373,8 +6453,7 @@ fn monitor_manifest_actions_cell(item: &RepositoryListItem) -> Label {
     label
 }
 
-fn monitor_enabled_cell(snapshot: &StateSnapshot, item: &RepositoryListItem) -> Label {
-    let enabled = workspace_repo_enabled(snapshot, item);
+fn monitor_enabled_cell(enabled: Option<bool>) -> Label {
     let text = match enabled {
         Some(true) => "Enabled",
         Some(false) => "Disabled",
@@ -8550,7 +8629,7 @@ fn repo_overview_summary_facts_section(
     item: &RepositoryListItem,
     attention_signals: &[AttentionSignal],
 ) -> GtkBox {
-    let summary = capability_monitor_summary(item, snapshot);
+    let summary = capability_monitor_summary(item, &snapshot.capability_registry);
     let facts = [
         ("State", status_label(&item.status.state).to_string()),
         ("Sync", format_sync_label(&item.status.sync)),
@@ -8664,7 +8743,10 @@ fn repo_overview_context(
         "{} · attention {} · caps {} · due {} · {}",
         status_label(&item.status.state),
         attention_monitor_label(attention_signals),
-        capability_monitor_label(&capability_monitor_summary(item, snapshot)),
+        capability_monitor_label(&capability_monitor_summary(
+            item,
+            &snapshot.capability_registry
+        )),
         repo_due_capability_count(snapshot, item, current_epoch_secs()),
         if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
             "selected"
@@ -12225,6 +12307,109 @@ mod tests {
         assert!(mark_repo_stale(&mut app_state, "alpha"));
         assert!(!mark_repo_stale(&mut app_state, "alpha"));
         assert!(app_state.repo_runtime["alpha"].needs_rescan());
+    }
+
+    fn test_monitor_row(name: &str, state: RepositoryState, sync: RepositorySync) -> MonitorRow {
+        build_monitor_row(
+            test_repository_item(name, state, sync),
+            MonitorViewMode::Overview,
+            &CapabilityRegistry::default(),
+            Some(true),
+            i64::MIN,
+        )
+    }
+
+    #[test]
+    fn monitor_store_update_touches_only_changed_rows() {
+        let rows = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|name| test_monitor_row(name, RepositoryState::Clean, RepositorySync::UpToDate))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            monitor_store_update(&rows, &rows),
+            MonitorStoreUpdate::Unchanged
+        );
+
+        let mut next = rows.clone();
+        next[2] = test_monitor_row("c", RepositoryState::Dirty, RepositorySync::UpToDate);
+        assert_eq!(
+            monitor_store_update(&rows, &next),
+            MonitorStoreUpdate::Positions(vec![2])
+        );
+
+        let mut reordered = rows.clone();
+        reordered.swap(0, 1);
+        assert_eq!(
+            monitor_store_update(&rows, &reordered),
+            MonitorStoreUpdate::Replace
+        );
+        assert_eq!(
+            monitor_store_update(&rows, &rows[..3]),
+            MonitorStoreUpdate::Replace
+        );
+
+        let switched_view = rows
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                row.view_mode = MonitorViewMode::Git;
+                row
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            monitor_store_update(&rows, &switched_view),
+            MonitorStoreUpdate::Replace
+        );
+    }
+
+    #[test]
+    fn monitor_row_filter_combines_mode_and_search_text() {
+        let dirty = test_monitor_row("Alpha", RepositoryState::Dirty, RepositorySync::UpToDate);
+        let clean = test_monitor_row("Beta", RepositoryState::Clean, RepositorySync::UpToDate);
+        let mut query = MonitorQuery::default();
+        assert!(monitor_row_matches(&dirty, &query));
+        assert!(monitor_row_matches(&clean, &query));
+
+        query.filter_mode = MonitorFilterMode::Dirty;
+        assert!(monitor_row_matches(&dirty, &query));
+        assert!(!monitor_row_matches(&clean, &query));
+
+        query.filter_mode = MonitorFilterMode::All;
+        query.filter_text = "alpha".to_string();
+        assert!(monitor_row_matches(&dirty, &query));
+        assert!(!monitor_row_matches(&clean, &query));
+
+        // Fields are matched one at a time, never across a field boundary.
+        query.filter_text = "alphagit@".to_string();
+        assert!(!monitor_row_matches(&dirty, &query));
+        query.filter_text = "org/beta.git".to_string();
+        assert!(monitor_row_matches(&clean, &query));
+    }
+
+    #[test]
+    fn monitor_row_sort_keeps_monorepo_last_in_both_directions() {
+        let mut monorepo = test_monitor_row(
+            "(monorepo)",
+            RepositoryState::Clean,
+            RepositorySync::UpToDate,
+        );
+        monorepo.item.id = MONOREPO_ROW_ID.to_string();
+        let rows = vec![
+            monorepo,
+            test_monitor_row("beta", RepositoryState::Clean, RepositorySync::UpToDate),
+            test_monitor_row("Alpha", RepositoryState::Clean, RepositorySync::UpToDate),
+        ];
+        let mut query = MonitorQuery::default();
+        let sorted_names = |query: &MonitorQuery| {
+            let mut rows = rows.clone();
+            rows.sort_by(|left, right| monitor_row_cmp(query, left, right));
+            rows.into_iter()
+                .map(|row| row.item.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sorted_names(&query), vec!["Alpha", "beta", "(monorepo)"]);
+        query.descending = true;
+        assert_eq!(sorted_names(&query), vec!["beta", "Alpha", "(monorepo)"]);
     }
 
     #[test]
