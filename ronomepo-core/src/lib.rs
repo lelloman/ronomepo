@@ -3082,16 +3082,12 @@ pub fn collect_repository_status(repo_path: &Path) -> RepositoryStatus {
         };
     }
 
-    let branch = current_branch(repo_path);
-    let state = repository_state(repo_path);
-    let sync = repository_sync(repo_path);
-    let head_commit = git_stdout(repo_path, ["rev-parse", "HEAD"]);
-
+    let status = porcelain_status(repo_path);
     RepositoryStatus {
-        state,
-        branch,
-        sync,
-        head_commit,
+        state: status.state,
+        branch: status.branch,
+        sync: status.sync,
+        head_commit: status.head_commit,
         repo_path: repo_path.to_path_buf(),
     }
 }
@@ -4001,47 +3997,104 @@ fn stderr_message(stderr: &[u8]) -> String {
     }
 }
 
-fn current_branch(repo_path: &Path) -> Option<String> {
-    match git_stdout(repo_path, ["branch", "--show-current"]) {
-        Some(output) if !output.is_empty() => Some(output),
-        Some(_) => Some("detached".to_string()),
-        None => None,
-    }
-}
-
 fn repository_state(repo_path: &Path) -> RepositoryState {
-    let has_diff = git_success(repo_path, ["diff", "--quiet"]).map(|ok| !ok);
-    let has_cached_diff = git_success(repo_path, ["diff", "--cached", "--quiet"]).map(|ok| !ok);
-    if matches!(has_diff, Some(true)) || matches!(has_cached_diff, Some(true)) {
-        return RepositoryState::Dirty;
-    }
+    porcelain_status(repo_path).state
+}
 
-    match git_stdout(repo_path, ["ls-files", "--others", "--exclude-standard"]) {
-        Some(output) if !output.is_empty() => RepositoryState::Untracked,
-        Some(_) => RepositoryState::Clean,
-        None => RepositoryState::Unknown,
+/// Everything the status scan needs, read from a single `git status` call.
+#[derive(Debug, PartialEq, Eq)]
+struct PorcelainStatus {
+    state: RepositoryState,
+    branch: Option<String>,
+    sync: RepositorySync,
+    head_commit: Option<String>,
+}
+
+fn porcelain_status(repo_path: &Path) -> PorcelainStatus {
+    let output = read_only_git(repo_path)
+        .args([
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--untracked-files=normal",
+            "-z",
+        ])
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => parse_porcelain_v2_status(&output.stdout),
+        _ => PorcelainStatus {
+            state: RepositoryState::Unknown,
+            branch: None,
+            sync: RepositorySync::Unknown,
+            head_commit: None,
+        },
     }
 }
 
-fn repository_sync(repo_path: &Path) -> RepositorySync {
-    let Some(upstream) = git_stdout(repo_path, ["rev-parse", "--abbrev-ref", "@{upstream}"]) else {
-        return RepositorySync::NoUpstream;
-    };
-    if upstream.is_empty() {
-        return RepositorySync::NoUpstream;
+/// Parses `git status --porcelain=v2 --branch -z`. An upstream that is
+/// configured but gone has no `branch.ab` header and is treated like no
+/// upstream at all, as is a detached HEAD.
+fn parse_porcelain_v2_status(output: &[u8]) -> PorcelainStatus {
+    let mut head_commit = None;
+    let mut branch = None;
+    let mut ahead_behind = None;
+    let mut has_changes = false;
+    let mut has_untracked = false;
+
+    let mut records = output.split(|byte| *byte == 0);
+    while let Some(record) = records.next() {
+        let record = String::from_utf8_lossy(record);
+        if let Some(header) = record.strip_prefix("# ") {
+            let (key, value) = header.split_once(' ').unwrap_or((header, ""));
+            match key {
+                "branch.oid" if value != "(initial)" => head_commit = Some(value.to_string()),
+                "branch.head" if value == "(detached)" => branch = Some("detached".to_string()),
+                "branch.head" => branch = Some(value.to_string()),
+                "branch.ab" => {
+                    let mut counts = value.split(' ');
+                    let ahead = counts.next().and_then(|v| v.strip_prefix('+'));
+                    let behind = counts.next().and_then(|v| v.strip_prefix('-'));
+                    ahead_behind = ahead
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .zip(behind.and_then(|v| v.parse::<usize>().ok()));
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match record.as_bytes().first() {
+            Some(b'1') | Some(b'u') => has_changes = true,
+            Some(b'2') => {
+                has_changes = true;
+                // Renames and copies carry their original path as an extra record.
+                records.next();
+            }
+            Some(b'?') => has_untracked = true,
+            _ => {}
+        }
     }
 
-    let ahead = git_stdout(repo_path, ["rev-list", "--count", "@{upstream}..HEAD"])
-        .and_then(|value| value.parse::<usize>().ok());
-    let behind = git_stdout(repo_path, ["rev-list", "--count", "HEAD..@{upstream}"])
-        .and_then(|value| value.parse::<usize>().ok());
+    let state = if has_changes {
+        RepositoryState::Dirty
+    } else if has_untracked {
+        RepositoryState::Untracked
+    } else {
+        RepositoryState::Clean
+    };
+    let sync = match ahead_behind {
+        None => RepositorySync::NoUpstream,
+        Some((0, 0)) => RepositorySync::UpToDate,
+        Some((ahead, 0)) => RepositorySync::Ahead(ahead),
+        Some((0, behind)) => RepositorySync::Behind(behind),
+        Some((ahead, behind)) => RepositorySync::Diverged { ahead, behind },
+    };
 
-    match (ahead, behind) {
-        (Some(0), Some(0)) => RepositorySync::UpToDate,
-        (Some(ahead), Some(0)) => RepositorySync::Ahead(ahead),
-        (Some(0), Some(behind)) => RepositorySync::Behind(behind),
-        (Some(ahead), Some(behind)) => RepositorySync::Diverged { ahead, behind },
-        _ => RepositorySync::Unknown,
+    PorcelainStatus {
+        state,
+        branch,
+        sync,
+        head_commit,
     }
 }
 
@@ -4203,16 +4256,6 @@ fn git_stdout<const N: usize>(repo_path: &Path, args: [&str; N]) -> Option<Strin
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn git_success<const N: usize>(repo_path: &Path, args: [&str; N]) -> Option<bool> {
-    read_only_git(repo_path)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()
-        .map(|status| status.success())
 }
 
 #[cfg(test)]
@@ -5103,6 +5146,116 @@ mod tests {
         // argument instead of failing to reach the "URL".
         assert!(!event.message.contains("must specify a repository"));
         assert!(!workspace.join("injected").exists());
+    }
+
+    #[test]
+    fn repository_status_reports_clean_dirty_and_untracked() {
+        let repo_path = temp_dir_path("status-states");
+        init_git_repo(&repo_path);
+        let head = git_stdout(&repo_path, ["rev-parse", "HEAD"]);
+
+        let status = collect_repository_status(&repo_path);
+        assert_eq!(status.state, RepositoryState::Clean);
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        assert_eq!(status.sync, RepositorySync::NoUpstream);
+        assert_eq!(status.head_commit, head);
+
+        fs::write(repo_path.join("scratch.txt"), "new").unwrap();
+        assert_eq!(
+            collect_repository_status(&repo_path).state,
+            RepositoryState::Untracked
+        );
+
+        fs::write(repo_path.join("README.md"), "changed\n").unwrap();
+        assert_eq!(
+            collect_repository_status(&repo_path).state,
+            RepositoryState::Dirty
+        );
+
+        run_git(&repo_path, ["checkout", "--", "README.md"]);
+        fs::remove_file(repo_path.join("scratch.txt")).unwrap();
+        run_git(&repo_path, ["mv", "README.md", "RENAMED.md"]);
+        assert_eq!(
+            collect_repository_status(&repo_path).state,
+            RepositoryState::Dirty
+        );
+    }
+
+    #[test]
+    fn repository_status_reports_ahead_behind_and_gone_upstream() {
+        let repo_path = temp_dir_path("status-sync");
+        init_git_repo(&repo_path);
+        run_git(&repo_path, ["branch", "base"]);
+        run_git(&repo_path, ["branch", "--set-upstream-to=base"]);
+        assert_eq!(
+            collect_repository_status(&repo_path).sync,
+            RepositorySync::UpToDate
+        );
+
+        run_git(&repo_path, ["commit", "--allow-empty", "-m", "ahead"]);
+        assert_eq!(
+            collect_repository_status(&repo_path).sync,
+            RepositorySync::Ahead(1)
+        );
+
+        run_git(&repo_path, ["checkout", "-q", "base"]);
+        run_git(&repo_path, ["commit", "--allow-empty", "-m", "upstream 1"]);
+        run_git(&repo_path, ["commit", "--allow-empty", "-m", "upstream 2"]);
+        run_git(&repo_path, ["checkout", "-q", "main"]);
+        assert_eq!(
+            collect_repository_status(&repo_path).sync,
+            RepositorySync::Diverged {
+                ahead: 1,
+                behind: 2
+            }
+        );
+
+        run_git(&repo_path, ["reset", "-q", "--hard", "HEAD~1"]);
+        assert_eq!(
+            collect_repository_status(&repo_path).sync,
+            RepositorySync::Behind(2)
+        );
+
+        run_git(&repo_path, ["branch", "-D", "base"]);
+        let status = collect_repository_status(&repo_path);
+        assert_eq!(status.sync, RepositorySync::NoUpstream);
+        assert_eq!(status.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn repository_status_reports_detached_head() {
+        let repo_path = temp_dir_path("status-detached");
+        init_git_repo(&repo_path);
+        run_git(&repo_path, ["checkout", "-q", "--detach"]);
+
+        let status = collect_repository_status(&repo_path);
+        assert_eq!(status.branch.as_deref(), Some("detached"));
+        assert_eq!(status.state, RepositoryState::Clean);
+        assert_eq!(status.sync, RepositorySync::NoUpstream);
+        assert!(status.head_commit.is_some());
+    }
+
+    #[test]
+    fn porcelain_status_parses_unborn_branches_and_renames() {
+        let status = parse_porcelain_v2_status(
+            b"# branch.oid (initial)\0# branch.head main\0? new file.txt\0",
+        );
+        assert_eq!(
+            status,
+            PorcelainStatus {
+                state: RepositoryState::Untracked,
+                branch: Some("main".to_string()),
+                sync: RepositorySync::NoUpstream,
+                head_commit: None,
+            }
+        );
+
+        let status = parse_porcelain_v2_status(
+            b"# branch.oid abc\0# branch.head dev\0# branch.upstream origin/dev\0# branch.ab +0 -3\02 R. N... 100644 100644 100644 a b R100 new\0? odd\0",
+        );
+        assert_eq!(status.state, RepositoryState::Dirty);
+        assert_eq!(status.sync, RepositorySync::Behind(3));
+        assert_eq!(status.head_commit.as_deref(), Some("abc"));
     }
 
     #[test]
