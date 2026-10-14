@@ -133,6 +133,10 @@ list.ronomepo-tree > row { min-height: 24px; }
 .ronomepo-vcs-unversioned { color: @danger; }
 .ronomepo-vcs-missing { color: @text_2; font-style: italic; }
 .ronomepo-vcs-unknown { color: @text_1; }
+/* On the selection background, state colors give way to contrast. */
+list.ronomepo-tree > row:selected label { color: @text_0; }
+list.ronomepo-tree > row:selected label.ronomepo-fg-muted,
+list.ronomepo-tree > row:selected label.ronomepo-vcs-missing { color: alpha(@text_0, 0.72); }
 
 /* Pages (editor area) */
 .ronomepo-page-header { padding: 14px 24px 10px; }
@@ -145,11 +149,15 @@ list.ronomepo-tree > row { min-height: 24px; }
 /* Containers inside cards must not repaint the pane background. */
 .ronomepo-card box, .ronomepo-card grid,
 .ronomepo-list-card box, .ronomepo-list-card grid,
+.ronomepo-lines box,
 .ronomepo-stat-tile box, .ronomepo-info-bar box { background: transparent; }
 .ronomepo-list-card { background: alpha(@text_0, 0.02); border: 1px solid @border; border-radius: 6px; }
 .ronomepo-list-card > .ronomepo-list-item { padding: 8px 12px; border-bottom: 1px solid alpha(@border, 0.7); }
 .ronomepo-list-card > .ronomepo-list-item:last-child { border-bottom: 0; }
 .ronomepo-list-card > .ronomepo-list-item:hover { background: alpha(@text_0, 0.03); }
+.ronomepo-lines { background: alpha(@text_0, 0.02); border: 1px solid @border; border-radius: 6px; padding: 6px 0; }
+.ronomepo-lines > .ronomepo-line { padding: 2px 12px; }
+.ronomepo-lines > .ronomepo-line:hover { background: alpha(@text_0, 0.04); }
 .ronomepo-kv-key { color: @text_2; }
 .ronomepo-kv-value { color: @text_0; }
 .ronomepo-problem { padding: 3px 0; }
@@ -479,6 +487,14 @@ pub fn list_card() -> GtkBox {
 pub fn list_card_item(list: &GtkBox, child: &impl IsA<Widget>) {
     child.add_css_class("ronomepo-list-item");
     list.append(child);
+}
+
+/// A bordered block of dense lines (logs, git output, signal lists); give
+/// each line the `ronomepo-line` class.
+pub fn lines_card() -> GtkBox {
+    let lines = vbox(0);
+    lines.add_css_class("ronomepo-lines");
+    lines
 }
 
 /// Severity of a Problems-style entry.

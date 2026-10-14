@@ -3603,7 +3603,7 @@ fn build_repo_monitor_row(
         item.dir_name
     )));
 
-    append_monitor_name_cell(&content, item);
+    append_monitor_name_cell(&content, item, row.view_mode == MonitorViewMode::Overview);
     match row.view_mode {
         MonitorViewMode::Overview => {
             content.append(&monitor_state_cell(&item.status.state));
@@ -3650,7 +3650,10 @@ fn build_repo_monitor_list_row(
     list_row
 }
 
-fn append_monitor_name_cell(row: &GtkBox, item: &RepositoryListItem) {
+/// The name cell, colored by working tree state like IDEA's VCS colors. With
+/// `show_branch`, the branch follows in small muted text, as in IDEA's
+/// Project tool window.
+fn append_monitor_name_cell(row: &GtkBox, item: &RepositoryListItem, show_branch: bool) {
     let name = monitor_cell(&item.name, None);
     name.add_css_class("ronomepo-row-name");
     if item.id == MONOREPO_ROW_ID {
@@ -3658,7 +3661,24 @@ fn append_monitor_name_cell(row: &GtkBox, item: &RepositoryListItem) {
     } else if let Some(class) = repo_name_vcs_class(&item.status.state) {
         name.add_css_class(class);
     }
-    row.append(&name);
+    if !show_branch || item.id == MONOREPO_ROW_ID {
+        row.append(&name);
+        return;
+    }
+    name.set_hexpand(false);
+    name.set_size_request(-1, -1);
+    // The name keeps its full width while it fits; the branch shrinks first.
+    name.set_max_width_chars(-1);
+    let cell = ui::hbox(6);
+    cell.set_hexpand(true);
+    cell.set_size_request(96, -1);
+    let branch = monitor_cell(branch_label(item), None);
+    branch.add_css_class("ronomepo-fg-muted");
+    branch.add_css_class("ronomepo-meta");
+    branch.set_size_request(24, -1);
+    cell.append(&name);
+    cell.append(&branch);
+    row.append(&cell);
 }
 
 fn repository_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
@@ -6973,27 +6993,65 @@ fn monitor_attention_cell(signals: &[AttentionSignal]) -> GtkBox {
     cell
 }
 
-fn workspace_attention_lines(
+/// Every open attention signal of the workspace as a dense Problems list:
+/// severity icon, summary, then the repository and signal metadata.
+fn append_attention_signals_section(
+    container: &GtkBox,
     snapshot: &StateSnapshot,
     items: &[RepositoryListItem],
-) -> Vec<String> {
-    let mut lines = items
+) {
+    let mut signals = items
         .iter()
         .flat_map(|item| repo_attention_detail_signals(snapshot, item))
-        .map(|signal| {
-            format!(
-                "{} | {} | {} | {} | {} | {}",
+        .collect::<Vec<_>>();
+    signals.sort_by(|left, right| {
+        left.repo_name
+            .cmp(&right.repo_name)
+            .then_with(|| attention_level_label(left.level).cmp(attention_level_label(right.level)))
+            .then_with(|| left.summary.cmp(&right.summary))
+    });
+    let count = ui::badge(&signals.len().to_string(), ui::Tone::Muted);
+    if signals.is_empty() {
+        container.append(&ui::section(
+            "Attention Signals",
+            &[count.upcast_ref()],
+            &ui::hint("No open attention signals."),
+        ));
+        return;
+    }
+    let list = ui::lines_card();
+    for signal in &signals {
+        let row = ui::hbox(8);
+        row.add_css_class("ronomepo-line");
+        let icon = ui::severity_icon(attention_severity(signal.level));
+        icon.set_valign(Align::Center);
+        icon.set_margin_top(0);
+        row.append(&icon);
+        let summary = Label::new(Some(&signal.summary));
+        summary.set_xalign(0.0);
+        summary.set_ellipsize(EllipsizeMode::End);
+        summary.add_css_class("ronomepo-fg-strong");
+        row.append(&summary);
+        let meta = ui::ellipsized(
+            &format!(
+                "{} · {} · {} · {} · {}",
                 signal.repo_name,
                 attention_level_label(signal.level),
                 attention_kind_label(signal.kind),
                 attention_source_label(signal.source),
                 attention_urgency_label(signal.urgency),
-                signal.summary
-            )
-        })
-        .collect::<Vec<_>>();
-    lines.sort();
-    lines
+            ),
+            &["ronomepo-fg-muted", "ronomepo-meta"],
+        );
+        meta.set_hexpand(true);
+        row.append(&meta);
+        list.append(&row);
+    }
+    container.append(&ui::section(
+        "Attention Signals",
+        &[count.upcast_ref()],
+        &list,
+    ));
 }
 
 fn attention_level_label(level: AttentionLevel) -> &'static str {
@@ -7595,12 +7653,7 @@ fn render_monorepo_overview(view: &MonorepoOverview, snapshot: &StateSnapshot) {
         Some(8),
         host_ptr,
     );
-    append_lines_section(
-        &sections,
-        "Attention Signals",
-        &workspace_attention_lines(snapshot, &items),
-        "No open attention signals.",
-    );
+    append_attention_signals_section(&sections, snapshot, &items);
     append_lines_section(
         &sections,
         "History Check",
@@ -8424,16 +8477,16 @@ fn render_fucina_policy(handle: &FucinaPolicyViewHandle, policy_root: &Path) {
     match load_fucina_policy(policy_root) {
         Ok(policy) => {
             set_fucina_status_visible(action_status, true);
-            let toolbar = ui::hbox(8);
-            toolbar.append(&ui::badge(
+            let badges = ui::hbox(6);
+            badges.append(&ui::badge(
                 &format!("Schema {}", policy.schema_version),
                 ui::Tone::Neutral,
             ));
-            toolbar.append(&ui::badge(
+            badges.append(&ui::badge(
                 &format!("{} repositories", policy.repositories.len()),
                 ui::Tone::Neutral,
             ));
-            toolbar.append(&ui::spacer());
+            root.append(&badges);
             let validate = ui::button("Validate", ui::ButtonKind::Secondary);
             let audit = ui::button("Audit all", ui::ButtonKind::Secondary);
             let preview = ui::button("Preview configuration", ui::ButtonKind::Secondary);
@@ -8441,11 +8494,15 @@ fn render_fucina_policy(handle: &FucinaPolicyViewHandle, policy_root: &Path) {
             apply.set_tooltip_text(Some(
                 "Previews first, then asks for confirmation before applying the safe changes",
             ));
-            toolbar.append(&validate);
-            toolbar.append(&audit);
-            toolbar.append(&preview);
-            toolbar.append(&apply);
-            root.append(&toolbar);
+            root.append(&ui::wrap_box(
+                &[
+                    validate.upcast_ref(),
+                    audit.upcast_ref(),
+                    preview.upcast_ref(),
+                    apply.upcast_ref(),
+                ],
+                8,
+            ));
 
             connect_fucina_action(
                 &validate,
@@ -8542,13 +8599,16 @@ fn fucina_repository_row(
     if repository.archived {
         title.append(&ui::badge("archived", ui::Tone::Warning));
     }
-    let (backup_text, backup_tone) = fucina_repository_backup_badge(repository);
-    title.append(&ui::badge(&backup_text, backup_tone));
     details.append(&title);
 
     let remotes = ui::vbox(0);
     remotes.set_tooltip_text(Some(&fucina_repository_remotes(repository)));
-    for (kind, url) in fucina_repository_remote_lines(repository) {
+    let (backup_text, backup_tone) = fucina_repository_backup_line(repository);
+    let lines = fucina_repository_remote_lines(repository)
+        .into_iter()
+        .map(|(kind, url)| (kind, url, ui::Tone::Muted, true))
+        .chain(std::iter::once(("Backup", backup_text, backup_tone, false)));
+    for (kind, url, tone, mono) in lines {
         let line = ui::hbox(8);
         let key = Label::new(Some(kind));
         key.set_xalign(0.0);
@@ -8560,9 +8620,12 @@ fn fucina_repository_row(
         value.set_hexpand(true);
         value.set_ellipsize(EllipsizeMode::Middle);
         value.set_selectable(true);
-        value.add_css_class("mono");
+        value.set_tooltip_text(Some(&url));
+        if mono {
+            value.add_css_class("mono");
+        }
         value.add_css_class("ronomepo-meta");
-        value.add_css_class("ronomepo-fg-muted");
+        ui::set_fg_tone(&value, tone);
         line.append(&key);
         line.append(&value);
         remotes.append(&line);
@@ -8618,13 +8681,13 @@ fn fucina_repository_remotes(repository: &FucinaRepositoryPolicy) -> String {
         .join(" · ")
 }
 
-fn fucina_repository_backup_badge(repository: &FucinaRepositoryPolicy) -> (String, ui::Tone) {
+fn fucina_repository_backup_line(repository: &FucinaRepositoryPolicy) -> (String, ui::Tone) {
     let tone = if repository.backup_required && repository.backups.is_empty() {
         ui::Tone::Warning
     } else if repository.backups.is_empty() {
         ui::Tone::Muted
     } else {
-        ui::Tone::Success
+        ui::Tone::Neutral
     };
     (fucina_repository_backup(repository), tone)
 }
@@ -9849,14 +9912,20 @@ fn repo_overview_action_row(
     item: &RepositoryListItem,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
     actions: &[(&'static str, Option<OperationKind>, ui::ButtonKind)],
-) -> GtkBox {
-    let row = ui::hbox(8);
-    for (label, kind, style) in actions {
-        row.append(&repo_overview_action_button(
-            item, host_ptr, label, *kind, *style,
-        ));
-    }
-    row
+) -> gtk::FlowBox {
+    let buttons = actions
+        .iter()
+        .map(|(label, kind, style)| {
+            repo_overview_action_button(item, host_ptr, label, *kind, *style)
+        })
+        .collect::<Vec<_>>();
+    ui::wrap_box(
+        &buttons
+            .iter()
+            .map(|button| button.upcast_ref())
+            .collect::<Vec<_>>(),
+        8,
+    )
 }
 
 /// The page header: repository name with status badges, then its path,
@@ -10089,18 +10158,19 @@ fn repo_overview_lines_body(lines: &[String], empty_message: &str, mono: bool) -
         block.append(&empty);
         return block;
     }
-    let list = ui::list_card();
+    let list = ui::lines_card();
     for line in lines {
         let row = Label::new(Some(line));
         row.set_xalign(0.0);
         row.set_wrap(true);
         row.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         row.set_selectable(true);
+        row.add_css_class("ronomepo-line");
         if mono {
             row.add_css_class("mono");
             row.add_css_class("ronomepo-meta");
         }
-        ui::list_card_item(&list, &row);
+        list.append(&row);
     }
     list
 }
