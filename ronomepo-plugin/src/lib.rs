@@ -687,6 +687,24 @@ struct ContainerViewHandle {
     host_ptr: usize,
 }
 
+/// A Fucina Policy view. The policy part is rebuilt only when repos.toml
+/// changes; the action status label lives outside it so running actions keep
+/// reporting into a live label.
+struct FucinaPolicyViewHandle {
+    root: glib::WeakRef<GtkBox>,
+    policy_area: GtkBox,
+    repository_area: GtkBox,
+    action_status: Label,
+    rendered_source: RefCell<Option<FucinaPolicySource>>,
+}
+
+/// What the rendered policy was read from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FucinaPolicySource {
+    policy_root: PathBuf,
+    modified: Option<SystemTime>,
+}
+
 struct CommitCheckViewHandle {
     root: glib::WeakRef<GtkBox>,
     editor: Rc<CommitCheckEditor>,
@@ -762,7 +780,7 @@ thread_local! {
     static MONOREPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static REPO_OVERVIEWS: RefCell<Vec<RepoOverviewViewHandle>> = const { RefCell::new(Vec::new()) };
     static COMMIT_CHECK_VIEWS: RefCell<Vec<CommitCheckViewHandle>> = const { RefCell::new(Vec::new()) };
-    static FUCINA_POLICY_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
+    static FUCINA_POLICY_VIEWS: RefCell<Vec<FucinaPolicyViewHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_BUFFERS: RefCell<Vec<OperationBufferHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_SUMMARY_CURSOR: Cell<Option<LogCursor>> = const { Cell::new(None) };
     static OPERATION_SUMMARIES: RefCell<Vec<glib::WeakRef<Label>>> = const { RefCell::new(Vec::new()) };
@@ -2338,12 +2356,12 @@ fn sync_commit_check_views(snapshot: &StateSnapshot) {
 fn refresh_workspace_settings_views(snapshot: &StateSnapshot) {
     FUCINA_POLICY_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|handle| match handle.root.upgrade() {
-            Some(root) => {
-                render_workspace_settings_into(&root, &snapshot, handle.host_ptr as *const _);
-                true
+        views.retain(|handle| {
+            if handle.root.upgrade().is_none() {
+                return false;
             }
-            None => false,
+            sync_fucina_policy_view(handle, snapshot);
+            true
         });
     });
 }
@@ -7810,33 +7828,6 @@ extern "C" fn create_workspace_settings_view(
     root.set_margin_start(24);
     root.set_margin_end(24);
 
-    let snapshot = snapshot();
-    render_workspace_settings_into(&root, &snapshot, host);
-
-    let root_ref = glib::WeakRef::new();
-    root_ref.set(Some(&root));
-    FUCINA_POLICY_VIEWS.with(|views| {
-        views.borrow_mut().push(ContainerViewHandle {
-            root: root_ref,
-            host_ptr: host as usize,
-        });
-    });
-
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-            as *mut std::ffi::c_void
-    }
-}
-
-fn render_workspace_settings_into(
-    root: &GtkBox,
-    snapshot: &StateSnapshot,
-    _host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-) {
-    clear_box(root);
-    let policy_root =
-        fucina_policy_root(&snapshot.workspace_root, snapshot.manifest_path.as_deref());
-
     let heading = Label::new(Some("Fucina repository policy"));
     heading.set_xalign(0.0);
     heading.add_css_class("title-2");
@@ -7849,12 +7840,63 @@ fn render_workspace_settings_into(
     explanation.set_wrap(true);
     root.append(&explanation);
 
+    let policy_area = GtkBox::new(Orientation::Vertical, 18);
     let action_status = Label::new(Some("Ready · detailed results appear in Operations"));
     action_status.set_xalign(0.0);
     action_status.set_wrap(true);
+    let repository_area = GtkBox::new(Orientation::Vertical, 0);
+    repository_area.set_vexpand(true);
+    root.append(&policy_area);
+    root.append(&action_status);
+    root.append(&repository_area);
 
-    match load_fucina_policy(&policy_root) {
+    let root_ref = glib::WeakRef::new();
+    root_ref.set(Some(&root));
+    let handle = FucinaPolicyViewHandle {
+        root: root_ref,
+        policy_area,
+        repository_area,
+        action_status,
+        rendered_source: RefCell::new(None),
+    };
+    sync_fucina_policy_view(&handle, &snapshot());
+    FUCINA_POLICY_VIEWS.with(|views| {
+        views.borrow_mut().push(handle);
+    });
+
+    unsafe {
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
+            as *mut std::ffi::c_void
+    }
+}
+
+/// Re-renders the policy part of a Fucina view when repos.toml was replaced,
+/// edited or moved since it was last rendered.
+fn sync_fucina_policy_view(handle: &FucinaPolicyViewHandle, snapshot: &StateSnapshot) {
+    let policy_root =
+        fucina_policy_root(&snapshot.workspace_root, snapshot.manifest_path.as_deref());
+    let source = FucinaPolicySource {
+        modified: fs::metadata(policy_root.join("repos.toml"))
+            .and_then(|metadata| metadata.modified())
+            .ok(),
+        policy_root,
+    };
+    if handle.rendered_source.borrow().as_ref() == Some(&source) {
+        return;
+    }
+    render_fucina_policy(handle, &source.policy_root);
+    *handle.rendered_source.borrow_mut() = Some(source);
+}
+
+fn render_fucina_policy(handle: &FucinaPolicyViewHandle, policy_root: &Path) {
+    clear_box(&handle.policy_area);
+    clear_box(&handle.repository_area);
+    let root = &handle.policy_area;
+    let action_status = &handle.action_status;
+
+    match load_fucina_policy(policy_root) {
         Ok(policy) => {
+            action_status.set_visible(true);
             let summary = Label::new(Some(&format!(
                 "Schema {} · {} repositories",
                 policy.schema_version,
@@ -7877,34 +7919,33 @@ fn render_workspace_settings_into(
 
             connect_fucina_action(
                 &validate,
-                policy_root.clone(),
+                policy_root.to_path_buf(),
                 FucinaPolicyAction::Validate,
                 Vec::new(),
                 action_status.clone(),
             );
             connect_fucina_action(
                 &audit,
-                policy_root.clone(),
+                policy_root.to_path_buf(),
                 FucinaPolicyAction::Audit,
                 Vec::new(),
                 action_status.clone(),
             );
             connect_fucina_action(
                 &preview,
-                policy_root.clone(),
+                policy_root.to_path_buf(),
                 FucinaPolicyAction::ConfigurePreview,
                 Vec::new(),
                 action_status.clone(),
             );
-            connect_fucina_apply(&apply, policy_root.clone(), action_status.clone());
-            root.append(&action_status);
+            connect_fucina_apply(&apply, policy_root.to_path_buf(), action_status.clone());
 
             let repository_list = GtkBox::new(Orientation::Vertical, 6);
             for repository in &policy.repositories {
                 repository_list.append(&fucina_repository_row(
                     repository,
-                    &policy_root,
-                    &action_status,
+                    policy_root,
+                    action_status,
                 ));
             }
             let repositories = ScrolledWindow::builder()
@@ -7914,9 +7955,10 @@ fn render_workspace_settings_into(
                 .vexpand(true)
                 .child(&repository_list)
                 .build();
-            root.append(&repositories);
+            handle.repository_area.append(&repositories);
         }
         Err(message) => {
+            action_status.set_visible(false);
             let error = Label::new(Some(&message));
             error.set_xalign(0.0);
             error.set_wrap(true);
@@ -8133,24 +8175,14 @@ fn run_fucina_action_async(
     workspace_root: PathBuf,
     action: FucinaPolicyAction,
     repositories: Vec<String>,
-    completion: impl Fn(Result<FucinaPolicyCommandResult, String>) + 'static,
+    completion: impl FnOnce(Result<FucinaPolicyCommandResult, String>) + 'static,
 ) {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(run_fucina_policy(&workspace_root, action, &repositories));
-    });
-    glib::timeout_add_local(Duration::from_millis(50), move || {
-        match receiver.try_recv() {
-            Ok(result) => {
-                completion(result);
-                glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                completion(Err("Fucina policy worker stopped unexpectedly".to_string()));
-                glib::ControlFlow::Break
-            }
-        }
+    glib::spawn_future_local(async move {
+        let result =
+            gio::spawn_blocking(move || run_fucina_policy(&workspace_root, action, &repositories))
+                .await
+                .unwrap_or_else(|_| Err("Fucina policy worker stopped unexpectedly".to_string()));
+        completion(result);
     });
 }
 
