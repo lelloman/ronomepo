@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use gtk::gio::prelude::ApplicationExtManual;
 use maruzzella::{
-    build_application, default_product_spec, load_static_plugin, plugin_tab, BottomPanelLayout,
-    CommandSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec, PanelResizePolicy, TabGroupSpec,
-    ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec,
+    build_application, default_product_spec, load_static_plugin, plugin_tab, AboutSpec,
+    BottomPanelLayout, CommandSpec, MaruzzellaConfig, MenuItemSpec, MenuRootSpec,
+    PanelResizePolicy, TabGroupSpec, ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec,
 };
 use ronomepo_core::normalize_workspace_root;
 use ronomepo_plugin::{persisted_config_root, PERSISTENCE_ID};
@@ -46,6 +46,12 @@ fn main() {
     product.branding.search_command_id = Some("ronomepo.workspace.filter".to_string());
     product.branding.status_text =
         "Desktop workspace for many sibling Git repositories".to_string();
+    product.about = AboutSpec::new(
+        env!("CARGO_PKG_VERSION"),
+        "A desktop app for managing a monorepo: one workspace directory holding many \
+         sibling Git repositories plus a little shared metadata.",
+    )
+    .with_link("Source code", "https://github.com/lelloman/ronomepo");
     product.include_base_toolbar_items = false;
     product.menu_roots = vec![
         MenuRootSpec {
