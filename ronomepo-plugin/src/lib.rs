@@ -12006,7 +12006,12 @@ mod tests {
 
     fn temp_test_dir(label: &str) -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("ronomepo-plugin-{label}-{id}"));
+        // Include the pid: concurrent test runs share the temp dir and would
+        // otherwise delete each other's fixtures.
+        let path = std::env::temp_dir().join(format!(
+            "ronomepo-plugin-{label}-{}-{id}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
