@@ -539,6 +539,10 @@ enum WorkerJob {
         targets: Vec<CapabilityRunTarget>,
         run_reason: String,
     },
+    RepoManifestActions {
+        action: StandardActionName,
+        targets: Vec<(RepositoryListItem, Arc<RepoManifest>)>,
+    },
     EditorLoad {
         path: PathBuf,
         reply: mpsc::Sender<EditorLoadMessage>,
@@ -1117,6 +1121,10 @@ fn run_worker_job(queued_job: QueuedJob) {
         } => {
             let result = run_capability_checks(&workspace_root, targets, &run_reason);
             Some(WorkerResult::CapabilityChecksCompleted { result })
+        }
+        WorkerJob::RepoManifestActions { action, targets } => {
+            run_repo_manifest_actions(action, targets);
+            None
         }
         WorkerJob::EditorLoad { path, reply } => {
             let result = fs::read_to_string(&path).map_err(|error| error.to_string());
@@ -5493,38 +5501,58 @@ fn run_selected_repo_manifest_action(action: StandardActionName) {
         return;
     }
 
+    let repo_count = targets.len();
+    match submit_job(WorkerJob::RepoManifestActions { action, targets }) {
+        Ok(()) => append_log(format!(
+            "Queued Ronomepo {} for {repo_count} repo(s).",
+            standard_action_label(action)
+        )),
+        Err(message) => append_log(format!(
+            "Ronomepo {} failed to start: {message}",
+            standard_action_label(action)
+        )),
+    }
+}
+
+/// Runs a context-menu manifest action on a worker thread, logging progress
+/// and command output to the Operations log as it goes.
+fn run_repo_manifest_actions(
+    action: StandardActionName,
+    targets: Vec<(RepositoryListItem, Arc<RepoManifest>)>,
+) {
+    let main_context = glib::MainContext::default();
+    let log = |message: String| main_context.invoke(move || append_log(message));
+    let label = standard_action_label(action);
+
     for (item, manifest) in targets {
         match action {
             StandardActionName::ListArtifacts => {
                 match list_repo_artifacts(&item.status.repo_path, &manifest) {
+                    Ok(artifacts) if artifacts.is_empty() => log(format!(
+                        "Ronomepo list_artifacts for {} found no artifacts.",
+                        item.name
+                    )),
                     Ok(artifacts) => {
-                        if artifacts.is_empty() {
-                            append_log(format!(
-                                "Ronomepo list_artifacts for {} found no artifacts.",
-                                item.name
+                        log(format!(
+                            "Ronomepo list_artifacts for {}: {} artifact(s).",
+                            item.name,
+                            artifacts.len()
+                        ));
+                        for artifact in artifacts {
+                            log(format!(
+                                "  [{}] {} {}",
+                                artifact.item_id,
+                                artifact.name,
+                                artifact
+                                    .path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string())
+                                    .or(artifact.pattern.clone())
+                                    .unwrap_or_else(|| "<no-path>".to_string())
                             ));
-                        } else {
-                            append_log(format!(
-                                "Ronomepo list_artifacts for {}: {} artifact(s).",
-                                item.name,
-                                artifacts.len()
-                            ));
-                            for artifact in artifacts {
-                                append_log(format!(
-                                    "  [{}] {} {}",
-                                    artifact.item_id,
-                                    artifact.name,
-                                    artifact
-                                        .path
-                                        .as_ref()
-                                        .map(|path| path.display().to_string())
-                                        .or(artifact.pattern.clone())
-                                        .unwrap_or_else(|| "<no-path>".to_string())
-                                ));
-                            }
                         }
                     }
-                    Err(error) => append_log(format!(
+                    Err(error) => log(format!(
                         "Ronomepo list_artifacts failed for {}: {error}",
                         item.name
                     )),
@@ -5537,7 +5565,7 @@ fn run_selected_repo_manifest_action(action: StandardActionName) {
                             .iter()
                             .map(|report| report.findings.len())
                             .sum::<usize>();
-                        append_log(format!(
+                        log(format!(
                             "Ronomepo verify_dependencies_freshness for {}: {} report(s), {} finding(s).",
                             item.name,
                             reports.len(),
@@ -5545,18 +5573,15 @@ fn run_selected_repo_manifest_action(action: StandardActionName) {
                         ));
                         for report in reports {
                             if report.findings.is_empty() {
-                                append_log(format!("  [{}] no issues found.", report.item_id));
+                                log(format!("  [{}] no issues found.", report.item_id));
                             } else {
                                 for finding in report.findings {
-                                    append_log(format!(
-                                        "  [{}] {}",
-                                        report.item_id, finding.message
-                                    ));
+                                    log(format!("  [{}] {}", report.item_id, finding.message));
                                 }
                             }
                         }
                     }
-                    Err(error) => append_log(format!(
+                    Err(error) => log(format!(
                         "Ronomepo verify_dependencies_freshness failed for {}: {error}",
                         item.name
                     )),
@@ -5564,30 +5589,32 @@ fn run_selected_repo_manifest_action(action: StandardActionName) {
             }
             _ => match plan_repo_action(&item.status.repo_path, &manifest, action) {
                 Ok(plan) => {
-                    append_log(format!(
-                        "Running Ronomepo {} for {} ({} step(s)).",
-                        standard_action_label(action),
+                    log(format!(
+                        "Running Ronomepo {label} for {} ({} step(s)).",
                         item.name,
                         plan.steps.len()
                     ));
                     for step in plan.steps {
                         match step.executor {
                             RepoActionExecutor::Command(command) => {
-                                run_planned_repo_command(&item.name, action, command);
+                                let succeeded = run_planned_repo_command(&item.name, action, &command, &log);
+                                if !succeeded {
+                                    log(format!(
+                                        "Ronomepo {label} for {} stopped after a failed step.",
+                                        item.name
+                                    ));
+                                    break;
+                                }
                             }
-                            RepoActionExecutor::BuiltInInspector => {
-                                append_log(format!(
-                                    "Ronomepo {} for {} uses a built-in inspector and has no terminal command to launch.",
-                                    standard_action_label(action),
-                                    item.name
-                                ));
-                            }
+                            RepoActionExecutor::BuiltInInspector => log(format!(
+                                "Ronomepo {label} for {} uses a built-in inspector and has no command to run.",
+                                item.name
+                            )),
                         }
                     }
                 }
-                Err(error) => append_log(format!(
-                    "Ronomepo {} failed for {}: {error}",
-                    standard_action_label(action),
+                Err(error) => log(format!(
+                    "Ronomepo {label} failed for {}: {error}",
                     item.name
                 )),
             },
@@ -5595,35 +5622,55 @@ fn run_selected_repo_manifest_action(action: StandardActionName) {
     }
 }
 
-fn run_planned_repo_command(repo_name: &str, action: StandardActionName, command: PlannedCommand) {
-    let mut process = Command::new(&command.program);
-    process.args(&command.args);
-    process.current_dir(&command.workdir);
-    for (key, value) in &command.env {
-        process.env(key, value);
-    }
+/// Number of trailing output lines copied into the Operations log per command.
+const REPO_ACTION_OUTPUT_TAIL_LINES: usize = 20;
 
-    let command_text = if command.args.is_empty() {
-        command.program.clone()
-    } else {
-        format!("{} {}", command.program, command.args.join(" "))
+/// Runs one planned command to completion and logs its result and the tail of
+/// its output. Returns whether it succeeded.
+fn run_planned_repo_command(
+    repo_name: &str,
+    action: StandardActionName,
+    command: &PlannedCommand,
+    log: &impl Fn(String),
+) -> bool {
+    let label = standard_action_label(action);
+    let command_text = planned_command_text(command);
+    log(format!(
+        "Started Ronomepo {label} for {repo_name}: {command_text} (cwd: {}).",
+        command.workdir.display()
+    ));
+    let output = match run_planned_command_to_output(command) {
+        Ok(output) => output,
+        Err(error) => {
+            log(format!("Ronomepo {label} for {repo_name} failed: {error}"));
+            return false;
+        }
     };
-
-    match process.spawn() {
-        Ok(_) => append_log(format!(
-            "Started Ronomepo {} for {}: {} (cwd: {}).",
-            standard_action_label(action),
-            repo_name,
-            command_text,
-            command.workdir.display()
-        )),
-        Err(error) => append_log(format!(
-            "Failed to start Ronomepo {} for {}: {} ({error})",
-            standard_action_label(action),
-            repo_name,
-            command_text
-        )),
+    let succeeded = output.status.success();
+    log(format!(
+        "Ronomepo {label} for {repo_name} {} ({}).",
+        if succeeded { "succeeded" } else { "failed" },
+        output.status
+    ));
+    for line in command_output_tail(&output, REPO_ACTION_OUTPUT_TAIL_LINES) {
+        log(format!("  {line}"));
     }
+    succeeded
+}
+
+/// The last `limit` non-empty lines of stdout followed by stderr.
+fn command_output_tail(output: &Output, limit: usize) -> Vec<String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    lines[lines.len().saturating_sub(limit)..]
+        .iter()
+        .map(|line| line.to_string())
+        .collect()
 }
 
 fn append_context_button<F>(menu: &GtkBox, popover: &Popover, label: &str, action: F)
@@ -12834,6 +12881,21 @@ mod tests {
             cursor.end_seq - cursor.first_seq,
             app_state.logs.len() as u64
         );
+    }
+
+    #[test]
+    fn command_output_tail_keeps_last_non_empty_lines() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"one\n\ntwo\nthree\n".to_vec(),
+            stderr: b"warn\n".to_vec(),
+        };
+        assert_eq!(
+            command_output_tail(&output, 3),
+            vec!["two", "three", "warn"]
+        );
+        assert_eq!(command_output_tail(&output, 10).len(), 4);
     }
 
     #[test]
