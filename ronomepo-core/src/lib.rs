@@ -4,6 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
@@ -740,11 +741,18 @@ pub struct RepositoryListItem {
     pub repo_manifest: Option<RepoManifestScan>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RepoManifestScan {
     pub path: PathBuf,
     pub state: RepoManifestScanState,
+    /// The parsed manifest when `state` is `Valid`, so readers need not load
+    /// it from disk again.
+    pub manifest: Option<Arc<RepoManifest>>,
 }
+
+// RepoManifest only lacks Eq because it embeds JSON values; equality is still
+// reflexive for anything parsed from a manifest file.
+impl Eq for RepoManifestScan {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RepoManifestScanState {
@@ -2963,6 +2971,7 @@ pub fn scan_repo_manifest(repo_root: &Path) -> RepoManifestScan {
         return RepoManifestScan {
             path,
             state: RepoManifestScanState::Missing,
+            manifest: None,
         };
     }
 
@@ -2970,12 +2979,14 @@ pub fn scan_repo_manifest(repo_root: &Path) -> RepoManifestScan {
         Ok(manifest) => RepoManifestScan {
             path,
             state: RepoManifestScanState::Valid(repo_manifest_summary(repo_root, &manifest)),
+            manifest: Some(Arc::new(manifest)),
         },
         Err(error) => RepoManifestScan {
             path,
             state: RepoManifestScanState::Invalid {
                 message: error.to_string(),
             },
+            manifest: None,
         },
     }
 }
@@ -5693,6 +5704,7 @@ backup_required = false
                     Path::new("/tmp/sample"),
                     manifest,
                 )),
+                manifest: Some(Arc::new(manifest.clone())),
             }),
         }
     }

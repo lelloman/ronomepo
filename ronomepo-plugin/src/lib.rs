@@ -611,7 +611,7 @@ struct CapabilityRunTarget {
     repo_id: String,
     repo_name: String,
     repo_path: PathBuf,
-    manifest: RepoManifest,
+    manifest: Arc<RepoManifest>,
     capability_ids: Option<Vec<String>>,
 }
 
@@ -5252,15 +5252,17 @@ fn repo_context_supported_manifest_actions(
     actions
 }
 
+/// The repo manifest parsed by the last status scan, when it was valid.
+fn scanned_repo_manifest(item: &RepositoryListItem) -> Option<&Arc<RepoManifest>> {
+    let scan = item.repo_manifest.as_ref()?;
+    matches!(scan.state, RepoManifestScanState::Valid(_))
+        .then_some(scan.manifest.as_ref())
+        .flatten()
+}
+
 fn selection_has_implemented_capabilities(selection: &[RepositoryListItem]) -> bool {
     selection.iter().any(|item| {
-        let Some(scan) = item.repo_manifest.as_ref() else {
-            return false;
-        };
-        if !matches!(scan.state, RepoManifestScanState::Valid(_)) {
-            return false;
-        }
-        load_repo_manifest(&scan.path).is_ok_and(|manifest| {
+        scanned_repo_manifest(item).is_some_and(|manifest| {
             manifest.capabilities.iter().any(|capability| {
                 capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
             })
@@ -5283,7 +5285,7 @@ fn context_action_label(action: StandardActionName) -> String {
 
 fn selected_repo_manifest_targets(
     action: StandardActionName,
-) -> Vec<(RepositoryListItem, RepoManifest)> {
+) -> Vec<(RepositoryListItem, Arc<RepoManifest>)> {
     selected_repository_items_from_state()
         .into_iter()
         .filter_map(|item| {
@@ -5294,7 +5296,7 @@ fn selected_repo_manifest_targets(
             if !summary.supported_actions.contains(&action) {
                 return None;
             }
-            let manifest = load_repo_manifest(&scan.path).ok()?;
+            let manifest = Arc::clone(scanned_repo_manifest(&item)?);
             Some((item, manifest))
         })
         .collect()
@@ -5311,11 +5313,7 @@ fn repo_capability_target_from_item(
     item: RepositoryListItem,
     capability_ids: Option<Vec<String>>,
 ) -> Option<CapabilityRunTarget> {
-    let scan = item.repo_manifest.as_ref()?;
-    if !matches!(scan.state, RepoManifestScanState::Valid(_)) {
-        return None;
-    }
-    let manifest = load_repo_manifest(&scan.path).ok()?;
+    let manifest = Arc::clone(scanned_repo_manifest(&item)?);
     if !manifest.capabilities.iter().any(|capability| {
         capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
             && capability_ids
@@ -5357,13 +5355,7 @@ fn stale_capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'s
     let targets = source_items
         .into_iter()
         .filter_map(|item| {
-            let manifest = item
-                .repo_manifest
-                .as_ref()
-                .and_then(|scan| {
-                    matches!(scan.state, RepoManifestScanState::Valid(_)).then_some(scan)
-                })
-                .and_then(|scan| load_repo_manifest(&scan.path).ok())?;
+            let manifest = Arc::clone(scanned_repo_manifest(&item)?);
             let dirty_now = matches!(
                 item.status.state,
                 ronomepo_core::RepositoryState::Dirty | ronomepo_core::RepositoryState::Untracked
@@ -5391,12 +5383,7 @@ fn repo_due_capability_count(
     item: &RepositoryListItem,
     now_epoch_secs: u64,
 ) -> usize {
-    let Some(manifest) = item
-        .repo_manifest
-        .as_ref()
-        .and_then(|scan| matches!(scan.state, RepoManifestScanState::Valid(_)).then_some(scan))
-        .and_then(|scan| load_repo_manifest(&scan.path).ok())
-    else {
+    let Some(manifest) = scanned_repo_manifest(item) else {
         return 0;
     };
 
@@ -5430,13 +5417,7 @@ fn due_capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'sta
     let targets = source_items
         .into_iter()
         .filter_map(|item| {
-            let manifest = item
-                .repo_manifest
-                .as_ref()
-                .and_then(|scan| {
-                    matches!(scan.state, RepoManifestScanState::Valid(_)).then_some(scan)
-                })
-                .and_then(|scan| load_repo_manifest(&scan.path).ok())?;
+            let manifest = Arc::clone(scanned_repo_manifest(&item)?);
             let capability_ids = manifest
                 .capabilities
                 .iter()
@@ -6285,12 +6266,11 @@ fn repo_attention_detail_signals(
     snapshot: &StateSnapshot,
     item: &RepositoryListItem,
 ) -> Vec<AttentionSignal> {
-    let manifest = item
-        .repo_manifest
-        .as_ref()
-        .and_then(|scan| matches!(scan.state, RepoManifestScanState::Valid(_)).then_some(scan))
-        .and_then(|scan| load_repo_manifest(&scan.path).ok());
-    derive_attention_signals(item, manifest.as_ref(), &snapshot.capability_registry)
+    derive_attention_signals(
+        item,
+        scanned_repo_manifest(item).map(|manifest| &**manifest),
+        &snapshot.capability_registry,
+    )
 }
 
 fn attention_monitor_label(signals: &[AttentionSignal]) -> &'static str {
@@ -6450,13 +6430,10 @@ fn repo_capability_detail_lines(
         return capability_registry_only_lines(snapshot, item);
     };
 
-    let manifest = match load_repo_manifest(&scan.path) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            lines.push(format!("Manifest could not be loaded: {error}"));
-            lines.extend(capability_registry_only_lines(snapshot, item));
-            return lines;
-        }
+    let Some(manifest) = scan.manifest.as_deref() else {
+        lines.push("Manifest has not been loaded by a status scan yet.".to_string());
+        lines.extend(capability_registry_only_lines(snapshot, item));
+        return lines;
     };
 
     let policy = assess_repo_capability_policy(&manifest);
@@ -12566,6 +12543,7 @@ mod tests {
             repo_manifest: Some(RepoManifestScan {
                 path: repo_path.join("ronomepo.repo.json"),
                 state: RepoManifestScanState::Missing,
+                manifest: None,
             }),
         });
         app_state.repo_runtime.insert(
