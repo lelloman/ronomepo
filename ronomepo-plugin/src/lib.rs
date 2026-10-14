@@ -714,6 +714,7 @@ thread_local! {
     static OPERATION_SUMMARIES: RefCell<Vec<glib::WeakRef<Label>>> = const { RefCell::new(Vec::new()) };
     static OPERATION_FOLLOWERS: RefCell<Vec<OperationFollowHandle>> = const { RefCell::new(Vec::new()) };
     static DIRTY_TEXT_EDITORS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static HOST_APIS: RefCell<Vec<&'static maruzzella_sdk::ffi::MzHostApi>> = const { RefCell::new(Vec::new()) };
 }
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -2389,10 +2390,36 @@ fn operation_follow_button() -> ToggleButton {
     button
 }
 
-fn remember_host_ptr(host: *const maruzzella_sdk::ffi::MzHostApi) {
-    if !host.is_null() {
-        LAST_HOST_PTR.store(host as usize, Ordering::Relaxed);
-    }
+/// The host hands view factories a pointer to a temporary copy of its API that
+/// is dropped as soon as the factory returns, so the pointer must never be kept.
+/// Keep one leaked copy per shell host instead (bounded by the number of
+/// surfaces) and hand out pointers to that. The copy drops the per-view config
+/// context, which only lives as long as the view it was created for.
+fn remember_host_ptr(
+    host: *const maruzzella_sdk::ffi::MzHostApi,
+) -> *const maruzzella_sdk::ffi::MzHostApi {
+    let Some(host) = (unsafe { host.as_ref() }) else {
+        return std::ptr::null();
+    };
+    let mut api = *host;
+    api.config_context = std::ptr::null_mut();
+    api.read_config_in_context = None;
+    api.write_config_in_context = None;
+    let stable: &'static maruzzella_sdk::ffi::MzHostApi = HOST_APIS.with(|apis| {
+        let mut apis = apis.borrow_mut();
+        if let Some(existing) = apis
+            .iter()
+            .find(|existing| existing.host_context == api.host_context)
+        {
+            return *existing;
+        }
+        let leaked: &'static maruzzella_sdk::ffi::MzHostApi = Box::leak(Box::new(api));
+        apis.push(leaked);
+        leaked
+    });
+    let stable = stable as *const maruzzella_sdk::ffi::MzHostApi;
+    LAST_HOST_PTR.store(stable as usize, Ordering::Relaxed);
+    stable
 }
 
 fn current_host_ptr() -> *const maruzzella_sdk::ffi::MzHostApi {
@@ -5351,7 +5378,7 @@ extern "C" fn create_repo_monitor_view(
         return std::ptr::null_mut();
     }
 
-    remember_host_ptr(host);
+    let host = remember_host_ptr(host);
 
     let content = GtkBox::new(Orientation::Vertical, 12);
     content.set_hexpand(true);
@@ -6463,7 +6490,7 @@ extern "C" fn create_monorepo_overview_view(
         return std::ptr::null_mut();
     }
 
-    remember_host_ptr(host);
+    let host = remember_host_ptr(host);
 
     let root = GtkBox::new(Orientation::Vertical, 18);
     root.set_vexpand(true);
@@ -6509,7 +6536,7 @@ extern "C" fn create_commit_check_view(
         return std::ptr::null_mut();
     }
 
-    remember_host_ptr(host);
+    let host = remember_host_ptr(host);
 
     let root = GtkBox::new(Orientation::Vertical, 18);
     root.set_margin_top(24);
@@ -7259,7 +7286,7 @@ extern "C" fn create_repo_overview_view(
         return std::ptr::null_mut();
     }
 
-    remember_host_ptr(host);
+    let host = remember_host_ptr(host);
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
@@ -7381,7 +7408,7 @@ extern "C" fn create_workspace_settings_view(
         return std::ptr::null_mut();
     }
 
-    remember_host_ptr(host);
+    let host = remember_host_ptr(host);
 
     let root = GtkBox::new(Orientation::Vertical, 18);
     root.set_margin_top(24);
@@ -9941,7 +9968,7 @@ extern "C" fn create_repo_manifest_editor_view(
         return std::ptr::null_mut();
     }
 
-    remember_host_ptr(host);
+    let host = remember_host_ptr(host);
 
     let repo_id = unsafe { request.as_ref() }
         .and_then(|request| decode_mzstr(request.instance_key))
@@ -10779,7 +10806,7 @@ extern "C" fn create_text_editor_view(
         return std::ptr::null_mut();
     }
 
-    remember_host_ptr(host);
+    let host = remember_host_ptr(host);
 
     let root = GtkBox::new(Orientation::Vertical, 12);
     root.set_margin_top(18);
@@ -11185,7 +11212,7 @@ extern "C" fn create_operations_view(
         return std::ptr::null_mut();
     }
 
-    remember_host_ptr(host);
+    let host = remember_host_ptr(host);
 
     let root = GtkBox::new(Orientation::Vertical, 12);
     root.set_margin_top(18);
