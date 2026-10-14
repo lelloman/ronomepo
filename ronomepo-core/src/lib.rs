@@ -3123,12 +3123,13 @@ pub fn collect_repository_details(repo_path: &Path) -> RepositoryDetails {
                     .collect()
             })
             .unwrap_or_default(),
-        last_commit: git_stdout(repo_path, ["log", "-1", "--format=%h|%s|%ct"]).and_then(
+        // The subject goes last so separators inside it cannot shift fields.
+        last_commit: git_stdout(repo_path, ["log", "-1", "--format=%h%x00%ct%x00%s"]).and_then(
             |output| {
-                let mut parts = output.splitn(3, '|');
+                let mut parts = output.splitn(3, '\0');
                 let short_sha = parts.next()?;
-                let subject = parts.next()?;
                 let committed_at_epoch_secs = parts.next()?.parse().ok()?;
+                let subject = parts.next().unwrap_or_default();
                 Some(LastCommitInfo {
                     short_sha: short_sha.to_string(),
                     subject: subject.to_string(),
@@ -3764,79 +3765,43 @@ fn collect_repo_recent_commits(
     num_commits: usize,
 ) -> Vec<RecentCommit> {
     let limit = num_commits.to_string();
+    // NUL separates fields and RS separates commits, so no subject or body
+    // text can be mistaken for structure. Signature output would otherwise be
+    // mixed into the log when log.showSignature is configured.
     let Some(output) = git_stdout(
         repo_path,
         [
             "log",
+            "--no-show-signature",
             "-n",
             &limit,
-            "--format=HASH:%H%nSUBJ:%s%nBODY:%b%nEND---",
+            "--format=%H%x00%s%x00%b%x1e",
         ],
     ) else {
         return Vec::new();
     };
 
-    let mut commits = Vec::new();
-    let mut current_hash = String::new();
-    let mut current_subject = String::new();
-    let mut body_lines = Vec::new();
-    let mut head_offset = 0usize;
-
-    let push_commit = |commits: &mut Vec<RecentCommit>,
-                       current_hash: &str,
-                       current_subject: &str,
-                       body_lines: &[String],
-                       head_offset: usize| {
-        if current_hash.is_empty() {
-            return;
-        }
-        commits.push(RecentCommit {
+    output
+        .split('\x1e')
+        .map(|record| record.trim_start_matches('\n'))
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| {
+            let mut fields = record.splitn(3, '\0');
+            let hash = fields.next()?;
+            let subject = fields.next().unwrap_or_default();
+            let body = fields.next().unwrap_or_default();
+            Some((hash, subject, body))
+        })
+        .enumerate()
+        .map(|(head_offset, (hash, subject, body))| RecentCommit {
             repository_id: repository_id.map(ToOwned::to_owned),
             repository_name: repository_name.to_string(),
             head_offset,
-            commit_hash: current_hash.to_string(),
-            subject: current_subject.to_string(),
-            body_lines: body_lines.to_vec(),
-        });
-    };
-
-    for line in output.lines() {
-        if let Some(hash) = line.strip_prefix("HASH:") {
-            current_hash = hash.to_string();
-            current_subject.clear();
-            body_lines.clear();
-            continue;
-        }
-        if let Some(subject) = line.strip_prefix("SUBJ:") {
-            current_subject = subject.to_string();
-            continue;
-        }
-        if let Some(body) = line.strip_prefix("BODY:") {
-            body_lines.push(body.to_string());
-            continue;
-        }
-        if line == "END---" {
-            push_commit(
-                &mut commits,
-                &current_hash,
-                &current_subject,
-                &body_lines,
-                head_offset,
-            );
-            if !current_hash.is_empty() {
-                head_offset += 1;
-            }
-            current_hash.clear();
-            current_subject.clear();
-            body_lines.clear();
-            continue;
-        }
-        if !current_hash.is_empty() {
-            body_lines.push(line.to_string());
-        }
-    }
-
-    commits
+            commit_hash: hash.to_string(),
+            subject: subject.to_string(),
+            body_lines: body.trim_end().lines().map(ToOwned::to_owned).collect(),
+        })
+        .collect()
 }
 
 fn evaluate_commit_check_rules(
@@ -5389,6 +5354,39 @@ mod tests {
         );
 
         assert!(repo_history_has_generated_markers(&repo_path, 25));
+    }
+
+    #[test]
+    fn commit_parsing_ignores_marker_like_text_in_messages() {
+        let repo_path = temp_dir_path("commit-parsing");
+        init_git_repo(&repo_path);
+        run_git(
+            &repo_path,
+            [
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fix a|b parsing",
+                "-m",
+                "END---\nHASH:deadbeef\nSUBJ:fake\nGenerated: Claude",
+            ],
+        );
+
+        let commits = collect_repo_recent_commits(&repo_path, None, "repo", 25);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].subject, "fix a|b parsing");
+        assert_eq!(commits[0].head_offset, 0);
+        assert_eq!(
+            commits[0].body_lines,
+            vec!["END---", "HASH:deadbeef", "SUBJ:fake", "Generated: Claude"]
+        );
+        assert_eq!(commits[1].subject, "init");
+        assert_eq!(commits[1].head_offset, 1);
+        assert!(commits[1].body_lines.is_empty());
+
+        let last_commit = collect_repository_details(&repo_path).last_commit.unwrap();
+        assert_eq!(last_commit.subject, "fix a|b parsing");
+        assert!(last_commit.committed_at_epoch_secs > 0);
     }
 
     #[test]
