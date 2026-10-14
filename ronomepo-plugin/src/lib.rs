@@ -199,7 +199,7 @@ const LOCAL_RESCAN_INTERVAL_SECS: u32 = 5 * 60;
 const REMOTE_FETCH_TICK_SECS: u32 = 30;
 const REMOTE_FETCH_INTERVAL_SECS: u64 = 60 * 60;
 const REMOTE_FETCH_JITTER_SECS: u64 = 30 * 60;
-const REMOTE_FETCH_CONCURRENCY: usize = 1;
+const REMOTE_FETCH_CONCURRENCY: usize = 3;
 const WATCH_POLL_FALLBACK_SECS: u64 = 15;
 const UI_REFRESH_DEBOUNCE_MILLIS: u64 = 75;
 const MAX_LOG_ENTRIES: usize = 500;
@@ -3600,60 +3600,68 @@ fn mark_all_repos_stale() {
 fn schedule_due_remote_fetches() {
     let scheduled = {
         let mut app_state = state().lock().expect("state mutex poisoned");
-        let inflight = app_state
-            .repo_runtime
-            .values()
-            .filter(|runtime| runtime.remote_fetch_in_flight)
-            .count();
-        let capacity = REMOTE_FETCH_CONCURRENCY.saturating_sub(inflight);
-        if capacity == 0 {
-            Vec::new()
-        } else {
-            let now = SystemTime::now();
-            let items = app_state
-                .repository_items
-                .iter()
-                .map(|item| {
-                    (
-                        item.id.clone(),
-                        item.name.clone(),
-                        item.status.repo_path.clone(),
-                        item.status.state.clone(),
-                        item.status.sync.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let mut due = items
-                .into_iter()
-                .filter_map(|(repo_id, repo_name, repo_path, state, sync)| {
-                    if matches!(state, ronomepo_core::RepositoryState::Missing)
-                        || matches!(
-                            sync,
-                            ronomepo_core::RepositorySync::NoUpstream
-                                | ronomepo_core::RepositorySync::Unknown
-                        )
-                    {
-                        return None;
-                    }
-                    let runtime = app_state.repo_runtime.get_mut(&repo_id)?;
-                    if runtime.remote_fetch_in_flight || runtime.next_fetch_due_at > now {
-                        return None;
-                    }
-                    runtime.remote_fetch_in_flight = true;
-                    Some((repo_id, repo_name, repo_path, runtime.next_fetch_due_at))
-                })
-                .collect::<Vec<_>>();
-            due.sort_by_key(|(_, _, _, due_at)| *due_at);
-            due.truncate(capacity);
-            due.into_iter()
-                .map(|(repo_id, repo_name, repo_path, _)| (repo_id, repo_name, repo_path))
-                .collect()
-        }
+        claim_due_remote_fetches(&mut app_state, SystemTime::now())
     };
 
     for (repo_id, repo_name, repo_path) in scheduled {
         schedule_repository_remote_fetch(&repo_id, &repo_name, repo_path);
     }
+}
+
+/// Selects the repos whose remote fetch is due, earliest first, up to the free
+/// fetch capacity, and marks only those as in flight.
+fn claim_due_remote_fetches(
+    app_state: &mut AppState,
+    now: SystemTime,
+) -> Vec<(String, String, PathBuf)> {
+    let inflight = app_state
+        .repo_runtime
+        .values()
+        .filter(|runtime| runtime.remote_fetch_in_flight)
+        .count();
+    let capacity = REMOTE_FETCH_CONCURRENCY.saturating_sub(inflight);
+    if capacity == 0 {
+        return Vec::new();
+    }
+
+    let mut due = app_state
+        .repository_items
+        .iter()
+        .filter(|item| {
+            !matches!(item.status.state, ronomepo_core::RepositoryState::Missing)
+                && !matches!(
+                    item.status.sync,
+                    ronomepo_core::RepositorySync::NoUpstream
+                        | ronomepo_core::RepositorySync::Unknown
+                )
+        })
+        .filter_map(|item| {
+            let runtime = app_state.repo_runtime.get(&item.id)?;
+            if runtime.remote_fetch_in_flight || runtime.next_fetch_due_at > now {
+                return None;
+            }
+            Some((runtime.next_fetch_due_at, item))
+        })
+        .collect::<Vec<_>>();
+    due.sort_by_key(|(due_at, _)| *due_at);
+    due.truncate(capacity);
+    let claimed = due
+        .into_iter()
+        .map(|(_, item)| {
+            (
+                item.id.clone(),
+                item.name.clone(),
+                item.status.repo_path.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for (repo_id, _, _) in &claimed {
+        if let Some(runtime) = app_state.repo_runtime.get_mut(repo_id) {
+            runtime.remote_fetch_in_flight = true;
+        }
+    }
+    claimed
 }
 
 fn schedule_workspace_scan() {
@@ -12187,6 +12195,63 @@ mod tests {
         assert!(mark_repo_stale(&mut app_state, "alpha"));
         assert!(!mark_repo_stale(&mut app_state, "alpha"));
         assert!(app_state.repo_runtime["alpha"].needs_rescan());
+    }
+
+    #[test]
+    fn due_remote_fetches_beyond_capacity_stay_schedulable() {
+        let mut app_state = AppState::default();
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        let count = REMOTE_FETCH_CONCURRENCY + 2;
+        for index in 0..count {
+            let name = format!("repo-{index}");
+            app_state.repository_items.push(test_repository_item(
+                &name,
+                RepositoryState::Clean,
+                RepositorySync::UpToDate,
+            ));
+            let mut runtime = RepoRuntimeState::new(UNIX_EPOCH, &name);
+            runtime.next_fetch_due_at = UNIX_EPOCH + Duration::from_secs(index as u64);
+            app_state.repo_runtime.insert(name, runtime);
+        }
+
+        let first = claim_due_remote_fetches(&mut app_state, now);
+        assert_eq!(first.len(), REMOTE_FETCH_CONCURRENCY);
+        // Earliest due first.
+        assert_eq!(first[0].0, "repo-0");
+        let in_flight = app_state
+            .repo_runtime
+            .values()
+            .filter(|runtime| runtime.remote_fetch_in_flight)
+            .count();
+        assert_eq!(in_flight, REMOTE_FETCH_CONCURRENCY);
+        assert!(claim_due_remote_fetches(&mut app_state, now).is_empty());
+
+        for (repo_id, _, _) in &first {
+            mark_remote_fetch_completed(&mut app_state, repo_id, true);
+        }
+        let second = claim_due_remote_fetches(&mut app_state, now);
+        let mut second_ids = second.into_iter().map(|(id, _, _)| id).collect::<Vec<_>>();
+        second_ids.sort();
+        let expected = (REMOTE_FETCH_CONCURRENCY..count)
+            .map(|index| format!("repo-{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(second_ids, expected);
+    }
+
+    #[test]
+    fn remote_fetch_skips_repos_without_upstream() {
+        let mut app_state = AppState::default();
+        app_state.repository_items.push(test_repository_item(
+            "alpha",
+            RepositoryState::Clean,
+            RepositorySync::NoUpstream,
+        ));
+        let mut runtime = RepoRuntimeState::new(UNIX_EPOCH, "alpha");
+        runtime.next_fetch_due_at = UNIX_EPOCH;
+        app_state.repo_runtime.insert("alpha".to_string(), runtime);
+
+        assert!(claim_due_remote_fetches(&mut app_state, SystemTime::now()).is_empty());
+        assert!(!app_state.repo_runtime["alpha"].remote_fetch_in_flight);
     }
 
     #[test]
