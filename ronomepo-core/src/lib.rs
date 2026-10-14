@@ -853,7 +853,8 @@ pub enum OperationKind {
     CloneMissing,
     Pull,
     Push,
-    PushForce,
+    /// Push without the commit-check preflight; this is not `git push --force`.
+    PushSkipChecks,
     ApplyHooks,
 }
 
@@ -3242,7 +3243,7 @@ pub fn run_workspace_operation<F>(
                 repository_id: None,
                 repository_name: None,
                 message: format!(
-                    "Push aborted because commit check rules blocked commits in: {}. Use force push to override.",
+                    "Push aborted because commit check rules blocked commits in: {}. Use Push (skip checks) to override.",
                     flagged.into_iter().collect::<Vec<_>>().join(", ")
                 ),
             });
@@ -3251,7 +3252,7 @@ pub fn run_workspace_operation<F>(
         }
     }
 
-    if matches!(kind, OperationKind::Push | OperationKind::PushForce)
+    if matches!(kind, OperationKind::Push | OperationKind::PushSkipChecks)
         && selected_repo_ids.is_empty()
     {
         emit_outcome(push_target(&OperationTarget::workspace_root(manifest)));
@@ -3268,7 +3269,7 @@ pub fn run_workspace_operation<F>(
                 emit_outcome(match kind {
                     OperationKind::CloneMissing => clone_missing_repo(manifest, repo),
                     OperationKind::Pull => pull_target(&OperationTarget::repo(manifest, repo)),
-                    OperationKind::Push | OperationKind::PushForce => {
+                    OperationKind::Push | OperationKind::PushSkipChecks => {
                         push_target(&OperationTarget::repo(manifest, repo))
                     }
                     OperationKind::ApplyHooks => apply_hooks_repo(manifest, repo),
@@ -3745,7 +3746,7 @@ fn operation_kind_label(kind: OperationKind) -> &'static str {
         OperationKind::CloneMissing => "Clone Missing",
         OperationKind::Pull => "Pull",
         OperationKind::Push => "Push",
-        OperationKind::PushForce => "Push Force",
+        OperationKind::PushSkipChecks => "Push (skip checks)",
         OperationKind::ApplyHooks => "Apply Hooks",
     }
 }

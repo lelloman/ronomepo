@@ -1397,7 +1397,7 @@ extern "C" fn command_push(
 extern "C" fn command_push_force(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    launch_operation(OperationKind::PushForce);
+    launch_operation(OperationKind::PushSkipChecks);
     maruzzella_sdk::ffi::MzStatus::OK
 }
 
@@ -1752,7 +1752,7 @@ fn operation_kind_title(kind: OperationKind) -> &'static str {
         OperationKind::CloneMissing => "Clone Missing",
         OperationKind::Pull => "Pull",
         OperationKind::Push => "Push",
-        OperationKind::PushForce => "Push Force",
+        OperationKind::PushSkipChecks => "Push (skip checks)",
         OperationKind::ApplyHooks => "Apply Hooks",
     }
 }
@@ -1852,7 +1852,7 @@ fn handle_operation_event(
 ) {
     let _timed = diag::timed("operation-event");
     if matches!(event.kind, OperationEventKind::Failed)
-        && matches!(operation, "Pull" | "Push" | "Push Force")
+        && matches!(operation, "Pull" | "Push" | "Push (skip checks)")
     {
         present_operation_failure_dialog(batch_id, operation, &event);
     }
@@ -4724,7 +4724,7 @@ fn append_repo_context_git_section(
         });
     }
     if can_push_force {
-        append_context_button(&submenu, popover, "Push Force", || {
+        append_context_button(&submenu, popover, "Push (skip checks)", || {
             let _ = command_push_force(maruzzella_sdk::ffi::MzBytes::empty());
         });
     }
@@ -8463,7 +8463,10 @@ fn render_repo_overview_git_page(
             ("Pull Repo", Some(OperationKind::Pull)),
             ("Push Repo", Some(OperationKind::Push)),
             ("Clone Repo", Some(OperationKind::CloneMissing)),
-            ("Push Repo Force", Some(OperationKind::PushForce)),
+            (
+                "Push Repo (skip checks)",
+                Some(OperationKind::PushSkipChecks),
+            ),
             ("Apply Hooks", Some(OperationKind::ApplyHooks)),
         ],
     ));
