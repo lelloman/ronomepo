@@ -649,6 +649,7 @@ enum WorkerResult {
     },
     CapabilityChecksCompleted {
         result: Result<CapabilityRunReport, String>,
+        repo_ids: Vec<String>,
     },
     OperationBatchCompleted {
         batch_id: usize,
@@ -1158,11 +1159,15 @@ fn worker_job_panic_recovery(job: &WorkerJob) -> Box<dyn FnOnce(String) -> Optio
                 result: Err(message),
             })
         }),
-        WorkerJob::CapabilityChecks { .. } => Box::new(|message| {
-            Some(WorkerResult::CapabilityChecksCompleted {
-                result: Err(message),
+        WorkerJob::CapabilityChecks { targets, .. } => {
+            let repo_ids = capability_target_repo_ids(targets);
+            Box::new(move |message| {
+                Some(WorkerResult::CapabilityChecksCompleted {
+                    result: Err(message),
+                    repo_ids,
+                })
             })
-        }),
+        }
         WorkerJob::EditorLoad { path, reply } => {
             let path = path.clone();
             let reply = reply.clone();
@@ -1290,8 +1295,9 @@ fn execute_worker_job(job: WorkerJob) -> Option<WorkerResult> {
             targets,
             run_reason,
         } => {
+            let repo_ids = capability_target_repo_ids(&targets);
             let result = run_capability_checks(&workspace_root, targets, &run_reason);
-            Some(WorkerResult::CapabilityChecksCompleted { result })
+            Some(WorkerResult::CapabilityChecksCompleted { result, repo_ids })
         }
         WorkerJob::EditorLoad { path, reply } => {
             let result = fs::read_to_string(&path).map_err(|error| error.to_string());
@@ -1308,6 +1314,16 @@ fn execute_worker_job(job: WorkerJob) -> Option<WorkerResult> {
             None
         }
     }
+}
+
+fn capability_target_repo_ids(targets: &[CapabilityRunTarget]) -> Vec<String> {
+    let mut repo_ids = targets
+        .iter()
+        .map(|target| target.repo_id.clone())
+        .collect::<Vec<_>>();
+    repo_ids.sort();
+    repo_ids.dedup();
+    repo_ids
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -2421,11 +2437,9 @@ fn handle_worker_result(result: WorkerResult) {
                 app_state.repo_details_cache.insert(repo_id, details);
                 changed
             };
+            // The debounced refresh re-sorts the monitor, which covers the
+            // recent-activity sort that depends on these details.
             if changed {
-                if active_monitor_sort_mode(&snapshot()) == MonitorSortMode::RecentActivity {
-                    let snapshot = snapshot();
-                    refresh_repository_views(&snapshot);
-                }
                 refresh_views();
             }
         }
@@ -2551,7 +2565,7 @@ fn handle_worker_result(result: WorkerResult) {
             }
             refresh_views();
         }
-        WorkerResult::CapabilityChecksCompleted { result } => {
+        WorkerResult::CapabilityChecksCompleted { result, repo_ids } => {
             let message = match result {
                 Ok(result) => {
                     for line in result.lines {
@@ -2562,7 +2576,14 @@ fn handle_worker_result(result: WorkerResult) {
                 Err(message) => format!("Capability checks failed: {message}"),
             };
             append_log(message);
-            schedule_workspace_scan();
+            // The registry is re-read on refresh; only the checked repos'
+            // working trees may have changed (e.g. build outputs).
+            for repo_id in repo_ids {
+                invalidate_repo_details(&repo_id);
+                if let Some(item) = repository_item_from_state(&repo_id) {
+                    request_repository_status_refresh(&item);
+                }
+            }
             refresh_views();
         }
         WorkerResult::OperationBatchCompleted { batch_id } => {
