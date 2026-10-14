@@ -1,4 +1,6 @@
 mod diag;
+#[cfg(feature = "embedded-terminal")]
+mod terminal_theme;
 
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
@@ -1629,6 +1631,8 @@ impl Plugin for RonomepoPlugin {
 
         let config = load_config(host)?;
         initialize_state(&config);
+        #[cfg(feature = "embedded-terminal")]
+        terminal_theme::register(host);
 
         host.register_command(
             CommandSpec::new(PLUGIN_ID, CMD_REFRESH, "Refresh Workspace")
@@ -10284,6 +10288,7 @@ fn build_vte_terminal_widget(path: &Path, label: &str, restart: &Button) -> GtkB
     terminal.set_scroll_on_keystroke(true);
     terminal.set_mouse_autohide(true);
     terminal.add_css_class("mono");
+    terminal_theme::attach(&terminal);
 
     let shell = preferred_embedded_shell();
     let path = path.to_path_buf();
