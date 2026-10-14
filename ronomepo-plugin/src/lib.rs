@@ -7345,27 +7345,31 @@ fn monitor_state_cell(state: &ronomepo_core::RepositoryState) -> Label {
     )
 }
 
-/// IDEA-like VCS colors: modified in the accent color, unversioned in red,
-/// clean in the default text color.
+/// The Status column tone. It matches the name colors: only states that need
+/// action stand out, and untracked files alone are not alarming.
 fn state_tone(state: &ronomepo_core::RepositoryState) -> ui::Tone {
     match state {
-        ronomepo_core::RepositoryState::Clean => ui::Tone::Muted,
+        ronomepo_core::RepositoryState::Clean | ronomepo_core::RepositoryState::Untracked => {
+            ui::Tone::Muted
+        }
         ronomepo_core::RepositoryState::Dirty => ui::Tone::Accent,
-        ronomepo_core::RepositoryState::Untracked | ronomepo_core::RepositoryState::Missing => {
+        ronomepo_core::RepositoryState::Missing | ronomepo_core::RepositoryState::Unknown => {
             ui::Tone::Danger
         }
-        ronomepo_core::RepositoryState::Unknown => ui::Tone::Muted,
     }
 }
 
-/// The tone coloring a repository name by its working tree state.
+/// IDEA-style name colors, kept calm: modified names in the accent color,
+/// diverged ones in the warning color, missing or unreadable repositories in
+/// the danger color. Clean and untracked-only names keep the default color.
 fn repo_name_tone(status: &RepositoryStatus) -> ui::Tone {
-    match status.state {
-        ronomepo_core::RepositoryState::Clean => ui::Tone::Strong,
-        ronomepo_core::RepositoryState::Dirty => ui::Tone::Accent,
-        ronomepo_core::RepositoryState::Untracked => ui::Tone::Danger,
-        ronomepo_core::RepositoryState::Missing => ui::Tone::Muted,
-        ronomepo_core::RepositoryState::Unknown => ui::Tone::Neutral,
+    match (&status.state, &status.sync) {
+        (ronomepo_core::RepositoryState::Missing | ronomepo_core::RepositoryState::Unknown, _) => {
+            ui::Tone::Danger
+        }
+        (_, ronomepo_core::RepositorySync::Diverged { .. }) => ui::Tone::Warning,
+        (ronomepo_core::RepositoryState::Dirty, _) => ui::Tone::Accent,
+        _ => ui::Tone::Strong,
     }
 }
 
@@ -7384,7 +7388,7 @@ fn sync_compact(sync: &ronomepo_core::RepositorySync) -> (String, ui::Tone) {
     match sync {
         ronomepo_core::RepositorySync::UpToDate => ("✓".to_string(), ui::Tone::Muted),
         ronomepo_core::RepositorySync::Ahead(ahead) => (format!("↑{ahead}"), ui::Tone::Accent),
-        ronomepo_core::RepositorySync::Behind(behind) => (format!("↓{behind}"), ui::Tone::Warning),
+        ronomepo_core::RepositorySync::Behind(behind) => (format!("↓{behind}"), ui::Tone::Accent),
         ronomepo_core::RepositorySync::Diverged { ahead, behind } => {
             (format!("↑{ahead} ↓{behind}"), ui::Tone::Warning)
         }
@@ -9995,6 +9999,7 @@ fn repo_overview_context(
 fn state_badge_tone(state: &ronomepo_core::RepositoryState) -> ui::Tone {
     match state {
         ronomepo_core::RepositoryState::Clean => ui::Tone::Success,
+        ronomepo_core::RepositoryState::Untracked => ui::Tone::Neutral,
         other => state_tone(other),
     }
 }
@@ -12667,6 +12672,80 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn repo_names_only_stand_out_for_states_that_need_action() {
+        let status = |state, sync| RepositoryStatus {
+            state,
+            sync,
+            ..empty_repository_status(PathBuf::from("/tmp/repo"))
+        };
+        let cases = [
+            (
+                RepositoryState::Clean,
+                RepositorySync::UpToDate,
+                ui::Tone::Strong,
+            ),
+            (
+                RepositoryState::Untracked,
+                RepositorySync::UpToDate,
+                ui::Tone::Strong,
+            ),
+            (
+                RepositoryState::Clean,
+                RepositorySync::Ahead(2),
+                ui::Tone::Strong,
+            ),
+            (
+                RepositoryState::Clean,
+                RepositorySync::Behind(1),
+                ui::Tone::Strong,
+            ),
+            (
+                RepositoryState::Clean,
+                RepositorySync::NoUpstream,
+                ui::Tone::Strong,
+            ),
+            (
+                RepositoryState::Dirty,
+                RepositorySync::UpToDate,
+                ui::Tone::Accent,
+            ),
+            (
+                RepositoryState::Dirty,
+                RepositorySync::Diverged {
+                    ahead: 1,
+                    behind: 1,
+                },
+                ui::Tone::Warning,
+            ),
+            (
+                RepositoryState::Clean,
+                RepositorySync::Diverged {
+                    ahead: 1,
+                    behind: 1,
+                },
+                ui::Tone::Warning,
+            ),
+            (
+                RepositoryState::Missing,
+                RepositorySync::Unknown,
+                ui::Tone::Danger,
+            ),
+            (
+                RepositoryState::Unknown,
+                RepositorySync::Unknown,
+                ui::Tone::Danger,
+            ),
+        ];
+        for (state, sync, tone) in cases {
+            let label = format!("{state:?} {sync:?}");
+            assert_eq!(repo_name_tone(&status(state, sync)), tone, "{label}");
+        }
+        assert_eq!(state_tone(&RepositoryState::Untracked), ui::Tone::Muted);
+        assert_eq!(state_tone(&RepositoryState::Dirty), ui::Tone::Accent);
+        assert_eq!(state_tone(&RepositoryState::Missing), ui::Tone::Danger);
+    }
 
     fn temp_test_dir(label: &str) -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
