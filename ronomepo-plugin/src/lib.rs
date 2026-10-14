@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -543,15 +543,6 @@ enum WorkerJob {
         action: StandardActionName,
         targets: Vec<(RepositoryListItem, Arc<RepoManifest>)>,
     },
-    EditorLoad {
-        path: PathBuf,
-        reply: mpsc::Sender<EditorLoadMessage>,
-    },
-    EditorSave {
-        path: PathBuf,
-        content: String,
-        reply: mpsc::Sender<EditorSaveMessage>,
-    },
 }
 
 enum WorkerResult {
@@ -675,16 +666,6 @@ struct CommitCheckRuleRowHandle {
     rule_id: String,
 }
 
-struct EditorLoadMessage {
-    path: PathBuf,
-    result: Result<String, String>,
-}
-
-struct EditorSaveMessage {
-    path: PathBuf,
-    result: Result<(), String>,
-}
-
 struct RepositoryViewHandle {
     list: glib::WeakRef<ListBox>,
     store: gio::ListStore,
@@ -762,6 +743,13 @@ struct OperationBufferHandle {
     line_counts: RefCell<std::collections::VecDeque<usize>>,
 }
 
+struct TextEditorState {
+    /// The host instance key of the view ("" for a keyless view), which is
+    /// what a teardown request names.
+    instance_key: String,
+    dirty: bool,
+}
+
 struct OperationFollowHandle {
     scroller: glib::WeakRef<ScrolledWindow>,
     toggle: glib::WeakRef<ToggleButton>,
@@ -779,7 +767,8 @@ thread_local! {
     static OPERATION_SUMMARY_CURSOR: Cell<Option<LogCursor>> = const { Cell::new(None) };
     static OPERATION_SUMMARIES: RefCell<Vec<glib::WeakRef<Label>>> = const { RefCell::new(Vec::new()) };
     static OPERATION_FOLLOWERS: RefCell<Vec<OperationFollowHandle>> = const { RefCell::new(Vec::new()) };
-    static DIRTY_TEXT_EDITORS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// Open text editor views by view id.
+    static TEXT_EDITORS: RefCell<HashMap<usize, TextEditorState>> = RefCell::new(HashMap::new());
 }
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -1124,20 +1113,6 @@ fn run_worker_job(queued_job: QueuedJob) {
         }
         WorkerJob::RepoManifestActions { action, targets } => {
             run_repo_manifest_actions(action, targets);
-            None
-        }
-        WorkerJob::EditorLoad { path, reply } => {
-            let result = fs::read_to_string(&path).map_err(|error| error.to_string());
-            let _ = reply.send(EditorLoadMessage { path, result });
-            None
-        }
-        WorkerJob::EditorSave {
-            path,
-            content,
-            reply,
-        } => {
-            let result = fs::write(&path, content).map_err(|error| error.to_string());
-            let _ = reply.send(EditorSaveMessage { path, result });
             None
         }
     };
@@ -11266,21 +11241,23 @@ extern "C" fn create_text_editor_view(
     root.set_margin_start(18);
     root.set_margin_end(18);
 
-    let initial_path = unsafe { request.as_ref() }
-        .and_then(|request| decode_mzstr(request.instance_key))
-        .or_else(|| {
-            unsafe { request.as_ref() }.and_then(|request| {
-                if request.payload.ptr.is_null() || request.payload.len == 0 {
-                    None
-                } else {
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(request.payload.ptr, request.payload.len)
-                    };
-                    let text = String::from_utf8_lossy(bytes).trim().to_string();
-                    (!text.is_empty()).then_some(text)
-                }
-            })
-        });
+    let instance_key =
+        unsafe { request.as_ref() }.and_then(|request| decode_mzstr(request.instance_key));
+    let initial_path = instance_key.clone().or_else(|| {
+        unsafe { request.as_ref() }.and_then(|request| {
+            if request.payload.ptr.is_null() || request.payload.len == 0 {
+                None
+            } else {
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(request.payload.ptr, request.payload.len) };
+                let text = String::from_utf8_lossy(bytes).trim().to_string();
+                (!text.is_empty()).then_some(text)
+            }
+        })
+    });
+    let instance_key = instance_key.unwrap_or_default();
+    let editor_id = register_text_editor(instance_key.clone());
+    root.connect_destroy(move |_| unregister_text_editor(editor_id));
 
     let title = Label::new(Some("Text Editor"));
     title.set_xalign(0.0);
@@ -11306,22 +11283,13 @@ extern "C" fn create_text_editor_view(
     status.set_wrap(true);
 
     let buffer = TextBuffer::new(None);
-    let editor_key = initial_path
-        .as_deref()
-        .map(resolve_editor_path)
-        .map(|path| path.to_string_lossy().to_string());
-    let suppress_dirty = Arc::new(AtomicBool::new(true));
+    // Set while the editor itself replaces the buffer text.
+    let suppress_dirty = Rc::new(Cell::new(false));
     buffer.connect_changed({
-        let editor_key = editor_key.clone();
-        let suppress_dirty = suppress_dirty.clone();
+        let suppress_dirty = Rc::clone(&suppress_dirty);
         move |_| {
-            if suppress_dirty.load(Ordering::SeqCst) {
-                return;
-            }
-            if let Some(editor_key) = editor_key.as_ref() {
-                DIRTY_TEXT_EDITORS.with(|dirty| {
-                    dirty.borrow_mut().insert(editor_key.clone());
-                });
+            if !suppress_dirty.get() {
+                set_text_editor_dirty(editor_id, true);
             }
         }
     });
@@ -11338,31 +11306,27 @@ extern "C" fn create_text_editor_view(
         .child(&text)
         .build();
 
+    let widgets = TextEditorWidgets {
+        id: editor_id,
+        buffer: buffer.clone(),
+        status: status.clone(),
+        title: title.clone(),
+        path_entry: path_entry.clone(),
+        suppress_dirty,
+    };
+
     if let Some(path) = initial_path.as_deref() {
         path_entry.set_text(path);
         let resolved = resolve_editor_path(path);
         title.set_text(&editor_title_for_path(&resolved));
-        queue_editor_load(
-            &buffer,
-            &status,
-            &title,
-            &path_entry,
-            &resolved,
-            suppress_dirty.clone(),
-        );
-    } else {
-        suppress_dirty.store(false, Ordering::SeqCst);
+        queue_editor_load(&widgets, &resolved);
     }
 
     open_button.connect_clicked({
-        let path_entry = path_entry.clone();
-        let buffer = buffer.clone();
-        let status = status.clone();
-        let title = title.clone();
+        let widgets = widgets.clone();
         let initial_path = initial_path.clone();
-        let suppress_dirty = suppress_dirty.clone();
         move |_| {
-            let path = resolve_editor_path(path_entry.text().as_str());
+            let path = resolve_editor_path(widgets.path_entry.text().as_str());
             let current_instance = initial_path
                 .as_deref()
                 .map(resolve_editor_path)
@@ -11370,33 +11334,26 @@ extern "C" fn create_text_editor_view(
             if !current_instance.as_os_str().is_empty() && current_instance != path {
                 open_text_editor_for_path(host, &path);
             } else {
-                queue_editor_load(
-                    &buffer,
-                    &status,
-                    &title,
-                    &path_entry,
-                    &path,
-                    suppress_dirty.clone(),
-                );
-                title.set_text(&editor_title_for_path(&path));
+                queue_editor_load(&widgets, &path);
+                widgets.title.set_text(&editor_title_for_path(&path));
             }
         }
     });
 
     save_button.connect_clicked({
-        let path_entry = path_entry.clone();
-        let buffer = buffer.clone();
-        let status = status.clone();
-        let title = title.clone();
+        let widgets = widgets.clone();
         move |_| {
-            let path = resolve_editor_path(path_entry.text().as_str());
-            let content = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+            let path = resolve_editor_path(widgets.path_entry.text().as_str());
+            let content = widgets.buffer.text(
+                &widgets.buffer.start_iter(),
+                &widgets.buffer.end_iter(),
+                true,
+            );
             queue_editor_save(
-                &buffer,
-                &status,
-                &title,
+                &widgets,
                 &path,
                 content.to_string(),
+                &instance_key,
                 host as usize,
             );
         }
@@ -11422,6 +11379,56 @@ extern "C" fn create_text_editor_view(
     }
 }
 
+/// Widgets of one text editor view that its load and save completions touch.
+/// The completions only run on the GTK thread.
+#[derive(Clone)]
+struct TextEditorWidgets {
+    id: usize,
+    buffer: TextBuffer,
+    status: Label,
+    title: Label,
+    path_entry: Entry,
+    suppress_dirty: Rc<Cell<bool>>,
+}
+
+fn register_text_editor(instance_key: String) -> usize {
+    static NEXT_TEXT_EDITOR_ID: AtomicUsize = AtomicUsize::new(1);
+    let id = NEXT_TEXT_EDITOR_ID.fetch_add(1, Ordering::Relaxed);
+    TEXT_EDITORS.with(|editors| {
+        editors.borrow_mut().insert(
+            id,
+            TextEditorState {
+                instance_key,
+                dirty: false,
+            },
+        );
+    });
+    id
+}
+
+fn unregister_text_editor(id: usize) {
+    TEXT_EDITORS.with(|editors| {
+        editors.borrow_mut().remove(&id);
+    });
+}
+
+fn set_text_editor_dirty(id: usize, dirty: bool) {
+    TEXT_EDITORS.with(|editors| {
+        if let Some(editor) = editors.borrow_mut().get_mut(&id) {
+            editor.dirty = dirty;
+        }
+    });
+}
+
+fn text_editor_instance_dirty(instance_key: &str) -> bool {
+    TEXT_EDITORS.with(|editors| {
+        editors
+            .borrow()
+            .values()
+            .any(|editor| editor.dirty && editor.instance_key == instance_key)
+    })
+}
+
 extern "C" fn prepare_text_editor_teardown(
     request: *const MzViewTeardownRequest,
 ) -> MzViewTeardownResult {
@@ -11433,12 +11440,8 @@ extern "C" fn prepare_text_editor_teardown(
             ),
         };
     };
-    let is_dirty = decode_mzstr(request.view.instance_key).is_some_and(|instance_key| {
-        let key = resolve_editor_path(&instance_key)
-            .to_string_lossy()
-            .to_string();
-        DIRTY_TEXT_EDITORS.with(|dirty| dirty.borrow().contains(&key))
-    });
+    let instance_key = decode_mzstr(request.view.instance_key).unwrap_or_default();
+    let is_dirty = text_editor_instance_dirty(&instance_key);
     MzViewTeardownResult {
         decision: if is_dirty {
             MzViewTeardownDecision::Confirm
@@ -11464,161 +11467,95 @@ fn resolve_editor_path(input: &str) -> PathBuf {
     }
 }
 
-fn queue_editor_load(
-    buffer: &TextBuffer,
-    status: &Label,
-    title: &Label,
-    path_entry: &Entry,
-    path: &Path,
-    suppress_dirty: Arc<AtomicBool>,
-) {
-    suppress_dirty.store(true, Ordering::SeqCst);
-    status.set_text(&format!("Loading {}...", path.display()));
-    let (sender, receiver) = mpsc::channel::<EditorLoadMessage>();
-    let buffer = glib::SendWeakRef::from(buffer.downgrade());
-    let status = glib::SendWeakRef::from(status.downgrade());
-    let title = glib::SendWeakRef::from(title.downgrade());
-    let path_entry = glib::SendWeakRef::from(path_entry.downgrade());
-    let queue_error_buffer = buffer.clone();
-    let queue_error_status = status.clone();
-    let completion_suppress_dirty = suppress_dirty.clone();
-    let main_context = glib::MainContext::default();
-    thread::spawn(move || {
-        let Ok(message) = receiver.recv() else {
-            return;
-        };
-        main_context.invoke(move || {
-            let Some(path_entry) = path_entry.upgrade() else {
-                return;
-            };
-            if resolve_editor_path(path_entry.text().as_str()) != message.path {
-                completion_suppress_dirty.store(false, Ordering::SeqCst);
-                return;
-            }
-            let Some(buffer) = buffer.upgrade() else {
-                return;
-            };
-            let Some(status) = status.upgrade() else {
-                return;
-            };
-            let Some(title) = title.upgrade() else {
-                return;
-            };
-            match message.result {
+fn queue_editor_load(widgets: &TextEditorWidgets, path: &Path) {
+    widgets.suppress_dirty.set(true);
+    widgets
+        .status
+        .set_text(&format!("Loading {}...", path.display()));
+    let widgets = widgets.clone();
+    let path = path.to_path_buf();
+    glib::spawn_future_local(async move {
+        let read_path = path.clone();
+        let result = gio::spawn_blocking(move || {
+            fs::read_to_string(&read_path).map_err(|error| error.to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err("the file reader stopped unexpectedly".to_string()));
+
+        // The user may have pointed the editor elsewhere in the meantime.
+        if resolve_editor_path(widgets.path_entry.text().as_str()) == path {
+            match result {
                 Ok(content) => {
-                    buffer.set_text(&content);
-                    DIRTY_TEXT_EDITORS.with(|dirty| {
-                        dirty
-                            .borrow_mut()
-                            .remove(&message.path.to_string_lossy().to_string());
-                    });
-                    status.set_text(&format!("Loaded {}", message.path.display()));
-                    title.set_text(&editor_title_for_path(&message.path));
+                    widgets.buffer.set_text(&content);
+                    widgets
+                        .status
+                        .set_text(&format!("Loaded {}", path.display()));
+                    widgets.title.set_text(&editor_title_for_path(&path));
                 }
                 Err(error) => {
-                    buffer.set_text("");
-                    status.set_text(&format!(
-                        "Failed to open {}: {error}",
-                        message.path.display()
-                    ));
+                    widgets.buffer.set_text("");
+                    widgets
+                        .status
+                        .set_text(&format!("Failed to open {}: {error}", path.display()));
                 }
             }
-            completion_suppress_dirty.store(false, Ordering::SeqCst);
-        });
+            // Either way the buffer no longer holds unsaved edits.
+            set_text_editor_dirty(widgets.id, false);
+        }
+        widgets.suppress_dirty.set(false);
     });
-
-    if let Err(message) = submit_job(WorkerJob::EditorLoad {
-        path: path.to_path_buf(),
-        reply: sender,
-    }) {
-        if let Some(buffer) = queue_error_buffer.upgrade() {
-            buffer.set_text("");
-        }
-        if let Some(status) = queue_error_status.upgrade() {
-            status.set_text(&format!(
-                "Failed to queue load for {}: {message}",
-                path.display()
-            ));
-        }
-        suppress_dirty.store(false, Ordering::SeqCst);
-    }
 }
 
 fn queue_editor_save(
-    buffer: &TextBuffer,
-    status: &Label,
-    title: &Label,
+    widgets: &TextEditorWidgets,
     path: &Path,
     content: String,
+    instance_key: &str,
     host_ptr: usize,
 ) {
-    status.set_text(&format!("Saving {}...", path.display()));
-    let (sender, receiver) = mpsc::channel::<EditorSaveMessage>();
-    let status = glib::SendWeakRef::from(status.downgrade());
-    let title = glib::SendWeakRef::from(title.downgrade());
-    let buffer = glib::SendWeakRef::from(buffer.downgrade());
+    widgets
+        .status
+        .set_text(&format!("Saving {}...", path.display()));
+    let widgets = widgets.clone();
     let path = path.to_path_buf();
-    let saved_content = content.clone();
-    let queue_error_status = status.clone();
-    let main_context = glib::MainContext::default();
-    thread::spawn(move || {
-        let Ok(message) = receiver.recv() else {
-            return;
-        };
-        main_context.invoke(move || {
-            let Some(status) = status.upgrade() else {
-                return;
-            };
-            let Some(title) = title.upgrade() else {
-                return;
-            };
-            match message.result {
-                Ok(()) => {
-                    if let Some(buffer) = buffer.upgrade() {
-                        let current = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
-                        if current.as_str() == saved_content {
-                            DIRTY_TEXT_EDITORS.with(|dirty| {
-                                dirty
-                                    .borrow_mut()
-                                    .remove(&message.path.to_string_lossy().to_string());
-                            });
-                        }
-                    }
-                    status.set_text(&format!("Saved {}", message.path.display()));
-                    let title_text = editor_title_for_path(&message.path);
-                    title.set_text(&title_text);
-                    if host_ptr != 0 {
-                        let host = unsafe {
-                            HostApi::from_raw(&*(host_ptr as *const maruzzella_sdk::ffi::MzHostApi))
-                        };
-                        let mut query = maruzzella_sdk::ViewQuery::new(PLUGIN_ID, VIEW_TEXT_EDITOR);
-                        let path_key = message.path.to_string_lossy().to_string();
-                        query.instance_key = Some(&path_key);
-                        let _ = host.update_view_title(&query, &title_text);
-                    }
+    let instance_key = instance_key.to_string();
+    glib::spawn_future_local(async move {
+        let write_path = path.clone();
+        let saved_content = content.clone();
+        let result = gio::spawn_blocking(move || {
+            fs::write(&write_path, content).map_err(|error| error.to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err("the file writer stopped unexpectedly".to_string()));
+
+        match result {
+            Ok(()) => {
+                let buffer = &widgets.buffer;
+                let current = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+                if current.as_str() == saved_content {
+                    set_text_editor_dirty(widgets.id, false);
                 }
-                Err(error) => {
-                    status.set_text(&format!(
-                        "Failed to save {}: {error}",
-                        message.path.display()
-                    ));
+                widgets
+                    .status
+                    .set_text(&format!("Saved {}", path.display()));
+                let title_text = editor_title_for_path(&path);
+                widgets.title.set_text(&title_text);
+                if host_ptr != 0 {
+                    let host = unsafe {
+                        HostApi::from_raw(&*(host_ptr as *const maruzzella_sdk::ffi::MzHostApi))
+                    };
+                    let mut query = maruzzella_sdk::ViewQuery::new(PLUGIN_ID, VIEW_TEXT_EDITOR);
+                    query.instance_key = Some(&instance_key);
+                    let _ = host.update_view_title(&query, &title_text);
                 }
             }
-        });
-    });
-
-    if let Err(message) = submit_job(WorkerJob::EditorSave {
-        path: path.clone(),
-        content,
-        reply: sender,
-    }) {
-        if let Some(status) = queue_error_status.upgrade() {
-            status.set_text(&format!(
-                "Failed to queue save for {}: {message}",
-                path.display()
-            ));
+            Err(error) => {
+                widgets
+                    .status
+                    .set_text(&format!("Failed to save {}: {error}", path.display()));
+            }
         }
-    }
+    });
 }
 
 fn editor_title_for_path(path: &Path) -> String {
@@ -12901,22 +12838,34 @@ mod tests {
     #[test]
     fn text_editor_teardown_confirms_only_for_dirty_instances() {
         let instance_key = "/tmp/ronomepo-dirty-editor.txt";
-        DIRTY_TEXT_EDITORS.with(|dirty| dirty.borrow_mut().clear());
         let mut request = MzViewTeardownRequest::default();
         request.view.instance_key = maruzzella_sdk::ffi::MzStr {
             ptr: instance_key.as_ptr(),
             len: instance_key.len(),
         };
 
+        let editor = register_text_editor(instance_key.to_string());
+        let keyless = register_text_editor(String::new());
         let ready = prepare_text_editor_teardown(&request);
         assert_eq!(ready.decision, MzViewTeardownDecision::Ready);
 
-        DIRTY_TEXT_EDITORS.with(|dirty| {
-            dirty.borrow_mut().insert(instance_key.to_string());
-        });
+        // A dirty editor without an instance key does not block keyed ones.
+        set_text_editor_dirty(keyless, true);
+        let ready = prepare_text_editor_teardown(&request);
+        assert_eq!(ready.decision, MzViewTeardownDecision::Ready);
+        assert!(text_editor_instance_dirty(""));
+
+        set_text_editor_dirty(editor, true);
         let confirm = prepare_text_editor_teardown(&request);
         assert_eq!(confirm.decision, MzViewTeardownDecision::Confirm);
-        DIRTY_TEXT_EDITORS.with(|dirty| dirty.borrow_mut().clear());
+
+        set_text_editor_dirty(editor, false);
+        assert!(!text_editor_instance_dirty(instance_key));
+        set_text_editor_dirty(editor, true);
+        unregister_text_editor(editor);
+        unregister_text_editor(keyless);
+        assert!(!text_editor_instance_dirty(instance_key));
+        assert!(!text_editor_instance_dirty(""));
     }
 }
 
