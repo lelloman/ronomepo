@@ -4759,12 +4759,12 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
 }
 
 fn watch_source(manifest: &WorkspaceManifest) -> WatchSource {
-    let workspace_root = normalized_watch_path(&manifest.root);
+    let workspace_root = absolute_normalized_path(&manifest.root);
     let workspace_git_dir = Some(workspace_root.join(".git")).filter(|path| path.exists());
     let mut repo_roots = manifest
         .repos
         .iter()
-        .map(|repo| normalized_watch_path(&workspace_root.join(&repo.dir_name)))
+        .map(|repo| absolute_normalized_path(&workspace_root.join(&repo.dir_name)))
         .filter(|path| path.exists())
         .collect::<Vec<_>>();
     repo_roots.sort();
@@ -4967,7 +4967,7 @@ fn watch_new_dirs(mut dirs: Vec<PathBuf>) {
     let mut to_watch = Vec::new();
     let mut unreadable = Vec::new();
     for dir in dirs {
-        let dir = normalized_watch_path(&dir);
+        let dir = absolute_normalized_path(&dir);
         if collected.contains(&dir)
             || !dir.is_dir()
             || is_under_ignored_dir(&ignored, &dir)
@@ -5054,14 +5054,14 @@ struct WatchRouting {
 
 impl WatchRouting {
     fn new(manifest: &WorkspaceManifest) -> Self {
-        let workspace_root = normalized_watch_path(&manifest.root);
+        let workspace_root = absolute_normalized_path(&manifest.root);
         let mut repos = manifest
             .repos
             .iter()
             .map(|repo| {
                 (
                     repo.id.clone(),
-                    normalized_watch_path(&workspace_root.join(&repo.dir_name)),
+                    absolute_normalized_path(&workspace_root.join(&repo.dir_name)),
                 )
             })
             .collect::<Vec<_>>();
@@ -5312,7 +5312,7 @@ fn handle_watch_backend_rescan() {
 }
 
 fn workspace_watch_path_matches(routing: &WatchRouting, path: &Path) -> bool {
-    let path = normalized_watch_path(path);
+    let path = absolute_normalized_path(path);
 
     if let Ok(relative) = path.strip_prefix(&routing.workspace_root) {
         if relative.components().count() == 0 {
@@ -5334,7 +5334,7 @@ fn workspace_watch_path_matches(routing: &WatchRouting, path: &Path) -> bool {
 }
 
 fn repo_id_for_watch_path(routing: &WatchRouting, path: &Path) -> Option<String> {
-    let path = normalized_watch_path(path);
+    let path = absolute_normalized_path(path);
     routing
         .repos
         .iter()
@@ -11065,8 +11065,11 @@ fn open_selected_repo_in_editor() {
     open_path_in_editor(&item.status.repo_path, &item.name);
 }
 
+/// Opens `path` in a text editor tab. `path` is resolved like every other
+/// repo or workspace path the plugin builds (against the working directory),
+/// not like user input in the editor's path entry.
 fn open_text_editor_for_path(host_ptr: *const maruzzella_sdk::ffi::MzHostApi, path: &Path) {
-    let resolved = resolve_editor_path(&path.display().to_string());
+    let resolved = absolute_normalized_path(path);
     let instance_key = resolved.to_string_lossy().to_string();
     let requested_title = editor_title_for_path(&resolved);
 
@@ -12224,15 +12227,19 @@ fn prepare_text_editor_teardown(request: *const MzViewTeardownRequest) -> MzView
     }
 }
 
+/// Resolves a path typed into the text editor: relative paths are relative to
+/// the workspace root.
 fn resolve_editor_path(input: &str) -> PathBuf {
-    let trimmed = input.trim();
-    let path = PathBuf::from(trimmed);
-    if path.is_absolute() {
-        path
-    } else {
-        let app_state = state().lock().expect("state mutex poisoned");
-        app_state.workspace_root.join(path)
-    }
+    let workspace_root = state()
+        .lock()
+        .expect("state mutex poisoned")
+        .workspace_root
+        .clone();
+    resolve_editor_input(&workspace_root, input)
+}
+
+fn resolve_editor_input(workspace_root: &Path, input: &str) -> PathBuf {
+    absolute_normalized_path(&workspace_root.join(input.trim()))
 }
 
 fn queue_editor_load(widgets: &TextEditorWidgets, path: &Path) {
@@ -12645,7 +12652,11 @@ fn load_manifest_if_present(path: &Path) -> Option<WorkspaceManifest> {
     Some(manifest)
 }
 
-fn normalized_watch_path(path: &Path) -> PathBuf {
+/// `path` made absolute against the process working directory, with `.` and
+/// `..` resolved lexically. Repo paths built from the manifest
+/// (`manifest.root.join(dir_name)`) are relative to the working directory,
+/// which is how the status scan, git commands and file watchers resolve them.
+fn absolute_normalized_path(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -13238,6 +13249,37 @@ mod tests {
             &WatchRouting::new(&manifest),
             &workspace_root.join("alpha/src/lib.rs")
         ));
+    }
+
+    #[test]
+    fn repo_file_editor_path_resolves_like_the_status_scan() {
+        // ronomepo.json with `root: "../"` beside a workspace root that is
+        // not the working directory: repo paths are relative to the working
+        // directory, never to the workspace root.
+        let cwd = std::env::current_dir().unwrap();
+        let repo_path = PathBuf::from("../").join("peerlo");
+
+        let readme = absolute_normalized_path(&repo_path.join("README.md"));
+        assert_eq!(readme, cwd.parent().unwrap().join("peerlo/README.md"));
+        assert!(readme
+            .components()
+            .all(|component| component != std::path::Component::ParentDir));
+
+        let git_config = absolute_normalized_path(&repo_path.join(".git/config"));
+        assert_eq!(git_config, cwd.parent().unwrap().join("peerlo/.git/config"));
+    }
+
+    #[test]
+    fn typed_editor_paths_resolve_against_the_workspace_root() {
+        let workspace_root = Path::new("/workspace/root");
+        assert_eq!(
+            resolve_editor_input(workspace_root, " notes/../README.md "),
+            PathBuf::from("/workspace/root/README.md")
+        );
+        assert_eq!(
+            resolve_editor_input(workspace_root, "/etc/hosts"),
+            PathBuf::from("/etc/hosts")
+        );
     }
 
     #[test]
