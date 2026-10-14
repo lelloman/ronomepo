@@ -1672,7 +1672,7 @@ impl Plugin for RonomepoPlugin {
             PLUGIN_ID,
             "ronomepo-about",
             "Ronomepo",
-            "Desktop-first multi-repository workspace manager hosted inside Maruzzella.",
+            "Repository monitor, Git operations, commit checks and Fucina policy.",
         ))?;
 
         host.register_view_factory(ViewFactorySpec::new(
