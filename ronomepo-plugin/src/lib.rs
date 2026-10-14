@@ -331,6 +331,11 @@ struct AppState {
     repo_runtime: HashMap<String, RepoRuntimeState>,
     watch_manager_sync_in_flight: bool,
     watch_manager_sync_pending: bool,
+    /// Whether any sync collapsed into `watch_manager_sync_pending` was forced.
+    watch_manager_sync_pending_force: bool,
+    /// Source of the installed watch manager, so checking whether a sync is a
+    /// no-op does not need the watch manager lock.
+    watch_source: Option<WatchSource>,
     /// The Pull/Push/... batch currently running; only one runs at a time.
     operation_in_flight: Option<OperationBatchState>,
     /// Each repo's invalidation_seq when the running full workspace scan was
@@ -394,6 +399,8 @@ impl Default for AppState {
             repo_runtime: HashMap::new(),
             watch_manager_sync_in_flight: false,
             watch_manager_sync_pending: false,
+            watch_manager_sync_pending_force: false,
+            watch_source: None,
             operation_in_flight: None,
             workspace_scan_seqs: HashMap::new(),
         }
@@ -2363,12 +2370,19 @@ fn handle_worker_result(result: WorkerResult) {
             }
         }
         WorkerResult::WatchManagerSyncCompleted { sync_seq, result } => {
-            let rerun = {
+            let (rerun, rerun_force) = {
                 let mut app_state = state().lock().expect("state mutex poisoned");
                 app_state.watch_manager_sync_in_flight = false;
+                app_state.watch_source = result
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map(|manager| manager.source.clone());
                 let rerun = app_state.watch_manager_sync_pending;
+                let rerun_force = app_state.watch_manager_sync_pending_force;
                 app_state.watch_manager_sync_pending = false;
-                rerun
+                app_state.watch_manager_sync_pending_force = false;
+                (rerun, rerun_force)
             };
 
             match result {
@@ -2416,7 +2430,7 @@ fn handle_worker_result(result: WorkerResult) {
 
             if rerun {
                 WATCH_SYNC_PENDING_COLLAPSES.fetch_add(1, Ordering::Relaxed);
-                sync_watch_manager_from_state();
+                sync_watch_manager(rerun_force);
             }
         }
         WorkerResult::RefreshWorkspaceCompleted {
@@ -4297,26 +4311,20 @@ fn sync_watch_manager(force: bool) {
     let manifest = {
         let mut app_state = state().lock().expect("state mutex poisoned");
         if app_state.watch_manager_sync_in_flight {
-            app_state.watch_manager_sync_pending = true;
-            WATCH_SYNC_PENDING_COLLAPSES.fetch_add(1, Ordering::Relaxed);
+            collapse_watch_manager_sync(&mut app_state, force);
             return;
         }
-        let unchanged = !force
-            && app_state.manifest.as_ref().is_some_and(|manifest| {
-                let source = watch_source(manifest);
-                watch_manager()
-                    .lock()
-                    .expect("watch manager mutex poisoned")
-                    .as_ref()
-                    .is_some_and(|manager| manager.source == source)
-            });
-        if unchanged {
-            return;
-        }
-        app_state.watch_manager_sync_in_flight = true;
-        app_state.watch_manager_sync_pending = false;
         app_state.manifest.clone()
     };
+    // Checks the filesystem, so keep it outside the state lock. Syncs only
+    // start on the main thread, so nothing claims one in between.
+    let source = manifest.as_ref().map(watch_source);
+    {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        if !claim_watch_manager_sync(&mut app_state, force, source.as_ref()) {
+            return;
+        }
+    }
 
     WATCH_SYNC_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let sync_seq = WATCH_MANAGER_SYNC_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
@@ -4327,10 +4335,40 @@ fn sync_watch_manager(force: bool) {
         let mut app_state = state().lock().expect("state mutex poisoned");
         app_state.watch_manager_sync_in_flight = false;
         app_state.watch_manager_sync_pending = false;
+        app_state.watch_manager_sync_pending_force = false;
+        drop(app_state);
         WATCH_SYNC_FAILURES.fetch_add(1, Ordering::Relaxed);
         append_log(format!("Repository watcher setup failed to start: {error}"));
         emit_runtime_profile("watch-sync-submit-failed");
     }
+}
+
+/// Records a sync requested while another runs; it reruns on completion, and
+/// stays forced if any collapsed request was (e.g. after an inotify overflow).
+fn collapse_watch_manager_sync(app_state: &mut AppState, force: bool) {
+    app_state.watch_manager_sync_pending = true;
+    app_state.watch_manager_sync_pending_force |= force;
+    WATCH_SYNC_PENDING_COLLAPSES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Marks a sync as in flight unless one already is, or it would rebuild the
+/// installed manager from the same source without being forced.
+fn claim_watch_manager_sync(
+    app_state: &mut AppState,
+    force: bool,
+    source: Option<&WatchSource>,
+) -> bool {
+    if app_state.watch_manager_sync_in_flight {
+        collapse_watch_manager_sync(app_state, force);
+        return false;
+    }
+    if !force && source.is_some() && app_state.watch_source.as_ref() == source {
+        return false;
+    }
+    app_state.watch_manager_sync_in_flight = true;
+    app_state.watch_manager_sync_pending = false;
+    app_state.watch_manager_sync_pending_force = false;
+    true
 }
 
 fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, String> {
@@ -12868,6 +12906,53 @@ mod tests {
         assert!(app_state.repo_runtime["beta"].needs_rescan());
         assert!(app_state.repo_runtime["beta"].local_refresh_in_flight);
         assert!(!app_state.repo_runtime["alpha"].needs_rescan());
+    }
+
+    #[test]
+    fn forced_watch_sync_requested_mid_sync_stays_forced() {
+        let source = WatchSource {
+            workspace_root: PathBuf::from("/workspace"),
+            workspace_git_dir: None,
+            repo_roots: vec![PathBuf::from("/workspace/alpha")],
+        };
+        let mut app_state = AppState::default();
+        app_state.watch_source = Some(source.clone());
+
+        // Same source and not forced: nothing to rebuild.
+        assert!(!claim_watch_manager_sync(
+            &mut app_state,
+            false,
+            Some(&source)
+        ));
+        assert!(claim_watch_manager_sync(
+            &mut app_state,
+            true,
+            Some(&source)
+        ));
+
+        // An overflow forces a rebuild while one runs; a plain sync follows.
+        assert!(!claim_watch_manager_sync(
+            &mut app_state,
+            true,
+            Some(&source)
+        ));
+        assert!(!claim_watch_manager_sync(
+            &mut app_state,
+            false,
+            Some(&source)
+        ));
+        assert!(app_state.watch_manager_sync_pending);
+        assert!(app_state.watch_manager_sync_pending_force);
+
+        // Completion reruns with the collapsed force, which must not be a no-op.
+        app_state.watch_manager_sync_in_flight = false;
+        let force = app_state.watch_manager_sync_pending_force;
+        assert!(claim_watch_manager_sync(
+            &mut app_state,
+            force,
+            Some(&source)
+        ));
+        assert!(!app_state.watch_manager_sync_pending_force);
     }
 
     #[test]
