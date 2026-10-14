@@ -737,15 +737,50 @@ struct CommitCheckEditor {
     baseline: RefCell<Vec<CommitCheckRule>>,
 }
 
-#[derive(Default)]
-struct RepoOverviewViewHandle {
-    summary_root: glib::WeakRef<GtkBox>,
-    git_root: glib::WeakRef<GtkBox>,
-    manifest_root: glib::WeakRef<GtkBox>,
-    activity_root: glib::WeakRef<GtkBox>,
-    terminal_root: glib::WeakRef<GtkBox>,
+/// A Repo Overview view. Only the visible tab of its stack is rendered on a
+/// refresh; the other tabs are marked stale and rendered when shown.
+struct RepoOverviewView {
+    stack: glib::WeakRef<Stack>,
+    pages: Vec<(RepoOverviewPage, GtkBox)>,
+    stale: RefCell<HashSet<RepoOverviewPage>>,
+    terminal_root: GtkBox,
     instance_key: Option<String>,
     host_ptr: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RepoOverviewPage {
+    Summary,
+    Git,
+    Manifest,
+    Activity,
+}
+
+impl RepoOverviewPage {
+    const ALL: [RepoOverviewPage; 4] = [
+        RepoOverviewPage::Summary,
+        RepoOverviewPage::Git,
+        RepoOverviewPage::Manifest,
+        RepoOverviewPage::Activity,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            RepoOverviewPage::Summary => "summary",
+            RepoOverviewPage::Git => "git",
+            RepoOverviewPage::Manifest => "manifest",
+            RepoOverviewPage::Activity => "activity",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            RepoOverviewPage::Summary => "Summary",
+            RepoOverviewPage::Git => "Git",
+            RepoOverviewPage::Manifest => "Manifest",
+            RepoOverviewPage::Activity => "Activity",
+        }
+    }
 }
 
 /// Identifies the log contents: `logs[i]` has sequence number
@@ -795,7 +830,7 @@ struct OperationFollowHandle {
 thread_local! {
     static REPOSITORY_VIEWS: RefCell<Vec<RepositoryViewHandle>> = const { RefCell::new(Vec::new()) };
     static MONOREPO_OVERVIEWS: RefCell<Vec<Rc<MonorepoOverview>>> = const { RefCell::new(Vec::new()) };
-    static REPO_OVERVIEWS: RefCell<Vec<RepoOverviewViewHandle>> = const { RefCell::new(Vec::new()) };
+    static REPO_OVERVIEWS: RefCell<Vec<Rc<RepoOverviewView>>> = const { RefCell::new(Vec::new()) };
     static COMMIT_CHECK_VIEWS: RefCell<Vec<CommitCheckViewHandle>> = const { RefCell::new(Vec::new()) };
     static FUCINA_POLICY_VIEWS: RefCell<Vec<FucinaPolicyViewHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_BUFFERS: RefCell<Vec<OperationBufferHandle>> = const { RefCell::new(Vec::new()) };
@@ -2326,32 +2361,15 @@ fn refresh_overview_views(snapshot: &StateSnapshot) {
 
     REPO_OVERVIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|handle| {
-            let Some(summary_root) = handle.summary_root.upgrade() else {
+        views.retain(|view| {
+            if view.stack.upgrade().is_none() {
                 return false;
-            };
-            let Some(git_root) = handle.git_root.upgrade() else {
-                return false;
-            };
-            let Some(manifest_root) = handle.manifest_root.upgrade() else {
-                return false;
-            };
-            let Some(activity_root) = handle.activity_root.upgrade() else {
-                return false;
-            };
-
-            render_repo_overview_pages(
-                &summary_root,
-                &git_root,
-                &manifest_root,
-                &activity_root,
-                &snapshot,
-                handle.instance_key.as_deref(),
-                handle.host_ptr as *const _,
-            );
-            if let Some(panel) = handle.terminal_root.upgrade() {
-                sync_repo_terminal_panel(&panel, &snapshot, handle.instance_key.as_deref());
             }
+            view.stale
+                .borrow_mut()
+                .extend(RepoOverviewPage::ALL.iter().copied());
+            render_visible_repo_overview_page(view, snapshot);
+            sync_repo_terminal_panel(&view.terminal_root, snapshot, view.instance_key.as_deref());
             true
         });
     });
@@ -7779,29 +7797,17 @@ extern "C" fn create_repo_overview_view(
 
     root.append(&tab_bar);
 
-    let summary_root = repo_overview_page_root();
-    let git_root = repo_overview_page_root();
-    let manifest_root = repo_overview_page_root();
-    let activity_root = repo_overview_page_root();
-
-    stack.add_titled(
-        &repo_overview_scroll_page(&summary_root),
-        Some("summary"),
-        "Summary",
-    );
-    stack.add_titled(&repo_overview_scroll_page(&git_root), Some("git"), "Git");
-    stack.add_titled(
-        &repo_overview_scroll_page(&manifest_root),
-        Some("manifest"),
-        "Manifest",
-    );
-
-    stack.add_titled(
-        &repo_overview_scroll_page(&activity_root),
-        Some("activity"),
-        "Activity",
-    );
-    stack.set_visible_child_name("summary");
+    let mut pages = Vec::new();
+    for page in RepoOverviewPage::ALL {
+        let page_root = repo_overview_page_root();
+        stack.add_titled(
+            &repo_overview_scroll_page(&page_root),
+            Some(page.name()),
+            page.title(),
+        );
+        pages.push((page, page_root));
+    }
+    stack.set_visible_child_name(RepoOverviewPage::Summary.name());
     mark_clickable(&switcher);
     mark_clickable_descendant_buttons(&switcher);
 
@@ -7825,40 +7831,51 @@ extern "C" fn create_repo_overview_view(
     let instance_key =
         unsafe { request.as_ref() }.and_then(|request| decode_mzstr(request.instance_key));
     let snapshot = snapshot();
-    render_repo_overview_pages(
-        &summary_root,
-        &git_root,
-        &manifest_root,
-        &activity_root,
-        &snapshot,
-        instance_key.as_deref(),
-        host,
-    );
     terminal_panel.append(&build_repo_terminal_panel(
         &snapshot,
         instance_key.as_deref(),
     ));
 
-    let summary_ref = glib::WeakRef::new();
-    summary_ref.set(Some(&summary_root));
-    let git_ref = glib::WeakRef::new();
-    git_ref.set(Some(&git_root));
-    let manifest_ref = glib::WeakRef::new();
-    manifest_ref.set(Some(&manifest_root));
-    let activity_ref = glib::WeakRef::new();
-    activity_ref.set(Some(&activity_root));
-    let terminal_ref = glib::WeakRef::new();
-    terminal_ref.set(Some(&terminal_panel));
+    let stack_ref = glib::WeakRef::new();
+    stack_ref.set(Some(&stack));
+    let view = Rc::new(RepoOverviewView {
+        stack: stack_ref,
+        pages,
+        stale: RefCell::new(RepoOverviewPage::ALL.into_iter().collect()),
+        terminal_root: terminal_panel,
+        instance_key,
+        host_ptr: host as usize,
+    });
+    for (page, page_root) in &view.pages {
+        if *page == RepoOverviewPage::Summary {
+            view.stale.borrow_mut().remove(page);
+            render_repo_overview_page(&view, *page, page_root, &snapshot);
+        }
+    }
+
+    // Stale tabs are rendered when they become visible, either by switching
+    // tabs or by this view's tab coming to the front.
+    stack.connect_visible_child_name_notify({
+        let view = Rc::downgrade(&view);
+        move |_| {
+            if let Some(view) = view.upgrade() {
+                render_visible_repo_overview_page_if_stale(&view);
+            }
+        }
+    });
+    stack.connect_map({
+        let view = Rc::downgrade(&view);
+        move |_| {
+            let view = view.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(view) = view.upgrade() {
+                    render_visible_repo_overview_page_if_stale(&view);
+                }
+            });
+        }
+    });
     REPO_OVERVIEWS.with(|views| {
-        views.borrow_mut().push(RepoOverviewViewHandle {
-            summary_root: summary_ref,
-            git_root: git_ref,
-            manifest_root: manifest_ref,
-            activity_root: activity_ref,
-            terminal_root: terminal_ref,
-            instance_key,
-            host_ptr: host as usize,
-        });
+        views.borrow_mut().push(view);
     });
 
     unsafe {
@@ -8878,50 +8895,74 @@ fn repo_overview_scroll_page(root: &GtkBox) -> ScrolledWindow {
     scroller
 }
 
-fn render_repo_overview_pages(
-    summary_root: &GtkBox,
-    git_root: &GtkBox,
-    manifest_root: &GtkBox,
-    activity_root: &GtkBox,
-    snapshot: &StateSnapshot,
-    instance_key: Option<&str>,
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-) {
-    for root in [summary_root, git_root, manifest_root, activity_root] {
-        clear_box(root);
+fn visible_repo_overview_page(view: &RepoOverviewView) -> Option<(RepoOverviewPage, &GtkBox)> {
+    let stack = view.stack.upgrade()?;
+    if !stack.is_mapped() {
+        return None;
     }
+    let visible = stack.visible_child_name()?;
+    view.pages
+        .iter()
+        .find(|(page, _)| page.name() == visible.as_str())
+        .map(|(page, root)| (*page, root))
+}
 
-    let target_repo_id = instance_key.or(snapshot.active_repo_id.as_deref());
+fn render_visible_repo_overview_page(view: &RepoOverviewView, snapshot: &StateSnapshot) {
+    let Some((page, root)) = visible_repo_overview_page(view) else {
+        return;
+    };
+    if view.stale.borrow_mut().remove(&page) {
+        render_repo_overview_page(view, page, root, snapshot);
+    }
+}
+
+fn render_visible_repo_overview_page_if_stale(view: &RepoOverviewView) {
+    let Some((page, _)) = visible_repo_overview_page(view) else {
+        return;
+    };
+    if view.stale.borrow().contains(&page) {
+        render_visible_repo_overview_page(view, &snapshot());
+    }
+}
+
+fn render_repo_overview_page(
+    view: &RepoOverviewView,
+    page: RepoOverviewPage,
+    root: &GtkBox,
+    snapshot: &StateSnapshot,
+) {
+    clear_box(root);
+    let host_ptr = view.host_ptr as *const maruzzella_sdk::ffi::MzHostApi;
+
+    let target_repo_id = view
+        .instance_key
+        .as_deref()
+        .or(snapshot.active_repo_id.as_deref());
     let Some(active_repo_id) = target_repo_id else {
-        render_repo_overview_empty_page(
-            summary_root,
-            snapshot,
-            host_ptr,
-            "No repo target was provided. Open repo overviews from the left monitor.",
-        );
-        render_repo_overview_muted_page(git_root, "No repo target is attached to this tab.");
-        render_repo_overview_muted_page(manifest_root, "No repo target is attached to this tab.");
-        render_repo_overview_muted_page(activity_root, "No repo target is attached to this tab.");
+        if page == RepoOverviewPage::Summary {
+            render_repo_overview_empty_page(
+                root,
+                snapshot,
+                host_ptr,
+                "No repo target was provided. Open repo overviews from the left monitor.",
+            );
+        } else {
+            render_repo_overview_muted_page(root, "No repo target is attached to this tab.");
+        }
         return;
     };
 
-    let items = repository_items(snapshot);
-    let Some(item) = items.iter().find(|item| item.id == active_repo_id) else {
-        render_repo_overview_empty_page(
-            summary_root,
-            snapshot,
-            host_ptr,
-            "The active repo overview target is no longer present in the current manifest.",
-        );
-        render_repo_overview_muted_page(git_root, "This repository is no longer in the manifest.");
-        render_repo_overview_muted_page(
-            manifest_root,
-            "This repository is no longer in the manifest.",
-        );
-        render_repo_overview_muted_page(
-            activity_root,
-            "This repository is no longer in the manifest.",
-        );
+    let Some(item) = repo_item_by_id(snapshot, active_repo_id) else {
+        if page == RepoOverviewPage::Summary {
+            render_repo_overview_empty_page(
+                root,
+                snapshot,
+                host_ptr,
+                "The active repo overview target is no longer present in the current manifest.",
+            );
+        } else {
+            render_repo_overview_muted_page(root, "This repository is no longer in the manifest.");
+        }
         return;
     };
 
@@ -8932,12 +8973,25 @@ fn render_repo_overview_pages(
     }
 
     let attention_signals = repo_attention_detail_signals(snapshot, item);
-    let details = snapshot.repo_details_cache.get(&item.id);
-
-    render_repo_overview_summary_page(summary_root, snapshot, item, &attention_signals, host_ptr);
-    render_repo_overview_git_page(git_root, snapshot, item, details, host_ptr);
-    render_repo_overview_manifest_page(manifest_root, snapshot, item, host_ptr);
-    render_repo_overview_activity_page(activity_root, snapshot, item, host_ptr);
+    root.append(&repo_overview_context(item, snapshot, &attention_signals));
+    match page {
+        RepoOverviewPage::Summary => {
+            render_repo_overview_summary_page(root, snapshot, item, &attention_signals, host_ptr)
+        }
+        RepoOverviewPage::Git => render_repo_overview_git_page(
+            root,
+            snapshot,
+            item,
+            snapshot.repo_details_cache.get(&item.id),
+            host_ptr,
+        ),
+        RepoOverviewPage::Manifest => {
+            render_repo_overview_manifest_page(root, snapshot, item, host_ptr)
+        }
+        RepoOverviewPage::Activity => {
+            render_repo_overview_activity_page(root, snapshot, item, host_ptr)
+        }
+    }
 }
 
 fn render_repo_overview_empty_page(
@@ -8972,7 +9026,6 @@ fn render_repo_overview_summary_page(
     attention_signals: &[AttentionSignal],
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    root.append(&repo_overview_context(item, snapshot, attention_signals));
     root.append(&repo_overview_summary_facts_section(
         snapshot,
         item,
@@ -8999,8 +9052,6 @@ fn render_repo_overview_git_page(
     details: Option<&RepositoryDetails>,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    let attention_signals = repo_attention_detail_signals(snapshot, item);
-    root.append(&repo_overview_context(item, snapshot, &attention_signals));
     root.append(&repo_overview_action_section(
         "Git Actions",
         item,
@@ -9022,8 +9073,6 @@ fn render_repo_overview_manifest_page(
     item: &RepositoryListItem,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    let attention_signals = repo_attention_detail_signals(snapshot, item);
-    root.append(&repo_overview_context(item, snapshot, &attention_signals));
     root.append(&repo_overview_manifest_status_section(item));
     root.append(&repo_overview_action_section(
         "Manifest Actions",
@@ -9045,8 +9094,6 @@ fn render_repo_overview_activity_page(
     item: &RepositoryListItem,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    let attention_signals = repo_attention_detail_signals(snapshot, item);
-    root.append(&repo_overview_context(item, snapshot, &attention_signals));
     root.append(&repo_overview_activity_section(
         &repo_recent_logs(snapshot, item),
         18,
