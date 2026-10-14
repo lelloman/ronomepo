@@ -1620,6 +1620,9 @@ fn log_timestamp() -> String {
 }
 
 fn schedule_log_surface_refresh() {
+    if !on_main_context(schedule_log_surface_refresh) {
+        return;
+    }
     if LOG_REFRESH_SCHEDULED
         .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -2106,7 +2109,22 @@ fn schedule_refresh_for_operation_event(manifest: &WorkspaceManifest, event: &Op
     request_repository_status_refresh(&item);
 }
 
+/// Returns whether the caller already runs on the GTK main context. Otherwise
+/// `retry` is queued there and the caller must return: worker threads log and
+/// request refreshes too, but timeouts and widgets are main-thread only.
+fn on_main_context(retry: fn()) -> bool {
+    let main_context = glib::MainContext::default();
+    if main_context.is_owner() {
+        return true;
+    }
+    main_context.invoke(retry);
+    false
+}
+
 fn refresh_views() {
+    if !on_main_context(refresh_views) {
+        return;
+    }
     if VIEW_REFRESH_SCHEDULED
         .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -12198,6 +12216,24 @@ mod tests {
 
         assert!(claim_due_remote_fetches(&mut app_state, SystemTime::now()).is_empty());
         assert!(!app_state.repo_runtime["alpha"].remote_fetch_in_flight);
+    }
+
+    #[test]
+    fn append_log_from_worker_thread_does_not_panic() {
+        // Stand in for the GTK main loop owning the default context.
+        let main_context = glib::MainContext::default();
+        let _owner = main_context
+            .acquire()
+            .expect("default main context is free");
+        thread::spawn(|| append_log("logged from a worker".to_string()))
+            .join()
+            .expect("append_log panicked off the main thread");
+        assert!(state()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .logs
+            .iter()
+            .any(|line| line.ends_with("logged from a worker")));
     }
 
     #[test]
