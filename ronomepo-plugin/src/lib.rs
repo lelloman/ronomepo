@@ -1205,9 +1205,11 @@ fn execute_worker_job(job: WorkerJob) -> Option<WorkerResult> {
             batch_id,
         } => {
             let main_context = glib::MainContext::default();
+            // Shared by every event of the batch instead of cloned per event.
+            let manifest = Arc::new(manifest);
             run_workspace_operation(&manifest, &selected_repo_ids, kind, |event| {
                 let event = event.clone();
-                let manifest = manifest.clone();
+                let manifest = Arc::clone(&manifest);
                 main_context.invoke(move || {
                     guard_panics("handle_operation_event", (), || {
                         handle_operation_event(batch_id, manifest, event)
@@ -2265,7 +2267,11 @@ fn present_operation_failure_dialog(operation: &'static str, failures: &[Operati
     window.present();
 }
 
-fn handle_operation_event(batch_id: usize, manifest: WorkspaceManifest, event: OperationEvent) {
+fn handle_operation_event(
+    batch_id: usize,
+    manifest: Arc<WorkspaceManifest>,
+    event: OperationEvent,
+) {
     let _timed = diag::timed("operation-event");
     if matches!(event.kind, OperationEventKind::Failed) {
         let mut app_state = state().lock().expect("state mutex poisoned");
@@ -2650,7 +2656,8 @@ fn schedule_refresh_for_operation_event(manifest: &WorkspaceManifest, event: &Op
             repo_path: manifest.root.join(&repo.dir_name),
             ..empty_repository_status(manifest.root.join(&repo.dir_name))
         },
-        repo_manifest: Some(scan_repo_manifest(&manifest.root.join(&repo.dir_name))),
+        // The status refresh job rescans the repo manifest off the main thread.
+        repo_manifest: None,
     };
     request_repository_status_refresh(&item);
 }
@@ -4493,7 +4500,7 @@ fn watch_source(manifest: &WorkspaceManifest) -> WatchSource {
 
 fn build_watch_manager_inner(manifest: &WorkspaceManifest) -> Result<WatchManager, String> {
     let source = watch_source(manifest);
-    let (mut backend, backend_kind) = create_watch_backend(Arc::new(manifest.clone()))?;
+    let (mut backend, backend_kind) = create_watch_backend(Arc::new(WatchRouting::new(manifest)))?;
     let mut watched_paths = 0;
     let mut unreadable_paths = Vec::new();
     let mut ignored_dirs = HashSet::new();
@@ -4758,13 +4765,45 @@ fn is_permission_denied(error: &notify::Error) -> bool {
     )
 }
 
+/// Watch roots normalized once per watch backend: the notify thread routes
+/// every event path through them.
+struct WatchRouting {
+    workspace_root: PathBuf,
+    workspace_git_dir: PathBuf,
+    /// Repo ids and roots, deepest roots first so nested repos win.
+    repos: Vec<(String, PathBuf)>,
+}
+
+impl WatchRouting {
+    fn new(manifest: &WorkspaceManifest) -> Self {
+        let workspace_root = normalized_watch_path(&manifest.root);
+        let mut repos = manifest
+            .repos
+            .iter()
+            .map(|repo| {
+                (
+                    repo.id.clone(),
+                    normalized_watch_path(&workspace_root.join(&repo.dir_name)),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Stable, so equally deep roots keep manifest order.
+        repos.sort_by_key(|(_, root)| std::cmp::Reverse(root.components().count()));
+        Self {
+            workspace_git_dir: workspace_root.join(".git"),
+            workspace_root,
+            repos,
+        }
+    }
+}
+
 fn create_watch_backend(
-    manifest: Arc<WorkspaceManifest>,
+    routing: Arc<WatchRouting>,
 ) -> Result<(WatchBackend, WatchBackendKind), String> {
     let config = repository_watch_config();
-    let poll_manifest = Arc::clone(&manifest);
+    let poll_routing = Arc::clone(&routing);
     match RecommendedWatcher::new(
-        move |event| dispatch_watch_event_result(&manifest, event),
+        move |event| dispatch_watch_event_result(&routing, event),
         config,
     ) {
         Ok(watcher) => Ok((
@@ -4772,7 +4811,7 @@ fn create_watch_backend(
             WatchBackendKind::Recommended,
         )),
         Err(_) => PollWatcher::new(
-            move |event| dispatch_watch_event_result(&poll_manifest, event),
+            move |event| dispatch_watch_event_result(&poll_routing, event),
             config.with_poll_interval(Duration::from_secs(WATCH_POLL_FALLBACK_SECS)),
         )
         .map(|watcher| (WatchBackend::Poll(watcher), WatchBackendKind::Poll))
@@ -4793,7 +4832,7 @@ fn watch_backend_mut(backend: &mut WatchBackend) -> &mut dyn Watcher {
     }
 }
 
-fn dispatch_watch_event_result(manifest: &WorkspaceManifest, event: notify::Result<notify::Event>) {
+fn dispatch_watch_event_result(routing: &WatchRouting, event: notify::Result<notify::Event>) {
     let main_context = glib::MainContext::default();
     match event {
         Ok(event) => {
@@ -4805,7 +4844,7 @@ fn dispatch_watch_event_result(manifest: &WorkspaceManifest, event: notify::Resu
                 let mut pending = pending_watch_events()
                     .lock()
                     .expect("pending watch events mutex poisoned");
-                record_watch_event(&mut pending, manifest, &event);
+                record_watch_event(&mut pending, routing, &event);
                 let pending_len = pending.repo_ids.len() + usize::from(pending.workspace_touched);
                 PENDING_WATCH_REPOS.store(pending_len, Ordering::Relaxed);
                 update_max_atomic(&PENDING_WATCH_REPOS_HIGH_WATER, pending_len);
@@ -4854,7 +4893,7 @@ fn watch_event_may_add_dir(event: &notify::Event) -> bool {
 
 fn record_watch_event(
     pending: &mut PendingWatchEvents,
-    manifest: &WorkspaceManifest,
+    routing: &WatchRouting,
     event: &notify::Event,
 ) {
     // The backend dropped events (e.g. inotify queue overflow) and reports it
@@ -4873,10 +4912,10 @@ fn record_watch_event(
         }
     }
     for path in &event.paths {
-        if workspace_watch_path_matches(manifest, path) {
+        if workspace_watch_path_matches(routing, path) {
             pending.workspace_touched = true;
         }
-        if let Some(repo_id) = repo_id_for_watch_path(manifest, path) {
+        if let Some(repo_id) = repo_id_for_watch_path(routing, path) {
             pending.repo_ids.insert(repo_id);
         }
     }
@@ -4994,11 +5033,10 @@ fn handle_watch_backend_rescan() {
     sync_watch_manager(true);
 }
 
-fn workspace_watch_path_matches(manifest: &WorkspaceManifest, path: &Path) -> bool {
-    let workspace_root = normalized_watch_path(&manifest.root);
+fn workspace_watch_path_matches(routing: &WatchRouting, path: &Path) -> bool {
     let path = normalized_watch_path(path);
 
-    if let Ok(relative) = path.strip_prefix(&workspace_root) {
+    if let Ok(relative) = path.strip_prefix(&routing.workspace_root) {
         if relative.components().count() == 0 {
             return false;
         }
@@ -5012,28 +5050,21 @@ fn workspace_watch_path_matches(manifest: &WorkspaceManifest, path: &Path) -> bo
         return relative.components().count() == 1 && watch_path_is_relevant(relative);
     }
 
-    path.strip_prefix(workspace_root.join(".git"))
+    path.strip_prefix(&routing.workspace_git_dir)
         .ok()
         .is_some_and(watch_path_is_relevant)
 }
 
-fn repo_id_for_watch_path(manifest: &WorkspaceManifest, path: &Path) -> Option<String> {
-    let workspace_root = normalized_watch_path(&manifest.root);
+fn repo_id_for_watch_path(routing: &WatchRouting, path: &Path) -> Option<String> {
     let path = normalized_watch_path(path);
-    let mut matches = manifest
+    routing
         .repos
         .iter()
-        .filter_map(|repo| {
-            let repo_root = normalized_watch_path(&workspace_root.join(&repo.dir_name));
-            let relative = path.strip_prefix(&repo_root).ok()?;
-            if !watch_path_is_relevant(relative) {
-                return None;
-            }
-            Some((repo.id.clone(), repo_root.components().count()))
+        .find(|(_, repo_root)| {
+            path.strip_prefix(repo_root)
+                .is_ok_and(|relative| watch_path_is_relevant(relative))
         })
-        .collect::<Vec<_>>();
-    matches.sort_by_key(|(_, depth)| *depth);
-    matches.pop().map(|(repo_id, _)| repo_id)
+        .map(|(repo_id, _)| repo_id.clone())
 }
 
 fn watch_path_is_relevant(relative: &Path) -> bool {
@@ -12454,7 +12485,7 @@ mod tests {
         while let Ok(event) = rx.recv_timeout(Duration::from_millis(500)) {
             let event = event.unwrap();
             if watch_event_may_change_status(&event) {
-                record_watch_event(&mut pending, manifest, &event);
+                record_watch_event(&mut pending, &WatchRouting::new(manifest), &event);
             }
         }
         pending
@@ -12631,15 +12662,15 @@ mod tests {
         };
 
         assert!(workspace_watch_path_matches(
-            &manifest,
+            &WatchRouting::new(&manifest),
             &workspace_root.join(".git/refs/heads/main")
         ));
         assert!(workspace_watch_path_matches(
-            &manifest,
+            &WatchRouting::new(&manifest),
             &workspace_root.join(".git/HEAD")
         ));
         assert!(!workspace_watch_path_matches(
-            &manifest,
+            &WatchRouting::new(&manifest),
             &workspace_root.join(".git/objects/ab/cd")
         ));
     }
@@ -12662,11 +12693,11 @@ mod tests {
         };
 
         assert!(workspace_watch_path_matches(
-            &manifest,
+            &WatchRouting::new(&manifest),
             &workspace_root.join("Cargo.toml")
         ));
         assert!(!workspace_watch_path_matches(
-            &manifest,
+            &WatchRouting::new(&manifest),
             &workspace_root.join("alpha/src/lib.rs")
         ));
     }
@@ -12690,7 +12721,7 @@ mod tests {
 
         let repo_event_path = cwd.join("../maruzzella/.git/refs/heads/main");
         assert_eq!(
-            repo_id_for_watch_path(&manifest, &repo_event_path).as_deref(),
+            repo_id_for_watch_path(&WatchRouting::new(&manifest), &repo_event_path).as_deref(),
             Some("maruzzella")
         );
     }
@@ -12716,7 +12747,7 @@ mod tests {
             let event_path = workspace_root.join("simple-ai").join(relative);
             assert!(!event_path.exists());
             assert_eq!(
-                repo_id_for_watch_path(&manifest, &event_path).as_deref(),
+                repo_id_for_watch_path(&WatchRouting::new(&manifest), &event_path).as_deref(),
                 Some("simple-ai")
             );
         }
@@ -12752,10 +12783,10 @@ mod tests {
         for index in 0..10_000 {
             event = event.add_path(root.join(format!("alpha/target/debug/deps/{index}.o")));
         }
-        record_watch_event(&mut pending, &manifest, &event);
+        record_watch_event(&mut pending, &WatchRouting::new(&manifest), &event);
         let objects = notify::Event::new(notify::EventKind::Any)
             .add_path(root.join("beta/.git/objects/ab/cdef"));
-        record_watch_event(&mut pending, &manifest, &objects);
+        record_watch_event(&mut pending, &WatchRouting::new(&manifest), &objects);
 
         assert!(!pending.backend_rescan);
         assert!(!pending.workspace_touched);
@@ -12795,10 +12826,10 @@ mod tests {
 
         let rescan =
             notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
-        record_watch_event(&mut pending, &manifest, &rescan);
+        record_watch_event(&mut pending, &WatchRouting::new(&manifest), &rescan);
         let later =
             notify::Event::new(notify::EventKind::Any).add_path(root.join("beta/src/lib.rs"));
-        record_watch_event(&mut pending, &manifest, &later);
+        record_watch_event(&mut pending, &WatchRouting::new(&manifest), &later);
 
         assert!(pending.backend_rescan);
         assert!(pending.repo_ids.is_empty());
