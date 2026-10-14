@@ -190,6 +190,10 @@ flowbox.ronomepo-wrap > flowboxchild { background: transparent; padding: 0; bord
 .ronomepo-empty-state { padding: 32px 16px; }
 .ronomepo-empty-state image { color: @text_2; -gtk-icon-size: 32px; }
 
+/* Editors */
+textview.ronomepo-editor,
+textview.ronomepo-editor text { background: @workbench; color: @text_0; }
+
 /* Console-style output */
 textview.ronomepo-console,
 textview.ronomepo-console text { background: @panel_bottom; color: @text_1; }

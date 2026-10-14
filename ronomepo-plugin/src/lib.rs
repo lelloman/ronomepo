@@ -32,15 +32,14 @@ use gtk::{
     Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, DropDown, Entry,
     EventControllerMotion, FilterChange, GestureClick, Image, Label, ListBox, ListBoxRow,
     Orientation, Paned, PolicyType, Popover, PositionType, ScrolledWindow, SelectionMode,
-    Separator, SortListModel, SorterChange, Stack, TextBuffer, TextView, ToggleButton, Window,
-    WrapMode,
+    SortListModel, SorterChange, Stack, TextBuffer, TextView, ToggleButton, Window, WrapMode,
 };
 use maruzzella_sdk::{
-    attach_text_tooltip, button_css_class, export_plugin, input_css_class, surface_css_class,
-    text_css_class, CommandSpec, HostApi, MzLogLevel, MzStatusCode, MzToolbarDisplayMode,
-    MzViewOpenDisposition, MzViewPlacement, MzViewTeardownDecision, MzViewTeardownRequest,
-    MzViewTeardownResult, OpenViewRequest, Plugin, PluginDependency, PluginDescriptor,
-    SurfaceContributionSpec, ToolbarWidgetSpec, Version, ViewFactorySpec,
+    attach_text_tooltip, export_plugin, input_css_class, CommandSpec, HostApi, MzLogLevel,
+    MzStatusCode, MzToolbarDisplayMode, MzViewOpenDisposition, MzViewPlacement,
+    MzViewTeardownDecision, MzViewTeardownRequest, MzViewTeardownResult, OpenViewRequest, Plugin,
+    PluginDependency, PluginDescriptor, SurfaceContributionSpec, ToolbarWidgetSpec, Version,
+    ViewFactorySpec,
 };
 use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};
 use notify::{
@@ -125,12 +124,6 @@ fn mark_clickable_list_rows(list: &ListBox) {
 
 fn clickable_button() -> Button {
     let button = Button::new();
-    mark_clickable(&button);
-    button
-}
-
-fn clickable_button_with_label(label: impl AsRef<str>) -> Button {
-    let button = Button::with_label(label.as_ref());
     mark_clickable(&button);
     button
 }
@@ -2297,22 +2290,22 @@ fn present_operation_failure_dialog(operation: &'static str, failures: &[Operati
     let window = Window::builder()
         .modal(true)
         .title(format!("{operation} failed"))
-        .default_width(520)
+        .default_width(560)
         .build();
+    window.add_css_class("app-dialog");
     if let Some(parent) = active_window().as_ref() {
         window.set_transient_for(Some(parent));
     }
 
-    let content = GtkBox::new(Orientation::Vertical, 12);
-    content.set_margin_top(16);
+    let content = GtkBox::new(Orientation::Vertical, 16);
+    content.set_margin_top(20);
     content.set_margin_bottom(16);
-    content.set_margin_start(16);
-    content.set_margin_end(16);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
 
-    let header = GtkBox::new(Orientation::Horizontal, 10);
-    let icon = Image::from_icon_name("dialog-error-symbolic");
-    icon.set_icon_size(gtk::IconSize::Large);
-    icon.add_css_class("error");
+    let header = ui::hbox(10);
+    let icon = ui::severity_icon(ui::Severity::Error);
+    icon.set_valign(Align::Center);
 
     let title_text = match failures {
         [failure] => failure.repository_name.as_deref().map_or_else(
@@ -2323,14 +2316,13 @@ fn present_operation_failure_dialog(operation: &'static str, failures: &[Operati
     };
     let title = Label::new(Some(&title_text));
     title.set_xalign(0.0);
-    title.add_css_class("title-4");
-    title.add_css_class("error");
+    title.add_css_class("ronomepo-section-title");
     title.set_wrap(true);
     header.append(&icon);
     header.append(&title);
     content.append(&header);
 
-    let messages = GtkBox::new(Orientation::Vertical, 8);
+    let messages = ui::list_card();
     for failure in failures {
         let text = match (failures.len(), failure.repository_name.as_deref()) {
             (2.., Some(repo_name)) => format!("{repo_name}: {}", failure.message),
@@ -2339,8 +2331,11 @@ fn present_operation_failure_dialog(operation: &'static str, failures: &[Operati
         let message = Label::new(Some(&text));
         message.set_xalign(0.0);
         message.set_wrap(true);
+        message.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         message.set_selectable(true);
-        messages.append(&message);
+        message.add_css_class("mono");
+        message.add_css_class("ronomepo-meta");
+        ui::list_card_item(&messages, &message);
     }
     let scroller = ScrolledWindow::new();
     scroller.set_policy(PolicyType::Never, PolicyType::Automatic);
@@ -2350,10 +2345,10 @@ fn present_operation_failure_dialog(operation: &'static str, failures: &[Operati
     scroller.set_child(Some(&messages));
     content.append(&scroller);
 
-    let buttons = GtkBox::new(Orientation::Horizontal, 8);
+    let buttons = ui::hbox(8);
     buttons.set_halign(Align::End);
     if is_generated_commit_failure {
-        let open_commit_check = clickable_button_with_label("Open Commit Check");
+        let open_commit_check = ui::button("Open Commit Check", ui::ButtonKind::Secondary);
         let window_ref = window.downgrade();
         open_commit_check.connect_clicked(move |_| {
             let _ = command_open_commit_check(maruzzella_sdk::ffi::MzBytes::empty());
@@ -2364,7 +2359,7 @@ fn present_operation_failure_dialog(operation: &'static str, failures: &[Operati
         });
         buttons.append(&open_commit_check);
     }
-    let close = clickable_button_with_label("Close");
+    let close = ui::button("Close", ui::ButtonKind::Primary);
     let window_ref = window.downgrade();
     close.connect_clicked(move |_| {
         if let Some(window) = window_ref.upgrade() {
@@ -3618,6 +3613,7 @@ fn build_repo_monitor_row(
         MonitorViewMode::Git => {
             let branch = monitor_cell(branch_label(item), Some(MONITOR_BRANCH_COL_WIDTH));
             branch.add_css_class("ronomepo-fg-muted");
+            branch.add_css_class("ronomepo-meta");
             content.append(&branch);
             content.append(&monitor_state_cell(&item.status.state));
             content.append(&monitor_sync_cell(&item.status.sync));
@@ -5472,6 +5468,7 @@ fn build_repo_context_menu(
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> Popover {
     let popover = Popover::new();
+    popover.add_css_class("ronomepo-popup");
     popover.set_autohide(true);
     popover.set_has_arrow(false);
     popover.set_position(PositionType::Bottom);
@@ -5549,10 +5546,8 @@ fn update_repo_context_selection(list: &ListBox, row: &ListBoxRow) {
 
 fn populate_repo_context_menu(popover: &Popover, host_ptr: *const maruzzella_sdk::ffi::MzHostApi) {
     let menu = GtkBox::new(Orientation::Vertical, 0);
-    menu.set_margin_top(4);
-    menu.set_margin_bottom(4);
-    menu.set_margin_start(4);
-    menu.set_margin_end(4);
+    menu.add_css_class("ronomepo-menu");
+    menu.set_size_request(160, -1);
 
     let selection = selected_repository_items_from_state();
     let root_hovered = Rc::new(Cell::new(false));
@@ -5590,7 +5585,7 @@ fn populate_repo_context_menu(popover: &Popover, host_ptr: *const maruzzella_sdk
     if !has_section {
         let empty = Label::new(Some("No actions available for this selection."));
         empty.set_xalign(0.0);
-        empty.add_css_class("dim-label");
+        empty.add_css_class("ronomepo-fg-muted");
         empty.set_margin_top(6);
         empty.set_margin_bottom(6);
         empty.set_margin_start(8);
@@ -5765,12 +5760,6 @@ fn append_context_submenu(
     let header = clickable_button();
     header.set_halign(Align::Fill);
     header.set_hexpand(true);
-    header.set_margin_top(2);
-    header.set_margin_bottom(2);
-    header.add_css_class("flat");
-    header.add_css_class("menu-heading");
-    header.set_margin_start(4);
-    header.set_margin_end(4);
 
     let row = GtkBox::new(Orientation::Horizontal, 8);
     row.set_halign(Align::Fill);
@@ -5781,15 +5770,18 @@ fn append_context_submenu(
     label.set_hexpand(true);
     label.set_halign(Align::Start);
 
-    let chevron = Label::new(Some("›"));
-    chevron.set_xalign(1.0);
+    let chevron = Image::from_icon_name("pan-end-symbolic");
     chevron.set_halign(Align::End);
+    chevron.add_css_class("ronomepo-menu-chevron");
 
     row.append(&label);
     row.append(&chevron);
     header.set_child(Some(&row));
 
+    submenu.add_css_class("ronomepo-menu");
+    submenu.set_size_request(180, -1);
     let submenu_popover = Popover::new();
+    submenu_popover.add_css_class("ronomepo-popup");
     submenu_popover.set_autohide(true);
     submenu_popover.set_has_arrow(false);
     submenu_popover.set_position(PositionType::Right);
@@ -6319,7 +6311,6 @@ where
     let button = clickable_button();
     button.set_halign(Align::Fill);
     button.set_hexpand(true);
-    button.add_css_class("flat");
     let text = Label::new(Some(label));
     text.set_xalign(0.0);
     text.set_halign(Align::Start);
@@ -6692,13 +6683,12 @@ fn monitor_cell(text: &str, width: Option<i32>) -> Label {
     let label = Label::new(Some(text));
     label.set_xalign(0.0);
     label.set_ellipsize(EllipsizeMode::End);
+    // A tiny natural width keeps long values from widening their column, so
+    // every row lines up with the header: fixed columns take their size
+    // request, flexible ones share the remaining width equally.
+    label.set_max_width_chars(1);
     match width {
-        Some(width) => {
-            // A tiny natural width keeps long values from widening the
-            // column; the size request sets the actual width.
-            label.set_max_width_chars(1);
-            label.set_size_request(width, -1);
-        }
+        Some(width) => label.set_size_request(width, -1),
         None => {
             label.set_hexpand(true);
             label.set_size_request(96, -1);
@@ -6710,6 +6700,7 @@ fn monitor_cell(text: &str, width: Option<i32>) -> Label {
 /// A monitor cell whose text is colored by `tone`.
 fn monitor_tone_cell(text: &str, tone: ui::Tone, width: i32, tooltip: Option<String>) -> Label {
     let label = monitor_cell(text, Some(width));
+    label.add_css_class("ronomepo-meta");
     ui::set_fg_tone(&label, tone);
     if let Some(tooltip) = tooltip {
         attach_text_tooltip(&label, tooltip);
@@ -6974,6 +6965,7 @@ fn monitor_attention_cell(signals: &[AttentionSignal]) -> GtkBox {
     } else {
         let label = Label::new(Some(text));
         label.add_css_class("ronomepo-fg-muted");
+        label.add_css_class("ronomepo-meta");
         label
     };
     attach_text_tooltip(&label, attention_monitor_tooltip(signals));
@@ -7636,65 +7628,52 @@ fn render_monorepo_overview(view: &MonorepoOverview, snapshot: &StateSnapshot) {
 }
 
 fn build_commit_check_view(root: &GtkBox, initial: &StateSnapshot) -> Rc<CommitCheckEditor> {
-    let hero = GtkBox::new(Orientation::Vertical, 4);
-    let title = Label::new(Some("Commit Check"));
-    title.set_xalign(0.0);
-    title.add_css_class("title-2");
-    let subtitle = Label::new(Some(
+    let hero = ui::vbox(4);
+    hero.append(&ui::page_title("Commit Check"));
+    hero.append(&ui::hint(
         "Scans recent commits with workspace rules before push.",
     ));
-    subtitle.set_xalign(0.0);
-    subtitle.add_css_class("muted");
-    subtitle.set_wrap(true);
-    hero.append(&title);
-    hero.append(&subtitle);
 
-    let actions = GtkBox::new(Orientation::Horizontal, 8);
-    let rerun = clickable_button_with_label("Run Check");
+    let actions = ui::hbox(12);
+    let rerun = ui::button("Run Check", ui::ButtonKind::Primary);
     rerun.connect_clicked(|_| {
         let _ = command_check_history(maruzzella_sdk::ffi::MzBytes::empty());
     });
     actions.append(&rerun);
 
-    let open_overview = clickable_button_with_label("Open Overview");
+    let open_overview = ui::link_button("Open Overview");
     open_overview.connect_clicked(|_| {
         let _ = command_open_overview(maruzzella_sdk::ffi::MzBytes::empty());
     });
     actions.append(&open_overview);
 
-    let rules_header = Label::new(Some("Rules"));
-    rules_header.set_xalign(0.0);
-    rules_header.add_css_class("title-4");
-
-    let rules_help = Label::new(Some(
+    let rules_help = ui::hint(
         "Rules run from the lowest priority to the highest. Later allow rules can unblock commits matched by earlier block rules.",
-    ));
-    rules_help.set_xalign(0.0);
-    rules_help.set_wrap(true);
-    rules_help.add_css_class("muted");
+    );
 
     let rule_status = Label::new(None);
     rule_status.set_xalign(0.0);
     rule_status.set_wrap(true);
-    rule_status.add_css_class("muted");
+    rule_status.add_css_class("ronomepo-fg-muted");
+    rule_status.add_css_class("ronomepo-meta");
 
     let editor = Rc::new(CommitCheckEditor {
-        rules_box: GtkBox::new(Orientation::Vertical, 8),
+        rules_box: ui::vbox(8),
         rule_rows: Rc::new(RefCell::new(Vec::new())),
         status: rule_status,
         baseline: RefCell::new(Vec::new()),
     });
     sync_commit_check_editor(&editor, initial, true);
 
-    let rule_actions = GtkBox::new(Orientation::Horizontal, 8);
-    let add_rule = clickable_button_with_label("Add Rule");
+    let rule_actions = ui::hbox(8);
+    let add_rule = ui::button("Add Rule", ui::ButtonKind::Secondary);
     add_rule.connect_clicked({
         let editor = Rc::clone(&editor);
         move |_| {
             open_add_commit_check_rule_dialog(active_window(), Rc::clone(&editor));
         }
     });
-    let save_rules = clickable_button_with_label("Save Rules");
+    let save_rules = ui::button("Save Rules", ui::ButtonKind::Secondary);
     save_rules.connect_clicked({
         let editor = Rc::clone(&editor);
         move |_| {
@@ -7724,7 +7703,7 @@ fn build_commit_check_view(root: &GtkBox, initial: &StateSnapshot) -> Rc<CommitC
             }
         }
     });
-    let discard_changes = clickable_button_with_label("Discard Changes");
+    let discard_changes = ui::button("Discard Changes", ui::ButtonKind::Ghost);
     discard_changes.connect_clicked({
         let editor = Rc::clone(&editor);
         move |_| {
@@ -7735,13 +7714,15 @@ fn build_commit_check_view(root: &GtkBox, initial: &StateSnapshot) -> Rc<CommitC
         rule_actions.append(&button);
     }
 
+    let rules = ui::vbox(8);
+    rules.append(&rules_help);
+    rules.append(&rule_actions);
+    rules.append(&editor.status);
+    rules.append(&editor.rules_box);
+
     root.append(&hero);
     root.append(&actions);
-    root.append(&rules_header);
-    root.append(&rules_help);
-    root.append(&rule_actions);
-    root.append(&editor.status);
-    root.append(&editor.rules_box);
+    root.append(&ui::section("Rules", &[], &rules));
     editor
 }
 
@@ -7833,8 +7814,8 @@ fn append_commit_check_rule_row(
     rule_rows: &Rc<RefCell<Vec<CommitCheckRuleRowHandle>>>,
     rule: Option<&CommitCheckRule>,
 ) {
-    let row = GtkBox::new(Orientation::Vertical, 8);
-    row.add_css_class("boxed-list");
+    let row = ui::vbox(8);
+    row.add_css_class("ronomepo-card");
 
     let enabled = clickable_check_button_with_label("Enabled");
     enabled.set_active(rule.map(|rule| rule.enabled).unwrap_or(true));
@@ -7852,13 +7833,16 @@ fn append_commit_check_rule_row(
     );
 
     let name = Entry::new();
+    name.add_css_class(&input_css_class("field"));
     name.set_placeholder_text(Some("Rule name"));
     name.set_hexpand(true);
     name.set_text(rule.map(|rule| rule.name.as_str()).unwrap_or(""));
 
     let priority = Entry::new();
+    priority.add_css_class(&input_css_class("field"));
     priority.set_placeholder_text(Some("Priority"));
-    priority.set_width_chars(8);
+    priority.set_tooltip_text(Some("Priority"));
+    priority.set_width_chars(6);
     priority.set_text(
         &rule
             .map(|rule| rule.priority.to_string())
@@ -7866,6 +7850,7 @@ fn append_commit_check_rule_row(
     );
 
     let value = Entry::new();
+    value.add_css_class(&input_css_class("field"));
     value.set_placeholder_text(Some("Regex pattern or commit hash"));
     value.set_hexpand(true);
     value.set_text(
@@ -7875,6 +7860,7 @@ fn append_commit_check_rule_row(
     );
 
     let repository_ids = Entry::new();
+    repository_ids.add_css_class(&input_css_class("field"));
     repository_ids.set_placeholder_text(Some("Repo IDs, comma-separated; empty means all"));
     repository_ids.set_hexpand(true);
     repository_ids.set_text(
@@ -7883,7 +7869,7 @@ fn append_commit_check_rule_row(
             .unwrap_or_else(String::new),
     );
 
-    let remove = clickable_button_with_label("Remove");
+    let remove = ui::icon_button("user-trash-symbolic", "Remove rule");
     let rule_id = rule
         .map(|rule| rule.id.clone())
         .unwrap_or_else(new_commit_check_rule_id);
@@ -7937,15 +7923,16 @@ fn build_modal_window(
     buttons: &[&Button],
 ) -> Window {
     let window = Window::builder().modal(true).title(title).build();
+    window.add_css_class("app-dialog");
     if let Some(parent) = parent {
         window.set_transient_for(Some(parent));
     }
 
-    let content = GtkBox::new(Orientation::Vertical, 12);
-    content.set_margin_top(16);
+    let content = GtkBox::new(Orientation::Vertical, 16);
+    content.set_margin_top(20);
     content.set_margin_bottom(16);
-    content.set_margin_start(16);
-    content.set_margin_end(16);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
     content.append(body);
 
     let button_row = GtkBox::new(Orientation::Horizontal, 8);
@@ -7972,14 +7959,11 @@ fn build_modal_window(
 }
 
 fn open_add_commit_check_rule_dialog(parent: Option<Window>, editor: Rc<CommitCheckEditor>) {
-    let cancel = Button::with_label("Cancel");
-    cancel.add_css_class(&button_css_class("secondary"));
-    let add = Button::with_label("Add Rule");
-    add.add_css_class(&button_css_class("primary"));
+    let cancel = ui::button("Cancel", ui::ButtonKind::Secondary);
+    let add = ui::button("Add Rule", ui::ButtonKind::Primary);
 
-    let body = GtkBox::new(Orientation::Vertical, 8);
-    body.add_css_class(&surface_css_class("workbench"));
-    body.add_css_class(&text_css_class("body"));
+    let body = ui::vbox(12);
+    body.set_size_request(440, -1);
 
     let enabled = clickable_check_button_with_label("Enabled");
     enabled.set_active(true);
@@ -7989,26 +7973,26 @@ fn open_add_commit_check_rule_dialog(parent: Option<Window>, editor: Rc<CommitCh
     let hash_matcher = clickable_check_button_with_label("Hash");
 
     let name = Entry::new();
-    name.add_css_class(&input_css_class("search"));
+    name.add_css_class(&input_css_class("field"));
     name.set_hexpand(true);
     name.set_placeholder_text(Some("Rule name"));
 
     let priority = Entry::new();
-    priority.add_css_class(&input_css_class("search"));
+    priority.add_css_class(&input_css_class("field"));
     priority.set_placeholder_text(Some("100"));
     priority.set_text("100");
 
     let value = Entry::new();
-    value.add_css_class(&input_css_class("search"));
+    value.add_css_class(&input_css_class("field"));
     value.set_hexpand(true);
     value.set_placeholder_text(Some("Regex pattern or commit hash"));
 
     let repository_ids = Entry::new();
-    repository_ids.add_css_class(&input_css_class("search"));
+    repository_ids.add_css_class(&input_css_class("field"));
     repository_ids.set_hexpand(true);
     repository_ids.set_placeholder_text(Some("Repo IDs, comma-separated; empty means all"));
 
-    let toggles = GtkBox::new(Orientation::Horizontal, 8);
+    let toggles = ui::hbox(16);
     toggles.append(&enabled);
     toggles.append(&allow);
     toggles.append(&hash_matcher);
@@ -8016,7 +8000,7 @@ fn open_add_commit_check_rule_dialog(parent: Option<Window>, editor: Rc<CommitCh
     let error = Label::new(None);
     error.set_xalign(0.0);
     error.set_wrap(true);
-    error.add_css_class("error");
+    error.add_css_class("ronomepo-fg-danger");
 
     body.append(&toggles);
     body.append(&labeled_field("Name", &name));
@@ -8034,8 +8018,6 @@ fn open_add_commit_check_rule_dialog(parent: Option<Window>, editor: Rc<CommitCh
         &body,
         &[&cancel, &add],
     );
-    dialog.add_css_class(&surface_css_class("workbench"));
-    dialog.add_css_class(&text_css_class("body"));
     dialog.set_default_widget(Some(&add));
 
     cancel.connect_clicked({
@@ -8842,10 +8824,10 @@ fn fucina_command_result_text(result: Result<FucinaPolicyCommandResult, String>)
 }
 
 fn labeled_field(label: &str, widget: &impl IsA<gtk::Widget>) -> GtkBox {
-    let row = GtkBox::new(Orientation::Vertical, 4);
+    let row = ui::vbox(4);
     let title = Label::new(Some(label));
     title.set_xalign(0.0);
-    title.add_css_class("title-5");
+    title.add_css_class("ronomepo-kv-key");
     row.append(&title);
     row.append(widget);
     row
@@ -10124,17 +10106,17 @@ fn repo_overview_lines_body(lines: &[String], empty_message: &str, mono: bool) -
 }
 
 fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str>) -> GtkBox {
-    let panel = GtkBox::new(Orientation::Vertical, 6);
+    let panel = GtkBox::new(Orientation::Vertical, 0);
     panel.set_hexpand(true);
     panel.set_vexpand(true);
 
-    let header = GtkBox::new(Orientation::Horizontal, 6);
-    header.set_margin_top(6);
-    header.set_margin_bottom(6);
-    header.set_margin_start(12);
-    header.set_margin_end(12);
+    let header = ui::hbox(4);
+    header.add_css_class("ronomepo-toolwindow-header");
+    let title = Label::new(Some("Terminal"));
+    title.add_css_class("ronomepo-toolwindow-title");
+    header.append(&title);
 
-    let restart = terminal_icon_button("view-refresh-symbolic", "Restart terminal");
+    let restart = ui::icon_button("view-refresh-symbolic", "Restart terminal");
     restart.set_sensitive(false);
     header.append(&restart);
 
@@ -10142,7 +10124,7 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
     spacer.set_hexpand(true);
     header.append(&spacer);
 
-    let external = terminal_icon_button("utilities-terminal-symbolic", "Open external terminal");
+    let external = ui::icon_button("utilities-terminal-symbolic", "Open external terminal");
     external.set_sensitive(false);
     header.append(&external);
     panel.append(&header);
@@ -10156,13 +10138,12 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
     let target_repo_id = instance_key.or(snapshot.active_repo_id.as_deref());
     let Some(item) = target_repo_id.and_then(|repo_id| repo_item_by_id(snapshot, repo_id)) else {
         panel.add_css_class("repo-terminal-empty");
-        let empty = Label::new(Some(
+        body.append(&ui::empty_state(
+            "utilities-terminal-symbolic",
+            "No terminal",
             "No repository target is attached to this tab, so no terminal session can be started.",
+            None,
         ));
-        empty.set_xalign(0.0);
-        empty.set_wrap(true);
-        empty.add_css_class("muted");
-        body.append(&empty);
         return panel;
     };
 
@@ -10189,26 +10170,11 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
         ));
         disabled.set_xalign(0.0);
         disabled.set_wrap(true);
-        disabled.add_css_class("muted");
+        disabled.add_css_class("ronomepo-fg-muted");
         body.append(&disabled);
     }
 
     panel
-}
-
-fn terminal_icon_button(icon_name: &str, tooltip: &str) -> Button {
-    let button = clickable_button();
-    button.add_css_class("toolbar-button");
-    button.add_css_class("toolbar-icon-button");
-    button.add_css_class(&button_css_class("ghost"));
-    button.set_focus_on_click(false);
-    button.set_tooltip_text(Some(tooltip));
-
-    let icon = Image::from_icon_name(icon_name);
-    icon.set_icon_size(gtk::IconSize::Normal);
-    button.set_child(Some(&icon));
-
-    button
 }
 
 fn sync_repo_terminal_panel(panel: &GtkBox, snapshot: &StateSnapshot, instance_key: Option<&str>) {
@@ -11175,19 +11141,16 @@ fn create_repo_manifest_editor_view(
             })
         });
 
-    let root = padded_view_root(14, 18);
+    let root = padded_view_root(20, 24);
 
     let snapshot = snapshot();
     let Some(repo_id) = repo_id else {
-        let title = Label::new(Some("Repo Manifest Editor"));
-        title.set_xalign(0.0);
-        title.add_css_class("title-2");
-        let body = Label::new(Some("No repository id was provided for this editor tab."));
-        body.set_xalign(0.0);
-        body.set_wrap(true);
-        body.add_css_class("muted");
-        root.append(&title);
-        root.append(&body);
+        root.append(&ui::empty_state(
+            "document-edit-symbolic",
+            "Repo Manifest Editor",
+            "No repository id was provided for this editor tab.",
+            None,
+        ));
         return into_view_ptr(root);
     };
 
@@ -11210,17 +11173,12 @@ fn render_repo_manifest_editor_into(
         .into_iter()
         .find(|item| item.id == repo_id)
     else {
-        let title = Label::new(Some("Repo Manifest Editor"));
-        title.set_xalign(0.0);
-        title.add_css_class("title-2");
-        let body = Label::new(Some(&format!(
-            "Repository {repo_id} is not present in the current workspace manifest."
-        )));
-        body.set_xalign(0.0);
-        body.set_wrap(true);
-        body.add_css_class("muted");
-        root.append(&title);
-        root.append(&body);
+        root.append(&ui::empty_state(
+            "document-edit-symbolic",
+            "Repo Manifest Editor",
+            &format!("Repository {repo_id} is not present in the current workspace manifest."),
+            None,
+        ));
         return;
     };
 
@@ -11235,33 +11193,32 @@ fn render_repo_manifest_editor_into(
         aggregation: Vec::new(),
     });
 
-    let title = Label::new(Some(&format!("{} Manifest", item.name)));
-    title.set_xalign(0.0);
-    title.add_css_class("title-2");
-    let subtitle = Label::new(Some(&format!("Editing {}", manifest_path.display())));
-    subtitle.set_xalign(0.0);
-    subtitle.set_wrap(true);
-    subtitle.add_css_class("muted");
+    let title = ui::page_title(&format!("{} Manifest", item.name));
+    let subtitle = ui::ellipsized(
+        &format!("Editing {}", manifest_path.display()),
+        &["mono", "ronomepo-meta", "ronomepo-fg-muted"],
+    );
 
     let preserved_repo_actions = Rc::new(manifest.repo_actions.clone());
     let preserved_aggregation = Rc::new(manifest.aggregation.clone());
 
     let repo_id_entry = Entry::new();
+    repo_id_entry.add_css_class(&input_css_class("field"));
     repo_id_entry.set_text(manifest.repo_id.as_deref().unwrap_or(&item.id));
 
-    let item_rows_box = GtkBox::new(Orientation::Vertical, 8);
+    let item_rows_box = ui::vbox(8);
     let item_rows = Rc::new(RefCell::new(Vec::<RepoManifestItemRowHandle>::new()));
     for manifest_item in &manifest.items {
         append_repo_manifest_item_row(&item_rows_box, &item_rows, Some(manifest_item));
     }
 
-    let action_rows_box = GtkBox::new(Orientation::Vertical, 8);
+    let action_rows_box = ui::vbox(8);
     let action_rows = Rc::new(RefCell::new(Vec::<RepoManifestActionRowHandle>::new()));
     for action in &manifest.actions {
         append_repo_manifest_action_row(&action_rows_box, &action_rows, Some(action));
     }
 
-    let capability_rows_box = GtkBox::new(Orientation::Vertical, 8);
+    let capability_rows_box = ui::vbox(8);
     let capability_rows = Rc::new(RefCell::new(Vec::<RepoManifestCapabilityRowHandle>::new()));
     for capability in &manifest.capabilities {
         append_repo_manifest_capability_row(
@@ -11276,12 +11233,18 @@ fn render_repo_manifest_editor_into(
     ));
     status.set_xalign(0.0);
     status.set_wrap(true);
-    status.add_css_class("muted");
+    status.add_css_class("ronomepo-fg-muted");
+    status.add_css_class("ronomepo-meta");
 
     let preview_buffer = TextBuffer::new(None);
     let preview_text = TextView::with_buffer(&preview_buffer);
     preview_text.set_monospace(true);
     preview_text.set_editable(false);
+    preview_text.add_css_class("ronomepo-editor");
+    preview_text.set_top_margin(8);
+    preview_text.set_bottom_margin(8);
+    preview_text.set_left_margin(12);
+    preview_text.set_right_margin(12);
     preview_text.set_wrap_mode(WrapMode::WordChar);
     preview_text.set_vexpand(true);
     let preview_scroller = ScrolledWindow::builder()
@@ -11304,8 +11267,8 @@ fn render_repo_manifest_editor_into(
         &preserved_aggregation,
     );
 
-    let actions = GtkBox::new(Orientation::Horizontal, 8);
-    let add_cargo = clickable_button_with_label("Add Cargo Item");
+    let actions = ui::hbox(8);
+    let add_cargo = ui::button("Add Cargo Item", ui::ButtonKind::Secondary);
     add_cargo.connect_clicked({
         let item_rows_box = item_rows_box.clone();
         let item_rows = item_rows.clone();
@@ -11324,19 +11287,19 @@ fn render_repo_manifest_editor_into(
             )
         }
     });
-    let add_action = clickable_button_with_label("Add Action");
+    let add_action = ui::button("Add Action", ui::ButtonKind::Secondary);
     add_action.connect_clicked({
         let action_rows_box = action_rows_box.clone();
         let action_rows = action_rows.clone();
         move |_| append_repo_manifest_action_row(&action_rows_box, &action_rows, None)
     });
-    let add_capability = clickable_button_with_label("Add Capability");
+    let add_capability = ui::button("Add Capability", ui::ButtonKind::Secondary);
     add_capability.connect_clicked({
         let capability_rows_box = capability_rows_box.clone();
         let capability_rows = capability_rows.clone();
         move |_| append_repo_manifest_capability_row(&capability_rows_box, &capability_rows, None)
     });
-    let preview = clickable_button_with_label("Preview JSON");
+    let preview = ui::button("Preview JSON", ui::ButtonKind::Ghost);
     preview.connect_clicked({
         let preview_buffer = preview_buffer.clone();
         let status = status.clone();
@@ -11359,7 +11322,7 @@ fn render_repo_manifest_editor_into(
             );
         }
     });
-    let save = clickable_button_with_label("Save Manifest");
+    let save = ui::button("Save Manifest", ui::ButtonKind::Primary);
     save.connect_clicked({
         let preview_buffer = preview_buffer.clone();
         let status = status.clone();
@@ -11393,25 +11356,27 @@ fn render_repo_manifest_editor_into(
             Err(message) => status.set_text(&message),
         }
     });
-    let edit_json = clickable_button_with_label("Edit JSON File");
+    let edit_json = ui::link_button("Edit JSON File");
     edit_json.connect_clicked({
         let manifest_path = manifest_path.clone();
         move |_| open_text_editor_for_path(host_ptr, &manifest_path)
     });
 
     for button in [
+        save,
+        preview,
         add_cargo,
         add_action,
         add_capability,
-        preview,
-        save,
         edit_json,
     ] {
         actions.append(&button);
     }
 
-    root.append(&title);
-    root.append(&subtitle);
+    let header = ui::vbox(4);
+    header.append(&title);
+    header.append(&subtitle);
+    root.append(&header);
     root.append(&actions);
     root.append(&status);
     root.append(&labeled_field("Repo ID", &repo_id_entry));
@@ -11437,7 +11402,11 @@ fn render_repo_manifest_editor_into(
         root,
         "JSON Preview",
         "Preview is generated from the structured fields above.",
-        &preview_scroller,
+        &{
+            let frame = ui::list_card();
+            frame.append(&preview_scroller);
+            frame
+        },
     );
 }
 
@@ -11447,19 +11416,10 @@ fn append_repo_manifest_editor_section(
     body: &str,
     child: &impl IsA<gtk::Widget>,
 ) {
-    let block = GtkBox::new(Orientation::Vertical, 8);
-    let heading_label = Label::new(Some(heading));
-    heading_label.set_xalign(0.0);
-    heading_label.add_css_class("title-4");
-    let body_label = Label::new(Some(body));
-    body_label.set_xalign(0.0);
-    body_label.set_wrap(true);
-    body_label.add_css_class("muted");
-    block.append(&heading_label);
-    block.append(&body_label);
+    let block = ui::vbox(8);
+    block.append(&ui::hint(body));
     block.append(child);
-    container.append(&block);
-    container.append(&Separator::new(Orientation::Horizontal));
+    container.append(&ui::section(heading, &[], &block));
 }
 
 fn append_repo_manifest_item_row(
@@ -11467,7 +11427,8 @@ fn append_repo_manifest_item_row(
     rows: &Rc<RefCell<Vec<RepoManifestItemRowHandle>>>,
     item: Option<&ronomepo_core::RepoItem>,
 ) {
-    let row = GtkBox::new(Orientation::Horizontal, 8);
+    let row = ui::hbox(8);
+    row.add_css_class("ronomepo-card");
     let id = Entry::new();
     id.set_placeholder_text(Some("id"));
     id.set_width_chars(16);
@@ -11477,7 +11438,7 @@ fn append_repo_manifest_item_row(
     let path = Entry::new();
     path.set_placeholder_text(Some("path"));
     path.set_hexpand(true);
-    let remove = clickable_button_with_label("Remove");
+    let remove = ui::icon_button("user-trash-symbolic", "Remove");
 
     if let Some(item) = item {
         id.set_text(&item.id);
@@ -11516,7 +11477,8 @@ fn append_repo_manifest_action_row(
     rows: &Rc<RefCell<Vec<RepoManifestActionRowHandle>>>,
     action: Option<&ronomepo_core::RepoActionDefinition>,
 ) {
-    let row = GtkBox::new(Orientation::Horizontal, 8);
+    let row = ui::hbox(8);
+    row.add_css_class("ronomepo-card");
     let id = Entry::new();
     id.set_placeholder_text(Some("id"));
     id.set_width_chars(20);
@@ -11530,7 +11492,7 @@ fn append_repo_manifest_action_row(
     timeout_seconds.set_placeholder_text(Some("timeout"));
     timeout_seconds.set_width_chars(8);
     let output = clickable_dropdown_from_strings(&["text", "json", "json_lines"]);
-    let remove = clickable_button_with_label("Remove");
+    let remove = ui::icon_button("user-trash-symbolic", "Remove");
 
     if let Some(action) = action {
         id.set_text(&action.id);
@@ -11584,9 +11546,10 @@ fn append_repo_manifest_capability_row(
     rows: &Rc<RefCell<Vec<RepoManifestCapabilityRowHandle>>>,
     capability: Option<&ronomepo_core::RepoCapabilityDeclaration>,
 ) {
-    let row = GtkBox::new(Orientation::Vertical, 6);
-    let top = GtkBox::new(Orientation::Horizontal, 8);
-    let bottom = GtkBox::new(Orientation::Horizontal, 8);
+    let row = ui::vbox(6);
+    row.add_css_class("ronomepo-card");
+    let top = ui::hbox(8);
+    let bottom = ui::hbox(8);
     let id = Entry::new();
     id.set_placeholder_text(Some("capability id"));
     id.set_width_chars(22);
@@ -11612,7 +11575,7 @@ fn append_repo_manifest_capability_row(
     let reason = Entry::new();
     reason.set_placeholder_text(Some("reason for N/A or unsupported"));
     reason.set_hexpand(true);
-    let remove = clickable_button_with_label("Remove");
+    let remove = ui::icon_button("user-trash-symbolic", "Remove");
 
     if let Some(capability) = capability {
         id.set_text(&capability.id);
@@ -11979,7 +11942,7 @@ fn create_text_editor_view(
     let host = remember_host_ptr(host);
     ui::install_stylesheet();
 
-    let root = padded_view_root(12, 18);
+    let root = padded_view_root(12, 16);
 
     let instance_key =
         unsafe { request.as_ref() }.and_then(|request| decode_mzstr(request.instance_key));
@@ -11999,18 +11962,18 @@ fn create_text_editor_view(
     let editor_id = register_text_editor(instance_key.clone());
     root.connect_destroy(move |_| unregister_text_editor(editor_id));
 
-    let title = Label::new(Some("Text Editor"));
-    title.set_xalign(0.0);
-    title.add_css_class("title-3");
+    let title = ui::page_title("Text Editor");
 
-    let toolbar = GtkBox::new(Orientation::Horizontal, 8);
+    let toolbar = ui::hbox(8);
     let path_entry = Entry::new();
+    path_entry.add_css_class(&input_css_class("field"));
+    path_entry.add_css_class("mono");
     path_entry.set_hexpand(true);
     path_entry.set_placeholder_text(Some("Relative or absolute file path"));
 
-    let open_button = clickable_button_with_label("Open");
-    let save_button = clickable_button_with_label("Save");
-    let format_button = clickable_button_with_label("Format");
+    let open_button = ui::button("Open", ui::ButtonKind::Secondary);
+    let save_button = ui::button("Save", ui::ButtonKind::Primary);
+    let format_button = ui::button("Format", ui::ButtonKind::Ghost);
 
     toolbar.append(&path_entry);
     toolbar.append(&open_button);
@@ -12019,7 +11982,8 @@ fn create_text_editor_view(
 
     let status = Label::new(Some("Open a text file from the workspace."));
     status.set_xalign(0.0);
-    status.add_css_class("muted");
+    status.add_css_class("ronomepo-fg-muted");
+    status.add_css_class("ronomepo-meta");
     status.set_wrap(true);
 
     let buffer = TextBuffer::new(None);
@@ -12037,6 +12001,11 @@ fn create_text_editor_view(
     text.set_monospace(true);
     text.set_wrap_mode(WrapMode::WordChar);
     text.set_vexpand(true);
+    text.add_css_class("ronomepo-editor");
+    text.set_top_margin(8);
+    text.set_bottom_margin(8);
+    text.set_left_margin(12);
+    text.set_right_margin(12);
 
     let scroller = ScrolledWindow::builder()
         .hexpand(true)
@@ -12108,10 +12077,13 @@ fn create_text_editor_view(
         }
     });
 
+    let frame = ui::list_card();
+    frame.append(&scroller);
+
     root.append(&title);
     root.append(&toolbar);
     root.append(&status);
-    root.append(&scroller);
+    root.append(&frame);
 
     into_view_ptr(root)
 }
