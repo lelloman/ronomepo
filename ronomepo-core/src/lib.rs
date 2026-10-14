@@ -3151,13 +3151,24 @@ pub fn collect_repository_details(repo_path: &Path) -> RepositoryDetails {
     }
 }
 
+/// Repositories an operation batch works on concurrently. Network-bound
+/// operations dominate, so a small pool hides most of the latency without
+/// hammering a single remote host.
+const MAX_PARALLEL_REPO_OPERATIONS: usize = 4;
+
+/// Runs `kind` for the selected repositories (all enabled ones when empty).
+///
+/// Events are emitted as they happen: `Started` first, then the workspace
+/// root's outcome (when the operation includes it), then one outcome per
+/// repository in completion order, and `Finished` last. Repositories are
+/// processed in parallel, so `emit` may be called from several threads.
 pub fn run_workspace_operation<F>(
     manifest: &WorkspaceManifest,
     selected_repo_ids: &[String],
     kind: OperationKind,
-    mut emit: F,
+    emit: F,
 ) where
-    F: FnMut(OperationEvent),
+    F: Fn(OperationEvent) + Sync,
 {
     let entries = manifest
         .repos
@@ -3183,30 +3194,21 @@ pub fn run_workspace_operation<F>(
         ),
     });
 
-    let mut completed = 0usize;
-    let mut skipped = 0usize;
-    let mut failed = 0usize;
+    let tally = std::sync::Mutex::new(OperationTally::default());
+    let emit_outcome = |event: OperationEvent| {
+        tally
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(event.kind);
+        emit(event);
+    };
 
     if matches!(kind, OperationKind::ApplyHooks) {
-        let root_event = apply_hooks_to_workspace_root(manifest);
-        match root_event.kind {
-            OperationEventKind::Success => completed += 1,
-            OperationEventKind::Skipped => skipped += 1,
-            OperationEventKind::Failed => failed += 1,
-            _ => {}
-        }
-        emit(root_event);
+        emit_outcome(apply_hooks_to_workspace_root(manifest));
     }
 
     if matches!(kind, OperationKind::Pull) && selected_repo_ids.is_empty() {
-        let root_event = pull_target(&OperationTarget::workspace_root(manifest));
-        match root_event.kind {
-            OperationEventKind::Success => completed += 1,
-            OperationEventKind::Skipped => skipped += 1,
-            OperationEventKind::Failed => failed += 1,
-            _ => {}
-        }
-        emit(root_event);
+        emit_outcome(pull_target(&OperationTarget::workspace_root(manifest)));
     }
 
     if matches!(kind, OperationKind::Push) {
@@ -3235,7 +3237,7 @@ pub fn run_workspace_operation<F>(
             .map(|entry| entry.repository_name)
             .collect::<BTreeSet<_>>();
         if !flagged.is_empty() {
-            emit(OperationEvent {
+            emit_outcome(OperationEvent {
                 kind: OperationEventKind::Failed,
                 repository_id: None,
                 repository_name: None,
@@ -3244,18 +3246,7 @@ pub fn run_workspace_operation<F>(
                     flagged.into_iter().collect::<Vec<_>>().join(", ")
                 ),
             });
-            emit(OperationEvent {
-                kind: OperationEventKind::Finished,
-                repository_id: None,
-                repository_name: None,
-                message: format!(
-                    "{} finished: {} completed, {} skipped, {} failed.",
-                    operation_kind_label(kind),
-                    completed,
-                    skipped,
-                    1
-                ),
-            });
+            emit(finished_event(kind, &tally));
             return;
         }
     }
@@ -3263,47 +3254,66 @@ pub fn run_workspace_operation<F>(
     if matches!(kind, OperationKind::Push | OperationKind::PushForce)
         && selected_repo_ids.is_empty()
     {
-        let root_event = push_target(&OperationTarget::workspace_root(manifest));
-        match root_event.kind {
-            OperationEventKind::Success => completed += 1,
-            OperationEventKind::Skipped => skipped += 1,
-            OperationEventKind::Failed => failed += 1,
-            _ => {}
-        }
-        emit(root_event);
+        emit_outcome(push_target(&OperationTarget::workspace_root(manifest)));
     }
 
-    for repo in entries {
-        let event = match kind {
-            OperationKind::CloneMissing => clone_missing_repo(manifest, repo),
-            OperationKind::Pull => pull_target(&OperationTarget::repo(manifest, repo)),
-            OperationKind::Push | OperationKind::PushForce => {
-                push_target(&OperationTarget::repo(manifest, repo))
-            }
-            OperationKind::ApplyHooks => apply_hooks_repo(manifest, repo),
-        };
-
-        match event.kind {
-            OperationEventKind::Success => completed += 1,
-            OperationEventKind::Skipped => skipped += 1,
-            OperationEventKind::Failed => failed += 1,
-            _ => {}
+    let next_entry = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..entries.len().min(MAX_PARALLEL_REPO_OPERATIONS) {
+            scope.spawn(|| loop {
+                let index = next_entry.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(repo) = entries.get(index) else {
+                    break;
+                };
+                emit_outcome(match kind {
+                    OperationKind::CloneMissing => clone_missing_repo(manifest, repo),
+                    OperationKind::Pull => pull_target(&OperationTarget::repo(manifest, repo)),
+                    OperationKind::Push | OperationKind::PushForce => {
+                        push_target(&OperationTarget::repo(manifest, repo))
+                    }
+                    OperationKind::ApplyHooks => apply_hooks_repo(manifest, repo),
+                });
+            });
         }
-        emit(event);
-    }
+    });
 
-    emit(OperationEvent {
+    emit(finished_event(kind, &tally));
+}
+
+#[derive(Default)]
+struct OperationTally {
+    completed: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+impl OperationTally {
+    fn record(&mut self, kind: OperationEventKind) {
+        match kind {
+            OperationEventKind::Success => self.completed += 1,
+            OperationEventKind::Skipped => self.skipped += 1,
+            OperationEventKind::Failed => self.failed += 1,
+            OperationEventKind::Started | OperationEventKind::Finished => {}
+        }
+    }
+}
+
+fn finished_event(kind: OperationKind, tally: &std::sync::Mutex<OperationTally>) -> OperationEvent {
+    let tally = tally
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    OperationEvent {
         kind: OperationEventKind::Finished,
         repository_id: None,
         repository_name: None,
         message: format!(
             "{} finished: {} completed, {} skipped, {} failed.",
             operation_kind_label(kind),
-            completed,
-            skipped,
-            failed
+            tally.completed,
+            tally.skipped,
+            tally.failed
         ),
-    });
+    }
 }
 
 pub fn collect_generated_history_matches(
@@ -5130,10 +5140,7 @@ mod tests {
             commit_check_rules: Some(Vec::new()),
         };
         for kind in [OperationKind::Pull, OperationKind::Push] {
-            let mut events = Vec::new();
-            run_workspace_operation(&manifest, &["alpha".to_string()], kind, |event| {
-                events.push(event);
-            });
+            let events = operation_events(&manifest, &["alpha".to_string()], kind);
             let repo_event = events
                 .iter()
                 .find(|event| event.repository_id.as_deref() == Some("alpha"))
@@ -5634,10 +5641,7 @@ mod tests {
             commit_check_rules: Some(default_commit_check_rules()),
         };
 
-        let mut events = Vec::new();
-        run_workspace_operation(&manifest, &[], OperationKind::Push, |event| {
-            events.push(event);
-        });
+        let events = operation_events(&manifest, &[], OperationKind::Push);
 
         assert!(events
             .iter()
@@ -5731,13 +5735,7 @@ mod tests {
                     pattern: "[".to_string(),
                 },
             });
-        let mut events = Vec::new();
-        run_workspace_operation(
-            &manifest,
-            &["alpha".to_string()],
-            OperationKind::Push,
-            |event| events.push(event),
-        );
+        let events = operation_events(&manifest, &["alpha".to_string()], OperationKind::Push);
         assert!(events.iter().any(|event| event
             .message
             .contains("invalid commit check rules: Bad regex")));
@@ -5772,10 +5770,7 @@ mod tests {
             commit_check_rules: Some(default_commit_check_rules()),
         };
 
-        let mut events = Vec::new();
-        run_workspace_operation(&manifest, &[], OperationKind::ApplyHooks, |event| {
-            events.push(event);
-        });
+        let events = operation_events(&manifest, &[], OperationKind::ApplyHooks);
 
         let root_hooks = git_stdout(&workspace, ["config", "--local", "core.hooksPath"]);
         assert_eq!(
@@ -5785,6 +5780,51 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.repository_name.as_deref() == Some("(monorepo)")));
+    }
+
+    #[test]
+    fn operation_batches_report_root_first_every_repo_once_and_finish_last() {
+        let workspace = temp_dir_path("parallel-batch");
+        let hooks_path = workspace.join("hooks");
+        fs::create_dir_all(&hooks_path).unwrap();
+        init_git_repo(&workspace);
+        let repos = (0..9)
+            .map(|index| {
+                let dir_name = format!("repo{index}");
+                if index != 4 {
+                    init_git_repo(&workspace.join(&dir_name));
+                }
+                RepositoryEntry {
+                    id: dir_name.clone(),
+                    name: dir_name.clone(),
+                    dir_name,
+                    remote_url: format!("git@example.com:repo{index}.git"),
+                    enabled: true,
+                }
+            })
+            .collect::<Vec<_>>();
+        let manifest = WorkspaceManifest {
+            name: "Example".to_string(),
+            root: workspace.to_path_buf(),
+            repos,
+            shared_hooks_path: Some(hooks_path),
+            commit_check_rules: None,
+        };
+
+        let events = operation_events(&manifest, &[], OperationKind::ApplyHooks);
+        assert_eq!(events.len(), 12);
+        assert_eq!(events[0].kind, OperationEventKind::Started);
+        assert_eq!(events[1].repository_name.as_deref(), Some("(monorepo)"));
+        let finished = events.last().unwrap();
+        assert_eq!(finished.kind, OperationEventKind::Finished);
+        assert!(finished
+            .message
+            .contains("9 completed, 0 skipped, 1 failed"));
+        let repo_ids = events[2..11]
+            .iter()
+            .filter_map(|event| event.repository_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(repo_ids.len(), 9);
     }
 
     #[test]
@@ -6261,6 +6301,18 @@ backup_required = false
                 )),
             }),
         }
+    }
+
+    fn operation_events(
+        manifest: &WorkspaceManifest,
+        selected_repo_ids: &[String],
+        kind: OperationKind,
+    ) -> Vec<OperationEvent> {
+        let events = std::sync::Mutex::new(Vec::new());
+        run_workspace_operation(manifest, selected_repo_ids, kind, |event| {
+            events.lock().unwrap().push(event);
+        });
+        events.into_inner().unwrap()
     }
 
     fn init_git_repo(path: &Path) {
