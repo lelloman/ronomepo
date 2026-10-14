@@ -331,6 +331,22 @@ struct AppState {
     repo_runtime: HashMap<String, RepoRuntimeState>,
     watch_manager_sync_in_flight: bool,
     watch_manager_sync_pending: bool,
+    /// The Pull/Push/... batch currently running; only one runs at a time.
+    operation_in_flight: Option<OperationBatchState>,
+}
+
+#[derive(Clone, Debug)]
+struct OperationBatchState {
+    batch_id: usize,
+    operation: &'static str,
+    /// Per-repo failures, reported together once the batch completes.
+    failures: Vec<OperationFailure>,
+}
+
+#[derive(Clone, Debug)]
+struct OperationFailure {
+    repository_name: Option<String>,
+    message: String,
 }
 
 impl Default for AppState {
@@ -375,6 +391,7 @@ impl Default for AppState {
             repo_runtime: HashMap::new(),
             watch_manager_sync_in_flight: false,
             watch_manager_sync_pending: false,
+            operation_in_flight: None,
         }
     }
 }
@@ -577,6 +594,9 @@ enum WorkerResult {
     },
     CapabilityChecksCompleted {
         result: Result<CapabilityRunReport, String>,
+    },
+    OperationBatchCompleted {
+        batch_id: usize,
     },
     JobPanicked {
         recovery: JobRecovery,
@@ -1124,17 +1144,16 @@ fn execute_worker_job(job: WorkerJob) -> Option<WorkerResult> {
             batch_id,
         } => {
             let main_context = glib::MainContext::default();
-            let operation = operation_kind_title(kind);
             run_workspace_operation(&manifest, &selected_repo_ids, kind, |event| {
                 let event = event.clone();
                 let manifest = manifest.clone();
                 main_context.invoke(move || {
                     guard_panics("handle_operation_event", (), || {
-                        handle_operation_event(batch_id, operation, manifest, event)
+                        handle_operation_event(batch_id, manifest, event)
                     })
                 });
             });
-            None
+            Some(WorkerResult::OperationBatchCompleted { batch_id })
         }
         WorkerJob::WorkspaceScan {
             workspace_root,
@@ -1912,26 +1931,29 @@ fn schedule_log_surface_refresh() {
     });
 }
 
-fn launch_operation(kind: OperationKind) {
-    let (manifest, selected_repo_ids, batch_id) = {
-        let mut app_state = state().lock().expect("state mutex poisoned");
-        let batch_id = app_state.next_operation_batch.max(1);
-        app_state.next_operation_batch = batch_id + 1;
-        (
-            app_state.manifest.clone(),
-            app_state.selected_repo_ids.clone(),
-            batch_id,
-        )
-    };
+/// Whether a Pull/Push/... batch is running. Only one runs at a time, since
+/// concurrent batches would run git against the same repositories.
+fn operation_in_flight() -> bool {
+    state()
+        .lock()
+        .expect("state mutex poisoned")
+        .operation_in_flight
+        .is_some()
+}
 
-    let Some(manifest) = manifest else {
-        append_log(format!(
-            "[run {batch_id}] {} skipped because no {} is loaded.",
-            operation_kind_title(kind),
-            MANIFEST_FILE_NAME
-        ));
-        refresh_views();
-        return;
+fn launch_operation(kind: OperationKind) {
+    let operation = operation_kind_title(kind);
+    let claimed = {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        claim_operation_batch(&mut app_state, operation)
+    };
+    let (manifest, selected_repo_ids, batch_id) = match claimed {
+        Ok(claimed) => claimed,
+        Err(message) => {
+            append_log(message);
+            refresh_views();
+            return;
+        }
     };
 
     if let Err(message) = submit_job(WorkerJob::OperationBatch {
@@ -1941,10 +1963,82 @@ fn launch_operation(kind: OperationKind) {
         batch_id,
     }) {
         append_log(format!(
-            "[run {batch_id}] {} failed to start: {message}",
-            operation_kind_title(kind)
+            "[run {batch_id}] {operation} failed to start: {message}"
         ));
-        refresh_views();
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        app_state.operation_in_flight = None;
+    }
+    refresh_views();
+}
+
+/// Reserves the single operation slot for a new batch, or explains why the
+/// batch cannot start.
+fn claim_operation_batch(
+    app_state: &mut AppState,
+    operation: &'static str,
+) -> Result<(WorkspaceManifest, Vec<String>, usize), String> {
+    let batch_id = app_state.next_operation_batch.max(1);
+    if let Some(running) = &app_state.operation_in_flight {
+        return Err(format!(
+            "{operation} not started: {} (run {}) is still running.",
+            running.operation, running.batch_id
+        ));
+    }
+    let Some(manifest) = app_state.manifest.clone() else {
+        app_state.next_operation_batch = batch_id + 1;
+        return Err(format!(
+            "[run {batch_id}] {operation} skipped because no {MANIFEST_FILE_NAME} is loaded."
+        ));
+    };
+    app_state.next_operation_batch = batch_id + 1;
+    app_state.operation_in_flight = Some(OperationBatchState {
+        batch_id,
+        operation,
+        failures: Vec::new(),
+    });
+    Ok((manifest, app_state.selected_repo_ids.clone(), batch_id))
+}
+
+/// Releases the operation slot and reports the batch's failures in one dialog.
+fn finish_operation_batch(batch_id: usize) {
+    let finished = {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        take_finished_operation_batch(&mut app_state, batch_id)
+    };
+    let Some(finished) = finished else {
+        return;
+    };
+    if !finished.failures.is_empty() && matches!(finished.operation, "Pull" | "Push" | "Push Force")
+    {
+        present_operation_failure_dialog(finished.operation, &finished.failures);
+    }
+}
+
+fn take_finished_operation_batch(
+    app_state: &mut AppState,
+    batch_id: usize,
+) -> Option<OperationBatchState> {
+    if app_state
+        .operation_in_flight
+        .as_ref()
+        .is_some_and(|running| running.batch_id == batch_id)
+    {
+        app_state.operation_in_flight.take()
+    } else {
+        None
+    }
+}
+
+fn record_operation_failure(app_state: &mut AppState, batch_id: usize, event: &OperationEvent) {
+    if let Some(running) = app_state
+        .operation_in_flight
+        .as_mut()
+        .filter(|running| running.batch_id == batch_id)
+    {
+        running.failures.push(OperationFailure {
+            repository_name: event.repository_name.clone(),
+            message: event.message.clone(),
+        });
     }
 }
 
@@ -1979,83 +2073,116 @@ fn active_window() -> Option<Window> {
         .and_then(|app| app.active_window())
 }
 
-fn present_operation_failure_dialog(
-    _batch_id: usize,
-    operation: &'static str,
-    event: &OperationEvent,
-) {
-    let is_generated_commit_failure =
-        operation == "Push" && event.message.contains("commit check rules blocked commits");
-    let dialog = Dialog::builder()
+fn present_operation_failure_dialog(operation: &'static str, failures: &[OperationFailure]) {
+    let is_generated_commit_failure = operation == "Push"
+        && failures.iter().any(|failure| {
+            failure
+                .message
+                .contains("commit check rules blocked commits")
+        });
+    let window = Window::builder()
         .modal(true)
         .title(format!("{operation} failed"))
+        .default_width(520)
         .build();
     if let Some(parent) = active_window().as_ref() {
-        dialog.set_transient_for(Some(parent));
+        window.set_transient_for(Some(parent));
     }
-    if is_generated_commit_failure {
-        let open_commit_check = dialog.add_button("Open Commit Check", ResponseType::Accept);
-        mark_clickable(&open_commit_check);
-    }
-    let close = dialog.add_button("Close", ResponseType::Close);
-    mark_clickable(&close);
-    dialog.set_default_response(ResponseType::Close);
 
-    let content = dialog.content_area();
+    let content = GtkBox::new(Orientation::Vertical, 12);
     content.set_margin_top(16);
     content.set_margin_bottom(16);
     content.set_margin_start(16);
     content.set_margin_end(16);
-    content.set_spacing(12);
-
-    let body = GtkBox::new(Orientation::Vertical, 8);
 
     let header = GtkBox::new(Orientation::Horizontal, 10);
     let icon = Image::from_icon_name("dialog-error-symbolic");
     icon.set_icon_size(gtk::IconSize::Large);
     icon.add_css_class("error");
 
-    let title_text = event.repository_name.as_deref().map_or_else(
-        || format!("{operation} failed."),
-        |repo_name| format!("{operation} failed for {repo_name}."),
-    );
+    let title_text = match failures {
+        [failure] => failure.repository_name.as_deref().map_or_else(
+            || format!("{operation} failed."),
+            |repo_name| format!("{operation} failed for {repo_name}."),
+        ),
+        _ => format!("{operation} failed for {} repositories.", failures.len()),
+    };
     let title = Label::new(Some(&title_text));
     title.set_xalign(0.0);
     title.add_css_class("title-4");
     title.add_css_class("error");
     title.set_wrap(true);
-
-    let message = Label::new(Some(&event.message));
-    message.set_xalign(0.0);
-    message.set_wrap(true);
-
     header.append(&icon);
     header.append(&title);
-    body.append(&header);
-    body.append(&message);
-    content.append(&body);
+    content.append(&header);
 
-    dialog.connect_response(move |dialog, response| {
-        if response == ResponseType::Accept {
+    let messages = GtkBox::new(Orientation::Vertical, 8);
+    for failure in failures {
+        let text = match (failures.len(), failure.repository_name.as_deref()) {
+            (2.., Some(repo_name)) => format!("{repo_name}: {}", failure.message),
+            _ => failure.message.clone(),
+        };
+        let message = Label::new(Some(&text));
+        message.set_xalign(0.0);
+        message.set_wrap(true);
+        message.set_selectable(true);
+        messages.append(&message);
+    }
+    let scroller = ScrolledWindow::new();
+    scroller.set_policy(PolicyType::Never, PolicyType::Automatic);
+    scroller.set_propagate_natural_height(true);
+    scroller.set_max_content_height(360);
+    scroller.set_vexpand(true);
+    scroller.set_child(Some(&messages));
+    content.append(&scroller);
+
+    let buttons = GtkBox::new(Orientation::Horizontal, 8);
+    buttons.set_halign(Align::End);
+    if is_generated_commit_failure {
+        let open_commit_check = clickable_button_with_label("Open Commit Check");
+        let window_ref = window.downgrade();
+        open_commit_check.connect_clicked(move |_| {
             let _ = command_open_commit_check(maruzzella_sdk::ffi::MzBytes::empty());
             let _ = queue_history_report(25);
+            if let Some(window) = window_ref.upgrade() {
+                window.close();
+            }
+        });
+        buttons.append(&open_commit_check);
+    }
+    let close = clickable_button_with_label("Close");
+    let window_ref = window.downgrade();
+    close.connect_clicked(move |_| {
+        if let Some(window) = window_ref.upgrade() {
+            window.close();
         }
-        dialog.close();
     });
-    dialog.present();
+    buttons.append(&close);
+    content.append(&buttons);
+
+    let escape = gtk::EventControllerKey::new();
+    let window_ref = window.downgrade();
+    escape.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            if let Some(window) = window_ref.upgrade() {
+                window.close();
+            }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    window.add_controller(escape);
+
+    window.set_child(Some(&content));
+    window.set_default_widget(Some(&close));
+    window.present();
 }
 
-fn handle_operation_event(
-    batch_id: usize,
-    operation: &'static str,
-    manifest: WorkspaceManifest,
-    event: OperationEvent,
-) {
+fn handle_operation_event(batch_id: usize, manifest: WorkspaceManifest, event: OperationEvent) {
     let _timed = diag::timed("operation-event");
-    if matches!(event.kind, OperationEventKind::Failed)
-        && matches!(operation, "Pull" | "Push" | "Push Force")
-    {
-        present_operation_failure_dialog(batch_id, operation, &event);
+    if matches!(event.kind, OperationEventKind::Failed) {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        record_operation_failure(&mut app_state, batch_id, &event);
     }
     append_log(format!(
         "[run {batch_id}] {}",
@@ -2089,6 +2216,7 @@ fn worker_result_label(result: &WorkerResult) -> &'static str {
         WorkerResult::HistoryReportCompleted { .. } => "worker-result:HistoryReportCompleted",
         WorkerResult::LineStatsCompleted { .. } => "worker-result:LineStatsCompleted",
         WorkerResult::CapabilityChecksCompleted { .. } => "worker-result:CapabilityChecksCompleted",
+        WorkerResult::OperationBatchCompleted { .. } => "worker-result:OperationBatchCompleted",
         WorkerResult::JobPanicked { .. } => "worker-result:JobPanicked",
     }
 }
@@ -2354,6 +2482,10 @@ fn handle_worker_result(result: WorkerResult) {
             schedule_workspace_scan();
             refresh_views();
         }
+        WorkerResult::OperationBatchCompleted { batch_id } => {
+            finish_operation_batch(batch_id);
+            refresh_views();
+        }
         WorkerResult::JobPanicked { recovery, message } => {
             recover_panicked_job(recovery, message);
             refresh_views();
@@ -2368,6 +2500,7 @@ fn recover_panicked_job(recovery: JobRecovery, message: String) {
             operation,
         } => {
             append_log(format!("[run {batch_id}] {operation} aborted: {message}"));
+            finish_operation_batch(batch_id);
             sync_watch_manager_from_state();
         }
         JobRecovery::WorkspaceScan => {
@@ -3889,6 +4022,10 @@ fn claim_due_remote_fetches(
     app_state: &mut AppState,
     now: SystemTime,
 ) -> Vec<(String, String, PathBuf)> {
+    // Background fetches would race the running batch's git commands.
+    if app_state.operation_in_flight.is_some() {
+        return Vec::new();
+    }
     let inflight = app_state
         .repo_runtime
         .values()
@@ -9414,8 +9551,13 @@ fn overview_actions(include_open_overview: bool) -> GtkBox {
         ));
     }
 
+    let operation_running = operation_in_flight();
     for (label, handler) in entries {
         let button = clickable_button_with_label(label);
+        if operation_running && matches!(label, "Pull" | "Push") {
+            button.set_sensitive(false);
+            button.set_tooltip_text(Some("Another operation is still running"));
+        }
         button.connect_clicked(move |_| {
             let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
         });
@@ -12579,6 +12721,70 @@ mod tests {
         assert!(worker_job_panic_recovery(&job)("boom".to_string()).is_none());
         let message = receiver.recv().expect("editor gets a reply");
         assert_eq!(message.result, Err("boom".to_string()));
+    }
+
+    fn empty_test_manifest(root: PathBuf) -> WorkspaceManifest {
+        WorkspaceManifest {
+            name: "Workspace".to_string(),
+            root,
+            repos: Vec::new(),
+            shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
+        }
+    }
+
+    #[test]
+    fn only_one_operation_batch_runs_at_a_time() {
+        let mut app_state = AppState::default();
+        app_state.manifest = Some(empty_test_manifest(PathBuf::from("/workspace")));
+
+        let (_, _, first) = claim_operation_batch(&mut app_state, "Pull").unwrap();
+        let refused = claim_operation_batch(&mut app_state, "Push").unwrap_err();
+        assert!(
+            refused.contains("Pull (run 1) is still running"),
+            "{refused}"
+        );
+
+        // A stale completion for another batch must not free the slot.
+        assert!(take_finished_operation_batch(&mut app_state, first + 7).is_none());
+        assert!(app_state.operation_in_flight.is_some());
+
+        let failure = OperationEvent {
+            kind: OperationEventKind::Failed,
+            repository_id: Some("alpha".to_string()),
+            repository_name: Some("alpha".to_string()),
+            message: "rejected".to_string(),
+        };
+        record_operation_failure(&mut app_state, first, &failure);
+        record_operation_failure(&mut app_state, first, &failure);
+        let finished = take_finished_operation_batch(&mut app_state, first).unwrap();
+        assert_eq!(finished.failures.len(), 2);
+        assert!(app_state.operation_in_flight.is_none());
+
+        let (_, _, second) = claim_operation_batch(&mut app_state, "Push").unwrap();
+        assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    fn remote_fetches_wait_for_running_operation() {
+        let mut app_state = AppState::default();
+        app_state.manifest = Some(empty_test_manifest(PathBuf::from("/workspace")));
+        app_state.repository_items.push(test_repository_item(
+            "alpha",
+            RepositoryState::Clean,
+            RepositorySync::UpToDate,
+        ));
+        let mut runtime = RepoRuntimeState::new(UNIX_EPOCH, "alpha");
+        runtime.next_fetch_due_at = UNIX_EPOCH;
+        app_state.repo_runtime.insert("alpha".to_string(), runtime);
+
+        claim_operation_batch(&mut app_state, "Pull").unwrap();
+        assert!(claim_due_remote_fetches(&mut app_state, SystemTime::now()).is_empty());
+        app_state.operation_in_flight = None;
+        assert_eq!(
+            claim_due_remote_fetches(&mut app_state, SystemTime::now()).len(),
+            1
+        );
     }
 
     #[test]
