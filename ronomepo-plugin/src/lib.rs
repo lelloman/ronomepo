@@ -12,7 +12,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -28,11 +28,11 @@ use gtk::glib::{
 use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
-    Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, Dialog, DropDown, Entry,
+    Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, DropDown, Entry,
     EventControllerMotion, FilterChange, GestureClick, Image, Label, ListBox, ListBoxRow,
-    Orientation, Paned, PolicyType, Popover, PositionType, ResponseType, ScrolledWindow,
-    SelectionMode, Separator, SortListModel, SorterChange, Stack, StackSwitcher, TextBuffer,
-    TextView, ToggleButton, Window, WrapMode,
+    Orientation, Paned, PolicyType, Popover, PositionType, ScrolledWindow, SelectionMode,
+    Separator, SortListModel, SorterChange, Stack, StackSwitcher, TextBuffer, TextView,
+    ToggleButton, Window, WrapMode,
 };
 use maruzzella_sdk::{
     attach_text_tooltip, button_css_class, export_plugin, input_css_class, surface_css_class,
@@ -61,9 +61,9 @@ use ronomepo_core::{
     CapabilityRegistry, CapabilityResult, CapabilityResultStatus, CapabilityState, CommitCheckRule,
     CommitCheckRuleEffect, CommitCheckRuleMatcher, CommitCheckRuleScope, FucinaPolicyAction,
     FucinaPolicyCommandResult, FucinaRepositoryPolicy, OperationEvent, OperationEventKind,
-    OperationKind, PlannedCommand, RepoActionExecutor, RepoManifest, RepoManifestScan,
-    RepoManifestScanState, RepositoryDetails, RepositoryListItem, RepositoryStatus,
-    StandardActionName, WorkspaceManifest, MANIFEST_FILE_NAME,
+    OperationKind, PlannedCommand, RepoActionExecutor, RepoCapabilityDeclaration, RepoManifest,
+    RepoManifestScan, RepoManifestScanState, RepositoryDetails, RepositoryListItem,
+    RepositoryStatus, StandardActionName, WorkspaceManifest, MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -212,72 +212,147 @@ pub struct RonomepoPlugin;
 // Older configs also carry `last_workspace_path` and `import_banner_dismissed`;
 // neither was ever used, and serde ignores the unknown keys.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(from = "StoredPluginConfig")]
 struct RonomepoPluginConfig {
-    /// Settings from before per-view monitor modes. Only read, and folded into
-    /// the overview settings by `migrate_legacy_monitor_settings`.
-    #[serde(default, skip_serializing)]
-    monitor_filter_mode: MonitorFilterMode,
-    #[serde(default, skip_serializing)]
-    monitor_sort_mode: MonitorSortMode,
-    #[serde(default, skip_serializing)]
-    monitor_sort_descending: bool,
+    monitor_view_mode: MonitorViewMode,
+    /// Per-view filter and sort settings.
+    monitor_views: MonitorSettings,
+}
+
+/// The config as stored, including the flat monitor fields written before
+/// the per-view settings were grouped. Loading migrates them, so saving a
+/// loaded config never drops them. Unknown keys are ignored.
+#[derive(Deserialize)]
+struct StoredPluginConfig {
     #[serde(default)]
     monitor_view_mode: MonitorViewMode,
     #[serde(default)]
+    monitor_views: Option<MonitorSettings>,
+    #[serde(flatten)]
+    legacy_monitor: LegacyMonitorConfig,
+}
+
+impl From<StoredPluginConfig> for RonomepoPluginConfig {
+    fn from(stored: StoredPluginConfig) -> Self {
+        Self {
+            monitor_view_mode: stored.monitor_view_mode,
+            monitor_views: stored
+                .monitor_views
+                .unwrap_or_else(|| stored.legacy_monitor.to_settings()),
+        }
+    }
+}
+
+/// Monitor settings as older versions stored them, read only for migration.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct LegacyMonitorConfig {
+    monitor_filter_mode: MonitorFilterMode,
+    monitor_sort_mode: MonitorSortMode,
+    monitor_sort_descending: bool,
     overview_filter_mode: MonitorFilterMode,
-    #[serde(default)]
     git_filter_mode: MonitorFilterMode,
-    #[serde(default)]
     checks_filter_mode: MonitorFilterMode,
-    #[serde(default)]
     manifest_filter_mode: MonitorFilterMode,
-    #[serde(default)]
     overview_sort_mode: MonitorSortMode,
-    #[serde(default)]
     git_sort_mode: MonitorSortMode,
-    #[serde(default)]
     checks_sort_mode: MonitorSortMode,
-    #[serde(default)]
     manifest_sort_mode: MonitorSortMode,
-    #[serde(default)]
     overview_sort_descending: bool,
-    #[serde(default)]
     git_sort_descending: bool,
-    #[serde(default)]
     checks_sort_descending: bool,
-    #[serde(default)]
     manifest_sort_descending: bool,
 }
 
 impl RonomepoPluginConfig {
     fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        let mut config = if bytes.is_empty() {
-            Self::default()
+        if bytes.is_empty() {
+            Ok(Self::default())
         } else {
-            serde_json::from_slice::<Self>(bytes)?
+            serde_json::from_slice::<Self>(bytes)
+        }
+    }
+}
+
+impl LegacyMonitorConfig {
+    fn to_settings(&self) -> MonitorSettings {
+        // The oldest configs had a single monitor_* setting, which applies to
+        // the overview when no overview-specific value was stored.
+        let overview_filter = if self.overview_filter_mode == MonitorFilterMode::All {
+            match self.monitor_filter_mode {
+                MonitorFilterMode::Dirty
+                | MonitorFilterMode::ToSync
+                | MonitorFilterMode::Issues => MonitorFilterMode::Issues,
+                _ => MonitorFilterMode::All,
+            }
+        } else {
+            self.overview_filter_mode
         };
-        config.migrate_legacy_monitor_settings();
-        Ok(config)
+        let overview_sort = if self.overview_sort_mode == MonitorSortMode::Name {
+            self.monitor_sort_mode
+        } else {
+            self.overview_sort_mode
+        };
+        MonitorSettings {
+            overview: MonitorViewSettings {
+                filter: overview_filter,
+                sort: overview_sort,
+                descending: self.monitor_sort_descending || self.overview_sort_descending,
+            },
+            git: MonitorViewSettings {
+                filter: self.git_filter_mode,
+                sort: self.git_sort_mode,
+                descending: self.git_sort_descending,
+            },
+            checks: MonitorViewSettings {
+                filter: self.checks_filter_mode,
+                sort: self.checks_sort_mode,
+                descending: self.checks_sort_descending,
+            },
+            manifest: MonitorViewSettings {
+                filter: self.manifest_filter_mode,
+                sort: self.manifest_sort_mode,
+                descending: self.manifest_sort_descending,
+            },
+        }
+    }
+}
+
+/// Filter and sort settings of one monitor view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct MonitorViewSettings {
+    filter: MonitorFilterMode,
+    sort: MonitorSortMode,
+    descending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct MonitorSettings {
+    overview: MonitorViewSettings,
+    git: MonitorViewSettings,
+    checks: MonitorViewSettings,
+    manifest: MonitorViewSettings,
+}
+
+impl MonitorSettings {
+    fn view(&self, view: MonitorViewMode) -> &MonitorViewSettings {
+        match view {
+            MonitorViewMode::Overview => &self.overview,
+            MonitorViewMode::Git => &self.git,
+            MonitorViewMode::Checks => &self.checks,
+            MonitorViewMode::Manifest => &self.manifest,
+        }
     }
 
-    /// Carries the pre-view-mode monitor settings over to the overview view.
-    /// The legacy fields are not serialized, so this applies once per config.
-    fn migrate_legacy_monitor_settings(&mut self) {
-        if self.overview_filter_mode == MonitorFilterMode::All
-            && matches!(
-                self.monitor_filter_mode,
-                MonitorFilterMode::Dirty | MonitorFilterMode::ToSync | MonitorFilterMode::Issues
-            )
-        {
-            self.overview_filter_mode = MonitorFilterMode::Issues;
+    fn view_mut(&mut self, view: MonitorViewMode) -> &mut MonitorViewSettings {
+        match view {
+            MonitorViewMode::Overview => &mut self.overview,
+            MonitorViewMode::Git => &mut self.git,
+            MonitorViewMode::Checks => &mut self.checks,
+            MonitorViewMode::Manifest => &mut self.manifest,
         }
-        if self.overview_sort_mode == MonitorSortMode::Name {
-            self.overview_sort_mode = self.monitor_sort_mode;
-        }
-        self.overview_sort_descending |= self.monitor_sort_descending;
-        self.monitor_filter_mode = MonitorFilterMode::default();
-        self.monitor_sort_mode = MonitorSortMode::default();
-        self.monitor_sort_descending = false;
     }
 }
 
@@ -339,18 +414,7 @@ struct AppState {
     repo_details_loading: HashSet<String>,
     monitor_filter: String,
     monitor_view_mode: MonitorViewMode,
-    overview_filter_mode: MonitorFilterMode,
-    git_filter_mode: MonitorFilterMode,
-    checks_filter_mode: MonitorFilterMode,
-    manifest_filter_mode: MonitorFilterMode,
-    overview_sort_mode: MonitorSortMode,
-    git_sort_mode: MonitorSortMode,
-    checks_sort_mode: MonitorSortMode,
-    manifest_sort_mode: MonitorSortMode,
-    overview_sort_descending: bool,
-    git_sort_descending: bool,
-    checks_sort_descending: bool,
-    manifest_sort_descending: bool,
+    monitor_settings: MonitorSettings,
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
@@ -383,6 +447,12 @@ struct AppState {
     /// Each repo's invalidation_seq when the running full workspace scan was
     /// submitted; repos invalidated since then must not take its results.
     workspace_scan_seqs: HashMap<String, u64>,
+    /// Sequence number one past the newest log line; see `LogCursor`.
+    log_end_seq: u64,
+    log_rewrites: u64,
+    /// Parsed `.ronomepo/capability-state.json`, re-read only when capability
+    /// checks write it or a workspace scan completes.
+    capability_registry: Arc<CapabilityRegistry>,
 }
 
 #[derive(Clone, Debug)]
@@ -413,18 +483,7 @@ impl Default for AppState {
             repo_details_loading: HashSet::new(),
             monitor_filter: String::new(),
             monitor_view_mode: MonitorViewMode::default(),
-            overview_filter_mode: MonitorFilterMode::All,
-            git_filter_mode: MonitorFilterMode::All,
-            checks_filter_mode: MonitorFilterMode::All,
-            manifest_filter_mode: MonitorFilterMode::All,
-            overview_sort_mode: MonitorSortMode::Name,
-            git_sort_mode: MonitorSortMode::Name,
-            checks_sort_mode: MonitorSortMode::Name,
-            manifest_sort_mode: MonitorSortMode::Name,
-            overview_sort_descending: false,
-            git_sort_descending: false,
-            checks_sort_descending: false,
-            manifest_sort_descending: false,
+            monitor_settings: MonitorSettings::default(),
             selected_repo_ids: Vec::new(),
             active_repo_id: None,
             logs: Vec::new(),
@@ -447,6 +506,9 @@ impl Default for AppState {
             deferred_watch_dirs: Vec::new(),
             operation_in_flight: None,
             workspace_scan_seqs: HashMap::new(),
+            log_end_seq: 0,
+            log_rewrites: 0,
+            capability_registry: Arc::new(CapabilityRegistry::default()),
         }
     }
 }
@@ -602,14 +664,9 @@ enum WorkerJob {
         targets: Vec<CapabilityRunTarget>,
         run_reason: String,
     },
-    EditorLoad {
-        path: PathBuf,
-        reply: mpsc::Sender<EditorLoadMessage>,
-    },
-    EditorSave {
-        path: PathBuf,
-        content: String,
-        reply: mpsc::Sender<EditorSaveMessage>,
+    RepoManifestActions {
+        action: StandardActionName,
+        targets: Vec<(RepositoryListItem, Arc<RepoManifest>)>,
     },
 }
 
@@ -694,7 +751,7 @@ struct CapabilityRunTarget {
     repo_id: String,
     repo_name: String,
     repo_path: PathBuf,
-    manifest: RepoManifest,
+    manifest: Arc<RepoManifest>,
     capability_ids: Option<Vec<String>>,
 }
 
@@ -754,39 +811,159 @@ struct CommitCheckRuleRowHandle {
     rule_id: String,
 }
 
-struct EditorLoadMessage {
-    path: PathBuf,
-    result: Result<String, String>,
-}
-
-struct EditorSaveMessage {
-    path: PathBuf,
-    result: Result<(), String>,
-}
-
 struct RepositoryViewHandle {
     list: glib::WeakRef<ListBox>,
-    scroller: glib::WeakRef<ScrolledWindow>,
+    controls: MonitorControls,
     store: gio::ListStore,
+    filter_model: gtk::FilterListModel,
     filter: CustomFilter,
     sorter: CustomSorter,
+    /// Filter and sort settings read by `filter` and `sorter`.
+    query: Rc<RefCell<MonitorQuery>>,
+    /// Mirror of the rows in `store`, used to update only rows that changed.
+    rows: RefCell<Vec<MonitorRow>>,
+    /// Whether the empty placeholder currently shown was built for a loaded
+    /// manifest; `None` while the list has rows.
+    placeholder_for_manifest: Cell<Option<bool>>,
 }
 
-#[derive(Default)]
-struct ContainerViewHandle {
+/// A Fucina Policy view. The policy part is rebuilt only when repos.toml
+/// changes; the action status label lives outside it so running actions keep
+/// reporting into a live label.
+struct FucinaPolicyViewHandle {
     root: glib::WeakRef<GtkBox>,
-    host_ptr: usize,
+    policy_area: GtkBox,
+    repository_area: GtkBox,
+    action_status: Label,
+    rendered_source: RefCell<Option<FucinaPolicySource>>,
 }
 
-#[derive(Default)]
-struct RepoOverviewViewHandle {
-    summary_root: glib::WeakRef<GtkBox>,
-    git_root: glib::WeakRef<GtkBox>,
-    manifest_root: glib::WeakRef<GtkBox>,
-    activity_root: glib::WeakRef<GtkBox>,
-    terminal_root: glib::WeakRef<GtkBox>,
+/// What the rendered policy was read from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FucinaPolicySource {
+    policy_root: PathBuf,
+    modified: Option<SystemTime>,
+}
+
+/// A Monorepo Overview view. Its chrome and the report controls (including
+/// the line-stats date entry) are built once; refreshes re-render only the
+/// slots, and only while the view is on screen.
+struct MonorepoOverview {
+    root: glib::WeakRef<GtkBox>,
+    top: GtkBox,
+    selection_slot: GtkBox,
+    files_slot: GtkBox,
+    sections: GtkBox,
+    reports: MonorepoReportControls,
+    host_ptr: usize,
+    /// Set when a refresh was skipped because the view was not mapped.
+    stale: Cell<bool>,
+}
+
+struct MonorepoReportControls {
+    row: GtkBox,
+    check_history: Button,
+    since_entry: Entry,
+    line_stats: Button,
+    all_time: Button,
+}
+
+struct CommitCheckViewHandle {
+    root: glib::WeakRef<GtkBox>,
+    editor: Rc<CommitCheckEditor>,
+}
+
+/// The rule editor of a Commit Check view. It is built once; refreshes only
+/// touch the rows when the manifest's rules change, and never discard edits.
+struct CommitCheckEditor {
+    rules_box: GtkBox,
+    rule_rows: Rc<RefCell<Vec<CommitCheckRuleRowHandle>>>,
+    status: Label,
+    /// Manifest rules the rows were last synced with.
+    baseline: RefCell<Vec<CommitCheckRule>>,
+}
+
+/// A Repo Overview view. Only the visible tab of its stack is rendered on a
+/// refresh; the other tabs are marked stale and rendered when shown.
+struct RepoOverviewView {
+    stack: glib::WeakRef<Stack>,
+    pages: Vec<(RepoOverviewPage, GtkBox)>,
+    stale: RefCell<HashSet<RepoOverviewPage>>,
+    terminal_root: GtkBox,
     instance_key: Option<String>,
     host_ptr: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RepoOverviewPage {
+    Summary,
+    Git,
+    Manifest,
+    Activity,
+}
+
+impl RepoOverviewPage {
+    const ALL: [RepoOverviewPage; 4] = [
+        RepoOverviewPage::Summary,
+        RepoOverviewPage::Git,
+        RepoOverviewPage::Manifest,
+        RepoOverviewPage::Activity,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            RepoOverviewPage::Summary => "summary",
+            RepoOverviewPage::Git => "git",
+            RepoOverviewPage::Manifest => "manifest",
+            RepoOverviewPage::Activity => "activity",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            RepoOverviewPage::Summary => "Summary",
+            RepoOverviewPage::Git => "Git",
+            RepoOverviewPage::Manifest => "Manifest",
+            RepoOverviewPage::Activity => "Activity",
+        }
+    }
+}
+
+/// Identifies the log contents: `logs[i]` has sequence number
+/// `end_seq - logs.len() + i`, and `rewrites` counts in-place updates of the
+/// last line (repeat collapsing).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LogCursor {
+    first_seq: u64,
+    end_seq: u64,
+    rewrites: u64,
+}
+
+/// What a log view showing `shown` must do to show the log at a newer cursor.
+#[derive(Debug, PartialEq, Eq)]
+enum LogViewEdit {
+    Unchanged,
+    Reset,
+    /// Drop `drop_front` entries from the start, keep the next `keep`
+    /// entries, and replace the rest with `logs[keep..]`.
+    Update {
+        drop_front: usize,
+        keep: usize,
+    },
+}
+
+struct OperationBufferHandle {
+    buffer: glib::WeakRef<TextBuffer>,
+    shown: Cell<LogCursor>,
+    /// Number of text lines of each shown entry (entries may span lines).
+    line_counts: RefCell<std::collections::VecDeque<usize>>,
+}
+
+struct TextEditorState {
+    /// The host instance key of the view ("" for a keyless view), which is
+    /// what a teardown request names.
+    instance_key: String,
+    dirty: bool,
 }
 
 struct OperationFollowHandle {
@@ -798,14 +975,19 @@ struct OperationFollowHandle {
 
 thread_local! {
     static REPOSITORY_VIEWS: RefCell<Vec<RepositoryViewHandle>> = const { RefCell::new(Vec::new()) };
-    static MONOREPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
-    static REPO_OVERVIEWS: RefCell<Vec<RepoOverviewViewHandle>> = const { RefCell::new(Vec::new()) };
-    static COMMIT_CHECK_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
-    static FUCINA_POLICY_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
-    static OPERATION_BUFFERS: RefCell<Vec<glib::WeakRef<TextBuffer>>> = const { RefCell::new(Vec::new()) };
+    static MONOREPO_OVERVIEWS: RefCell<Vec<Rc<MonorepoOverview>>> = const { RefCell::new(Vec::new()) };
+    static REPO_OVERVIEWS: RefCell<Vec<Rc<RepoOverviewView>>> = const { RefCell::new(Vec::new()) };
+    static COMMIT_CHECK_VIEWS: RefCell<Vec<CommitCheckViewHandle>> = const { RefCell::new(Vec::new()) };
+    static FUCINA_POLICY_VIEWS: RefCell<Vec<FucinaPolicyViewHandle>> = const { RefCell::new(Vec::new()) };
+    static OPERATION_BUFFERS: RefCell<Vec<OperationBufferHandle>> = const { RefCell::new(Vec::new()) };
+    static OPERATION_SUMMARY_CURSOR: Cell<Option<LogCursor>> = const { Cell::new(None) };
     static OPERATION_SUMMARIES: RefCell<Vec<glib::WeakRef<Label>>> = const { RefCell::new(Vec::new()) };
     static OPERATION_FOLLOWERS: RefCell<Vec<OperationFollowHandle>> = const { RefCell::new(Vec::new()) };
-    static DIRTY_TEXT_EDITORS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// Pull/Push buttons, disabled while an operation batch runs. Views keep
+    /// them across refreshes, so their state is synced on every refresh.
+    static OPERATION_BUTTONS: RefCell<Vec<glib::WeakRef<Button>>> = const { RefCell::new(Vec::new()) };
+    /// Open text editor views by view id.
+    static TEXT_EDITORS: RefCell<HashMap<usize, TextEditorState>> = RefCell::new(HashMap::new());
     static HOST_APIS: RefCell<Vec<&'static maruzzella_sdk::ffi::MzHostApi>> = const { RefCell::new(Vec::new()) };
     static PENDING_CONFIG_UPDATES: RefCell<Vec<PluginConfigUpdate>> = const { RefCell::new(Vec::new()) };
 }
@@ -1088,8 +1270,7 @@ fn worker_job_label(job: &WorkerJob) -> &'static str {
         WorkerJob::HistoryReport { .. } => "worker-job:HistoryReport",
         WorkerJob::LineStats { .. } => "worker-job:LineStats",
         WorkerJob::CapabilityChecks { .. } => "worker-job:CapabilityChecks",
-        WorkerJob::EditorLoad { .. } => "worker-job:EditorLoad",
-        WorkerJob::EditorSave { .. } => "worker-job:EditorSave",
+        WorkerJob::RepoManifestActions { .. } => "worker-job:RepoManifestActions",
     }
 }
 
@@ -1168,31 +1349,10 @@ fn worker_job_panic_recovery(job: &WorkerJob) -> Box<dyn FnOnce(String) -> Optio
                 })
             })
         }
-        WorkerJob::EditorLoad { path, reply } => {
-            let path = path.clone();
-            let reply = reply.clone();
-            Box::new(move |message| {
-                let _ = reply.send(EditorLoadMessage {
-                    path,
-                    result: Err(message),
-                });
-                None
-            })
-        }
-        WorkerJob::EditorSave { path, reply, .. } => {
-            let path = path.clone();
-            let reply = reply.clone();
-            Box::new(move |message| {
-                let _ = reply.send(EditorSaveMessage {
-                    path,
-                    result: Err(message),
-                });
-                None
-            })
-        }
-        WorkerJob::WorkspaceRootStatusRefresh { .. } | WorkerJob::WatchNewDirs { .. } => {
-            Box::new(|_| None)
-        }
+        // Nothing is held in flight for these; the panic itself is logged.
+        WorkerJob::WorkspaceRootStatusRefresh { .. }
+        | WorkerJob::WatchNewDirs { .. }
+        | WorkerJob::RepoManifestActions { .. } => Box::new(|_| None),
     }
 }
 
@@ -1301,18 +1461,8 @@ fn execute_worker_job(job: WorkerJob) -> Option<WorkerResult> {
             let result = run_capability_checks(&workspace_root, targets, &run_reason);
             Some(WorkerResult::CapabilityChecksCompleted { result, repo_ids })
         }
-        WorkerJob::EditorLoad { path, reply } => {
-            let result = fs::read_to_string(&path).map_err(|error| error.to_string());
-            let _ = reply.send(EditorLoadMessage { path, result });
-            None
-        }
-        WorkerJob::EditorSave {
-            path,
-            content,
-            reply,
-        } => {
-            let result = fs::write(&path, content).map_err(|error| error.to_string());
-            let _ = reply.send(EditorSaveMessage { path, result });
+        WorkerJob::RepoManifestActions { action, targets } => {
+            run_repo_manifest_actions(action, targets);
             None
         }
     }
@@ -1644,9 +1794,11 @@ fn initialize_state(config: &RonomepoPluginConfig) {
         .unwrap_or_else(|| PathBuf::from("."));
     let manifest_path = default_manifest_path(&workspace_root);
     let manifest = load_manifest_if_present(&manifest_path);
+    let capability_registry = read_capability_registry(&workspace_root);
 
     let mut app_state = state().lock().expect("state mutex poisoned");
     app_state.workspace_root = workspace_root.clone();
+    app_state.capability_registry = capability_registry;
     app_state.manifest_path = manifest.as_ref().map(|_| manifest_path.clone());
     app_state.manifest = manifest;
     app_state.workspace_status = empty_repository_status(workspace_root.clone());
@@ -1656,18 +1808,7 @@ fn initialize_state(config: &RonomepoPluginConfig) {
     app_state.repo_details_cache.clear();
     app_state.repo_details_loading.clear();
     app_state.monitor_view_mode = config.monitor_view_mode;
-    app_state.overview_filter_mode = config.overview_filter_mode;
-    app_state.git_filter_mode = config.git_filter_mode;
-    app_state.checks_filter_mode = config.checks_filter_mode;
-    app_state.manifest_filter_mode = config.manifest_filter_mode;
-    app_state.overview_sort_mode = config.overview_sort_mode;
-    app_state.git_sort_mode = config.git_sort_mode;
-    app_state.checks_sort_mode = config.checks_sort_mode;
-    app_state.manifest_sort_mode = config.manifest_sort_mode;
-    app_state.overview_sort_descending = config.overview_sort_descending;
-    app_state.git_sort_descending = config.git_sort_descending;
-    app_state.checks_sort_descending = config.checks_sort_descending;
-    app_state.manifest_sort_descending = config.manifest_sort_descending;
+    app_state.monitor_settings = config.monitor_views;
     sync_repo_runtime_state(&mut app_state);
     if app_state.logs.is_empty() {
         let message = format!(
@@ -1984,9 +2125,11 @@ fn push_log_line(app_state: &mut AppState, message: String) {
         if let Some(last) = app_state.logs.last_mut() {
             *last = line;
         }
+        app_state.log_rewrites += 1;
         return;
     }
     app_state.logs.push(format!("{stamp} {message}"));
+    app_state.log_end_seq += 1;
     app_state.last_log_message = Some(message);
     app_state.last_log_repeats = 1;
     if app_state.logs.len() > MAX_LOG_ENTRIES {
@@ -2329,22 +2472,14 @@ fn handle_worker_result(result: WorkerResult) {
                 app_state.repository_items_loading = false;
                 let rerun = app_state.repository_items_refresh_pending;
                 app_state.repository_items_refresh_pending = false;
-                let prefetch_sort_details = match app_state.monitor_view_mode {
-                    MonitorViewMode::Overview => {
-                        app_state.overview_sort_mode == MonitorSortMode::RecentActivity
-                    }
-                    MonitorViewMode::Git => {
-                        app_state.git_sort_mode == MonitorSortMode::RecentActivity
-                    }
-                    MonitorViewMode::Checks => {
-                        app_state.checks_sort_mode == MonitorSortMode::RecentActivity
-                    }
-                    MonitorViewMode::Manifest => {
-                        app_state.manifest_sort_mode == MonitorSortMode::RecentActivity
-                    }
-                };
+                let prefetch_sort_details = app_state
+                    .monitor_settings
+                    .view(app_state.monitor_view_mode)
+                    .sort
+                    == MonitorSortMode::RecentActivity;
                 (rerun, prefetch_sort_details, changed_mid_scan)
             };
+            reload_capability_registry();
             if changed_mid_scan {
                 schedule_pending_local_rescans();
             }
@@ -2578,8 +2713,9 @@ fn handle_worker_result(result: WorkerResult) {
                 Err(message) => format!("Capability checks failed: {message}"),
             };
             append_log(message);
-            // The registry is re-read on refresh; only the checked repos'
-            // working trees may have changed (e.g. build outputs).
+            reload_capability_registry();
+            // Only the checked repos' working trees may have changed (e.g.
+            // build outputs).
             for repo_id in repo_ids {
                 invalidate_repo_details(&repo_id);
                 if let Some(item) = repository_item_from_state(&repo_id) {
@@ -2695,6 +2831,7 @@ fn refresh_views_now() {
     refresh_overview_views(&snapshot);
     refresh_workspace_settings_views(&snapshot);
     refresh_operation_views(&snapshot);
+    refresh_operation_buttons();
 }
 
 fn refresh_repository_views(snapshot: &StateSnapshot) {
@@ -2704,10 +2841,7 @@ fn refresh_repository_views(snapshot: &StateSnapshot) {
             let Some(list) = handle.list.upgrade() else {
                 return false;
             };
-            let Some(scroller) = handle.scroller.upgrade() else {
-                return false;
-            };
-            refresh_repository_view_handle(handle, &list, &scroller, &snapshot);
+            refresh_repository_view_handle(handle, &list, snapshot);
             true
         });
     });
@@ -2716,69 +2850,50 @@ fn refresh_repository_views(snapshot: &StateSnapshot) {
 fn refresh_overview_views(snapshot: &StateSnapshot) {
     MONOREPO_OVERVIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|handle| match handle.root.upgrade() {
-            Some(root) => {
-                render_monorepo_overview_into(&root, &snapshot, handle.host_ptr as *const _);
-                true
+        views.retain(|view| {
+            let Some(root) = view.root.upgrade() else {
+                return false;
+            };
+            if root.is_mapped() {
+                render_monorepo_overview(view, snapshot);
+            } else {
+                view.stale.set(true);
             }
-            None => false,
+            true
         });
     });
 
-    COMMIT_CHECK_VIEWS.with(|views| {
-        let mut views = views.borrow_mut();
-        views.retain(|handle| match handle.root.upgrade() {
-            Some(root) => {
-                render_commit_check_into(&root, &snapshot);
-                true
-            }
-            None => false,
-        });
-    });
+    sync_commit_check_views(snapshot);
 
     REPO_OVERVIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|handle| {
-            let Some(summary_root) = handle.summary_root.upgrade() else {
+        views.retain(|view| {
+            if view.stack.upgrade().is_none() {
                 return false;
-            };
-            let Some(git_root) = handle.git_root.upgrade() else {
-                return false;
-            };
-            let Some(manifest_root) = handle.manifest_root.upgrade() else {
-                return false;
-            };
-            let Some(activity_root) = handle.activity_root.upgrade() else {
-                return false;
-            };
-
-            render_repo_overview_pages(
-                &summary_root,
-                &git_root,
-                &manifest_root,
-                &activity_root,
-                &snapshot,
-                handle.instance_key.as_deref(),
-                handle.host_ptr as *const _,
-            );
-            if let Some(panel) = handle.terminal_root.upgrade() {
-                sync_repo_terminal_panel(&panel, &snapshot, handle.instance_key.as_deref());
             }
+            view.stale
+                .borrow_mut()
+                .extend(RepoOverviewPage::ALL.iter().copied());
+            render_visible_repo_overview_page(view, snapshot);
+            sync_repo_terminal_panel(&view.terminal_root, snapshot, view.instance_key.as_deref());
             true
         });
     });
 }
 
 fn refresh_commit_check_views_now() {
-    let snapshot = snapshot();
+    sync_commit_check_views(&snapshot());
+}
+
+fn sync_commit_check_views(snapshot: &StateSnapshot) {
     COMMIT_CHECK_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|handle| match handle.root.upgrade() {
-            Some(root) => {
-                render_commit_check_into(&root, &snapshot);
-                true
+        views.retain(|handle| {
+            if handle.root.upgrade().is_none() {
+                return false;
             }
-            None => false,
+            sync_commit_check_editor(&handle.editor, snapshot, false);
+            true
         });
     });
 }
@@ -2786,39 +2901,55 @@ fn refresh_commit_check_views_now() {
 fn refresh_workspace_settings_views(snapshot: &StateSnapshot) {
     FUCINA_POLICY_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|handle| match handle.root.upgrade() {
-            Some(root) => {
-                render_workspace_settings_into(&root, &snapshot, handle.host_ptr as *const _);
-                true
+        views.retain(|handle| {
+            if handle.root.upgrade().is_none() {
+                return false;
             }
-            None => false,
+            sync_fucina_policy_view(handle, snapshot);
+            true
         });
     });
 }
 
 fn refresh_operation_views(snapshot: &StateSnapshot) {
+    refresh_operation_log_views(snapshot.log_cursor, &snapshot.logs);
+}
+
+/// Brings every Operations view up to `cursor`, editing only the changed
+/// lines of each buffer.
+fn refresh_operation_log_views(cursor: LogCursor, logs: &[String]) {
+    let mut changed = false;
     OPERATION_BUFFERS.with(|buffers| {
         let mut buffers = buffers.borrow_mut();
-        buffers.retain(|buffer_ref| match buffer_ref.upgrade() {
+        buffers.retain(|handle| match handle.buffer.upgrade() {
             Some(buffer) => {
-                buffer.set_text(&snapshot.logs.join("\n"));
+                changed |= sync_operation_buffer(handle, &buffer, cursor, logs);
                 true
             }
             None => false,
         });
     });
 
-    OPERATION_SUMMARIES.with(|labels| {
-        let mut labels = labels.borrow_mut();
-        labels.retain(|label_ref| match label_ref.upgrade() {
-            Some(label) => {
-                label.set_text(&operation_summary_text(&snapshot.logs));
-                true
-            }
-            None => false,
+    let summary_stale = OPERATION_SUMMARY_CURSOR.with(|shown| shown.replace(Some(cursor)))
+        != Some(cursor)
+        || runtime_profile_enabled();
+    if summary_stale {
+        let text = operation_summary_text(logs);
+        OPERATION_SUMMARIES.with(|labels| {
+            let mut labels = labels.borrow_mut();
+            labels.retain(|label_ref| match label_ref.upgrade() {
+                Some(label) => {
+                    label.set_text(&text);
+                    true
+                }
+                None => false,
+            });
         });
-    });
+    }
 
+    if !changed {
+        return;
+    }
     OPERATION_FOLLOWERS.with(|followers| {
         let mut followers = followers.borrow_mut();
         followers.retain(|handle| {
@@ -2842,10 +2973,113 @@ fn refresh_operation_views(snapshot: &StateSnapshot) {
     });
 }
 
+fn log_cursor(app_state: &AppState) -> LogCursor {
+    LogCursor {
+        first_seq: app_state
+            .log_end_seq
+            .saturating_sub(app_state.logs.len() as u64),
+        end_seq: app_state.log_end_seq,
+        rewrites: app_state.log_rewrites,
+    }
+}
+
+fn log_view_edit(shown: LogCursor, current: LogCursor) -> LogViewEdit {
+    if shown == current {
+        return LogViewEdit::Unchanged;
+    }
+    if current.first_seq < shown.first_seq || current.end_seq < shown.end_seq {
+        return LogViewEdit::Reset;
+    }
+    // Only the newest line is ever rewritten, so a rewrite since `shown`
+    // touched at most the last shown entry.
+    let replace_from = if shown.rewrites == current.rewrites {
+        shown.end_seq
+    } else {
+        shown.end_seq.saturating_sub(1)
+    };
+    if replace_from < current.first_seq || replace_from < shown.first_seq {
+        return LogViewEdit::Reset;
+    }
+    LogViewEdit::Update {
+        drop_front: (current.first_seq - shown.first_seq) as usize,
+        keep: (replace_from - current.first_seq) as usize,
+    }
+}
+
+fn log_entry_line_count(entry: &str) -> usize {
+    entry.matches('\n').count() + 1
+}
+
+/// Returns whether the buffer text changed.
+fn sync_operation_buffer(
+    handle: &OperationBufferHandle,
+    buffer: &TextBuffer,
+    cursor: LogCursor,
+    logs: &[String],
+) -> bool {
+    let edit = log_view_edit(handle.shown.get(), cursor);
+    let mut line_counts = handle.line_counts.borrow_mut();
+    let (drop_front, keep) = match edit {
+        LogViewEdit::Unchanged => return false,
+        LogViewEdit::Update { drop_front, keep } if drop_front <= line_counts.len() => {
+            (drop_front, keep)
+        }
+        _ => {
+            buffer.set_text(&logs.join("\n"));
+            *line_counts = logs
+                .iter()
+                .map(|entry| log_entry_line_count(entry))
+                .collect();
+            handle.shown.set(cursor);
+            return true;
+        }
+    };
+
+    let dropped_lines = line_counts.drain(..drop_front).sum::<usize>();
+    if dropped_lines > 0 {
+        let mut start = buffer.start_iter();
+        let mut end = buffer
+            .iter_at_line(dropped_lines as i32)
+            .unwrap_or_else(|| buffer.end_iter());
+        buffer.delete(&mut start, &mut end);
+    }
+
+    line_counts.truncate(keep);
+    let kept_lines = line_counts.iter().sum::<usize>();
+    let mut cut = if kept_lines == 0 {
+        buffer.start_iter()
+    } else {
+        let mut line_end = buffer
+            .iter_at_line(kept_lines as i32 - 1)
+            .unwrap_or_else(|| buffer.end_iter());
+        if !line_end.ends_line() {
+            line_end.forward_to_line_end();
+        }
+        line_end
+    };
+    let mut end = buffer.end_iter();
+    buffer.delete(&mut cut, &mut end);
+
+    let appended = &logs[keep.min(logs.len())..];
+    if !appended.is_empty() {
+        let mut text = appended.join("\n");
+        if kept_lines > 0 {
+            text.insert(0, '\n');
+        }
+        buffer.insert(&mut buffer.end_iter(), &text);
+        line_counts.extend(appended.iter().map(|entry| log_entry_line_count(entry)));
+    }
+    handle.shown.set(cursor);
+    true
+}
+
 fn refresh_log_surfaces() {
     let _timed = diag::timed("refresh-log-surfaces");
-    let snapshot = snapshot();
-    refresh_operation_views(&snapshot);
+    let (cursor, logs) = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        (log_cursor(&app_state), app_state.logs.clone())
+    };
+    refresh_operation_log_views(cursor, &logs);
 }
 
 fn adjustment_bottom_value(adjustment: &gtk::Adjustment) -> f64 {
@@ -2954,27 +3188,17 @@ struct StateSnapshot {
     repo_details_loading: HashSet<String>,
     monitor_filter: String,
     monitor_view_mode: MonitorViewMode,
-    overview_filter_mode: MonitorFilterMode,
-    git_filter_mode: MonitorFilterMode,
-    checks_filter_mode: MonitorFilterMode,
-    manifest_filter_mode: MonitorFilterMode,
-    overview_sort_mode: MonitorSortMode,
-    git_sort_mode: MonitorSortMode,
-    checks_sort_mode: MonitorSortMode,
-    manifest_sort_mode: MonitorSortMode,
-    overview_sort_descending: bool,
-    git_sort_descending: bool,
-    checks_sort_descending: bool,
-    manifest_sort_descending: bool,
+    monitor_settings: MonitorSettings,
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
+    log_cursor: LogCursor,
     history_report: Vec<String>,
     history_report_loading: bool,
     line_stats_report: Vec<String>,
     line_stats_loading: bool,
     line_stats_since: String,
-    capability_registry: CapabilityRegistry,
+    capability_registry: Arc<CapabilityRegistry>,
 }
 
 fn snapshot() -> StateSnapshot {
@@ -2989,46 +3213,76 @@ fn snapshot() -> StateSnapshot {
         repo_details_loading: app_state.repo_details_loading.clone(),
         monitor_filter: app_state.monitor_filter.clone(),
         monitor_view_mode: app_state.monitor_view_mode,
-        overview_filter_mode: app_state.overview_filter_mode,
-        git_filter_mode: app_state.git_filter_mode,
-        checks_filter_mode: app_state.checks_filter_mode,
-        manifest_filter_mode: app_state.manifest_filter_mode,
-        overview_sort_mode: app_state.overview_sort_mode,
-        git_sort_mode: app_state.git_sort_mode,
-        checks_sort_mode: app_state.checks_sort_mode,
-        manifest_sort_mode: app_state.manifest_sort_mode,
-        overview_sort_descending: app_state.overview_sort_descending,
-        git_sort_descending: app_state.git_sort_descending,
-        checks_sort_descending: app_state.checks_sort_descending,
-        manifest_sort_descending: app_state.manifest_sort_descending,
+        monitor_settings: app_state.monitor_settings,
         selected_repo_ids: app_state.selected_repo_ids.clone(),
         active_repo_id: app_state.active_repo_id.clone(),
         logs: app_state.logs.clone(),
+        log_cursor: log_cursor(&app_state),
         history_report: app_state.history_report.clone(),
         history_report_loading: app_state.history_report_loading,
         line_stats_report: app_state.line_stats_report.clone(),
         line_stats_loading: app_state.line_stats_loading,
         line_stats_since: app_state.line_stats_since.clone(),
-        capability_registry: load_capability_registry(&default_capability_registry_path(
-            &app_state.workspace_root,
-        ))
-        .unwrap_or_default(),
+        capability_registry: Arc::clone(&app_state.capability_registry),
     }
 }
 
 fn refresh_repository_view_handle(
     handle: &RepositoryViewHandle,
     list: &ListBox,
-    _scroller: &ScrolledWindow,
     snapshot: &StateSnapshot,
 ) {
-    sync_repository_monitor_store(&handle.store, &all_monitor_items(snapshot));
-    handle.filter.changed(FilterChange::Different);
-    handle.sorter.changed(SorterChange::Different);
-    sync_repository_monitor_selection(list, &snapshot.selected_repo_ids);
+    let query = monitor_query(snapshot);
+    let (filter_changed, sort_changed) = {
+        let mut current = handle.query.borrow_mut();
+        let filter_changed =
+            current.filter_mode != query.filter_mode || current.filter_text != query.filter_text;
+        let sort_changed =
+            current.sort_mode != query.sort_mode || current.descending != query.descending;
+        *current = query;
+        (filter_changed, sort_changed)
+    };
 
-    let filtered_items = visible_monitor_items(snapshot);
-    update_repository_monitor_empty_state(list, snapshot, filtered_items.is_empty());
+    let next_rows = monitor_rows(snapshot);
+    let update = monitor_store_update(&handle.rows.borrow(), &next_rows);
+    match update {
+        MonitorStoreUpdate::Unchanged => {}
+        MonitorStoreUpdate::Positions(positions) => {
+            for position in positions {
+                handle.store.splice(
+                    position as u32,
+                    1,
+                    &[BoxedAnyObject::new(next_rows[position].clone())],
+                );
+            }
+        }
+        MonitorStoreUpdate::Replace => {
+            let objects = next_rows
+                .iter()
+                .cloned()
+                .map(BoxedAnyObject::new)
+                .collect::<Vec<_>>();
+            handle.store.splice(0, handle.store.n_items(), &objects);
+        }
+    }
+    *handle.rows.borrow_mut() = next_rows;
+
+    // Changed rows are re-filtered and re-sorted by the models themselves; a
+    // full pass is only needed when the criteria change.
+    if filter_changed {
+        handle.filter.changed(FilterChange::Different);
+    }
+    if sort_changed {
+        handle.sorter.changed(SorterChange::Different);
+    }
+    sync_monitor_controls(&handle.controls, snapshot);
+    sync_repository_monitor_selection(list, &snapshot.selected_repo_ids);
+    update_repository_monitor_empty_state(
+        handle,
+        list,
+        snapshot,
+        handle.filter_model.n_items() == 0,
+    );
 }
 
 fn status_label(state: &ronomepo_core::RepositoryState) -> &'static str {
@@ -3107,22 +3361,65 @@ fn branch_label(item: &RepositoryListItem) -> &str {
     item.status.branch.as_deref().unwrap_or("detached")
 }
 
-fn all_monitor_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
-    let mut items = vec![monorepo_monitor_item(snapshot)];
-    items.extend(repository_items(snapshot));
-    items
+/// The view, filter and sort controls of a repository monitor.
+struct MonitorControls {
+    syncing: Rc<Cell<bool>>,
+    view_buttons: Vec<(MonitorViewMode, ToggleButton)>,
+    filter_buttons: Vec<(MonitorViewMode, MonitorFilterMode, ToggleButton)>,
+    sort_dropdowns: Vec<(MonitorViewMode, DropDown)>,
+    sort_direction: Rc<Cell<bool>>,
+    sort_direction_label: Label,
+    /// Filter, sort and column-header stacks, each with one page per view.
+    stacks: [Stack; 3],
 }
 
-fn sync_repository_monitor_store(store: &gio::ListStore, next_items: &[RepositoryListItem]) {
-    let boxed_items = next_items
-        .iter()
-        .cloned()
-        .map(BoxedAnyObject::new)
-        .collect::<Vec<_>>();
-    store.splice(0, store.n_items(), &boxed_items);
+/// Mirrors the monitor settings into the controls, which only follow local
+/// clicks otherwise (another monitor view may have changed them).
+fn sync_monitor_controls(controls: &MonitorControls, snapshot: &StateSnapshot) {
+    controls.syncing.set(true);
+    let active_view = snapshot.monitor_view_mode;
+    for (view, button) in &controls.view_buttons {
+        if *view == active_view && !button.is_active() {
+            button.set_active(true);
+        }
+    }
+    let view_key = monitor_view_mode_key(active_view);
+    for stack in &controls.stacks {
+        if stack.visible_child_name().as_deref() != Some(view_key) {
+            stack.set_visible_child_name(view_key);
+        }
+    }
+    for (view, filter_mode, button) in &controls.filter_buttons {
+        if snapshot.monitor_settings.view(*view).filter == *filter_mode && !button.is_active() {
+            button.set_active(true);
+        }
+    }
+    for (view, dropdown) in &controls.sort_dropdowns {
+        let index = monitor_sort_mode_index(*view, snapshot.monitor_settings.view(*view).sort);
+        if dropdown.selected() != index {
+            dropdown.set_selected(index);
+        }
+    }
+    let descending = active_monitor_settings(snapshot).descending;
+    if controls.sort_direction.get() != descending {
+        controls.sort_direction.set(descending);
+        controls
+            .sort_direction_label
+            .set_text(monitor_sort_direction_label(descending));
+    }
+    controls.syncing.set(false);
 }
 
-fn update_repository_monitor_empty_state(list: &ListBox, snapshot: &StateSnapshot, is_empty: bool) {
+fn update_repository_monitor_empty_state(
+    handle: &RepositoryViewHandle,
+    list: &ListBox,
+    snapshot: &StateSnapshot,
+    is_empty: bool,
+) {
+    let next = is_empty.then_some(snapshot.manifest.is_some());
+    if handle.placeholder_for_manifest.replace(next) == next {
+        return;
+    }
     if is_empty {
         list.add_css_class("repo-monitor-empty");
         list.set_placeholder(Some(&repository_monitor_empty_placeholder(snapshot)));
@@ -3192,43 +3489,152 @@ fn repo_id_from_list_box_row(row: &ListBoxRow) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
-fn repo_item_from_object(object: &glib::Object) -> Option<RepositoryListItem> {
+fn with_monitor_row<T>(object: &glib::Object, read: impl FnOnce(&MonitorRow) -> T) -> Option<T> {
     object
         .downcast_ref::<BoxedAnyObject>()
-        .map(|boxed| boxed.borrow::<RepositoryListItem>().clone())
+        .map(|boxed| read(&boxed.borrow::<MonitorRow>()))
 }
 
-fn repo_monitor_filter_matches(item: &RepositoryListItem, snapshot: &StateSnapshot) -> bool {
-    if !matches_filter_mode(item, active_monitor_filter_mode(snapshot), snapshot) {
-        return false;
+/// One repository monitor row: the item plus every derived value the row
+/// widgets, filter and sorter read, computed once per refresh. Rows whose
+/// inputs did not change compare equal and keep their widgets.
+#[derive(Clone, Debug, PartialEq)]
+struct MonitorRow {
+    item: RepositoryListItem,
+    view_mode: MonitorViewMode,
+    name_key: String,
+    attention_signals: Vec<AttentionSignal>,
+    attention_rank: u8,
+    capability: CapabilityMonitorSummary,
+    enabled: Option<bool>,
+    last_commit_epoch_secs: i64,
+    /// Lowercased searchable fields, separated so a filter cannot match
+    /// across two of them.
+    search_text: String,
+}
+
+/// Filter and sort settings applied by the monitor list models.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MonitorQuery {
+    filter_mode: MonitorFilterMode,
+    /// Trimmed and lowercased; empty matches everything.
+    filter_text: String,
+    sort_mode: MonitorSortMode,
+    descending: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MonitorStoreUpdate {
+    Unchanged,
+    /// Same rows in the same order; only these positions changed.
+    Positions(Vec<usize>),
+    Replace,
+}
+
+fn monitor_query(snapshot: &StateSnapshot) -> MonitorQuery {
+    let settings = active_monitor_settings(snapshot);
+    MonitorQuery {
+        filter_mode: settings.filter,
+        filter_text: snapshot.monitor_filter.trim().to_ascii_lowercase(),
+        sort_mode: settings.sort,
+        descending: settings.descending,
     }
-    let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
-    if filter.is_empty() {
-        return true;
+}
+
+fn monitor_rows(snapshot: &StateSnapshot) -> Vec<MonitorRow> {
+    std::iter::once(monorepo_monitor_item(snapshot))
+        .chain(snapshot.repository_items.iter().cloned())
+        .map(|item| {
+            let enabled = workspace_repo_enabled(snapshot, &item);
+            let last_commit_epoch_secs = snapshot
+                .repo_details_cache
+                .get(&item.id)
+                .and_then(|details| details.last_commit.as_ref())
+                .map(|commit| commit.committed_at_epoch_secs)
+                .unwrap_or(i64::MIN);
+            build_monitor_row(
+                item,
+                snapshot.monitor_view_mode,
+                &snapshot.capability_registry,
+                enabled,
+                last_commit_epoch_secs,
+            )
+        })
+        .collect()
+}
+
+fn build_monitor_row(
+    item: RepositoryListItem,
+    view_mode: MonitorViewMode,
+    registry: &CapabilityRegistry,
+    enabled: Option<bool>,
+    last_commit_epoch_secs: i64,
+) -> MonitorRow {
+    let attention_signals = derive_attention_signals(&item, None, registry);
+    let attention_rank = attention_signals_rank(&attention_signals);
+    let capability = capability_monitor_summary(&item, registry);
+    let search_text = [
+        item.name.as_str(),
+        item.dir_name.as_str(),
+        item.remote_url.as_str(),
+        branch_label(&item),
+        &format_sync_label(&item.status.sync),
+        status_label(&item.status.state),
+        manifest_presence_search_text(item.repo_manifest.as_ref()),
+        &capability_monitor_search_text(&capability),
+        &attention_monitor_search_text(&attention_signals),
+    ]
+    .join("\u{1f}")
+    .to_ascii_lowercase();
+    MonitorRow {
+        name_key: item.name.to_ascii_lowercase(),
+        item,
+        view_mode,
+        attention_signals,
+        attention_rank,
+        capability,
+        enabled,
+        last_commit_epoch_secs,
+        search_text,
     }
-    let branch = branch_label(item).to_ascii_lowercase();
-    let sync = format_sync_label(&item.status.sync).to_ascii_lowercase();
-    let state = status_label(&item.status.state).to_ascii_lowercase();
-    let manifest = manifest_presence_search_text(item.repo_manifest.as_ref()).to_ascii_lowercase();
-    let capability = capability_monitor_search_text(item, snapshot).to_ascii_lowercase();
-    let attention =
-        attention_monitor_search_text(&repo_attention_signals(snapshot, item)).to_ascii_lowercase();
-    item.name.to_ascii_lowercase().contains(&filter)
-        || item.dir_name.to_ascii_lowercase().contains(&filter)
-        || item.remote_url.to_ascii_lowercase().contains(&filter)
-        || branch.contains(&filter)
-        || sync.contains(&filter)
-        || state.contains(&filter)
-        || manifest.contains(&filter)
-        || capability.contains(&filter)
-        || attention.contains(&filter)
+}
+
+fn monitor_store_update(current: &[MonitorRow], next: &[MonitorRow]) -> MonitorStoreUpdate {
+    if current.len() != next.len()
+        || current
+            .iter()
+            .zip(next)
+            .any(|(current, next)| current.item.id != next.item.id)
+    {
+        return MonitorStoreUpdate::Replace;
+    }
+    let changed = current
+        .iter()
+        .zip(next)
+        .enumerate()
+        .filter(|(_, (current, next))| current != next)
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    if changed.is_empty() {
+        MonitorStoreUpdate::Unchanged
+    } else if changed.len() * 2 > next.len() {
+        // One splice rebuilds everything at once instead of re-sorting per row.
+        MonitorStoreUpdate::Replace
+    } else {
+        MonitorStoreUpdate::Positions(changed)
+    }
+}
+
+fn monitor_row_matches(row: &MonitorRow, query: &MonitorQuery) -> bool {
+    monitor_row_matches_mode(row, query.filter_mode)
+        && (query.filter_text.is_empty() || row.search_text.contains(&query.filter_text))
 }
 
 fn build_repo_monitor_row(
-    item: &RepositoryListItem,
+    row: &MonitorRow,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> GtkBox {
-    let current_snapshot = snapshot();
+    let item = &row.item;
     let content = GtkBox::new(Orientation::Horizontal, 10);
     mark_clickable(&content);
     content.set_margin_top(8);
@@ -3244,11 +3650,11 @@ fn build_repo_monitor_row(
     )));
 
     append_monitor_name_cell(&content, item);
-    match current_snapshot.monitor_view_mode {
+    match row.view_mode {
         MonitorViewMode::Overview => {
             content.append(&monitor_state_cell(&item.status.state));
             content.append(&monitor_sync_cell(&item.status.sync));
-            content.append(&monitor_attention_cell(&current_snapshot, item));
+            content.append(&monitor_attention_cell(&row.attention_signals));
         }
         MonitorViewMode::Git => {
             content.append(&monitor_text_cell(
@@ -3262,13 +3668,13 @@ fn build_repo_monitor_row(
         }
         MonitorViewMode::Checks => {
             content.append(&monitor_manifest_cell(item.repo_manifest.as_ref()));
-            content.append(&monitor_capability_cell(item, &current_snapshot));
-            content.append(&monitor_attention_cell(&current_snapshot, item));
+            content.append(&monitor_capability_cell(&row.capability));
+            content.append(&monitor_attention_cell(&row.attention_signals));
         }
         MonitorViewMode::Manifest => {
             content.append(&monitor_manifest_cell(item.repo_manifest.as_ref()));
             content.append(&monitor_manifest_actions_cell(item));
-            content.append(&monitor_enabled_cell(&current_snapshot, item));
+            content.append(&monitor_enabled_cell(row.enabled));
             content.append(&monitor_text_cell(
                 &item.remote_url,
                 MONITOR_BRANCH_COL_CHARS,
@@ -3279,6 +3685,18 @@ fn build_repo_monitor_row(
     }
     attach_repo_monitor_context_menu(&content, host_ptr);
     content
+}
+
+fn build_repo_monitor_list_row(
+    row: &MonitorRow,
+    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
+) -> ListBoxRow {
+    let list_row = ListBoxRow::new();
+    list_row.set_child(Some(&build_repo_monitor_row(row, host_ptr)));
+    // Selection only ever targets repositories, so the monorepo row would be
+    // deselected again on the next refresh.
+    list_row.set_selectable(row.item.id != MONOREPO_ROW_ID);
+    list_row
 }
 
 fn append_monitor_name_cell(row: &GtkBox, item: &RepositoryListItem) {
@@ -3307,55 +3725,8 @@ fn monorepo_monitor_item(snapshot: &StateSnapshot) -> RepositoryListItem {
     }
 }
 
-fn visible_monitor_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
-    filtered_repository_items(snapshot, all_monitor_items(snapshot))
-}
-
-fn active_monitor_filter_mode(snapshot: &StateSnapshot) -> MonitorFilterMode {
-    match snapshot.monitor_view_mode {
-        MonitorViewMode::Overview => snapshot.overview_filter_mode,
-        MonitorViewMode::Git => snapshot.git_filter_mode,
-        MonitorViewMode::Checks => snapshot.checks_filter_mode,
-        MonitorViewMode::Manifest => snapshot.manifest_filter_mode,
-    }
-}
-
-fn active_monitor_sort_mode(snapshot: &StateSnapshot) -> MonitorSortMode {
-    match snapshot.monitor_view_mode {
-        MonitorViewMode::Overview => snapshot.overview_sort_mode,
-        MonitorViewMode::Git => snapshot.git_sort_mode,
-        MonitorViewMode::Checks => snapshot.checks_sort_mode,
-        MonitorViewMode::Manifest => snapshot.manifest_sort_mode,
-    }
-}
-
-fn active_monitor_sort_descending(snapshot: &StateSnapshot) -> bool {
-    match snapshot.monitor_view_mode {
-        MonitorViewMode::Overview => snapshot.overview_sort_descending,
-        MonitorViewMode::Git => snapshot.git_sort_descending,
-        MonitorViewMode::Checks => snapshot.checks_sort_descending,
-        MonitorViewMode::Manifest => snapshot.manifest_sort_descending,
-    }
-}
-
-fn filtered_repository_items(
-    snapshot: &StateSnapshot,
-    mut items: Vec<RepositoryListItem>,
-) -> Vec<RepositoryListItem> {
-    items.sort_by(|left, right| repo_monitor_sort_cmp(snapshot, left, right));
-
-    let mode = active_monitor_filter_mode(snapshot);
-    items.retain(|item| matches_filter_mode(item, mode, snapshot));
-
-    let filter = snapshot.monitor_filter.trim().to_ascii_lowercase();
-    if filter.is_empty() {
-        return items;
-    }
-
-    items
-        .into_iter()
-        .filter(|item| repo_monitor_filter_matches(item, snapshot))
-        .collect()
+fn active_monitor_settings(snapshot: &StateSnapshot) -> MonitorViewSettings {
+    *snapshot.monitor_settings.view(snapshot.monitor_view_mode)
 }
 
 fn repo_monitor_sort_key(item: &RepositoryListItem) -> (u8, String) {
@@ -3508,101 +3879,57 @@ fn monitor_sort_direction_label(descending: bool) -> &'static str {
     }
 }
 
-fn repo_monitor_sort_cmp(
-    snapshot: &StateSnapshot,
-    left: &RepositoryListItem,
-    right: &RepositoryListItem,
+fn monitor_row_cmp(
+    query: &MonitorQuery,
+    left: &MonitorRow,
+    right: &MonitorRow,
 ) -> std::cmp::Ordering {
     let monorepo_rank =
-        u8::from(left.id == MONOREPO_ROW_ID).cmp(&u8::from(right.id == MONOREPO_ROW_ID));
+        u8::from(left.item.id == MONOREPO_ROW_ID).cmp(&u8::from(right.item.id == MONOREPO_ROW_ID));
     if monorepo_rank != std::cmp::Ordering::Equal {
         return monorepo_rank;
     }
 
-    let ordering = match active_monitor_sort_mode(snapshot) {
-        MonitorSortMode::Name => left
-            .name
+    let by_name = || left.name_key.cmp(&right.name_key);
+    let ordering = match query.sort_mode {
+        MonitorSortMode::Name => by_name(),
+        MonitorSortMode::Branch => branch_label(&left.item)
             .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase()),
-        MonitorSortMode::Branch => branch_label(left)
-            .to_ascii_lowercase()
-            .cmp(&branch_label(right).to_ascii_lowercase())
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            }),
+            .cmp(&branch_label(&right.item).to_ascii_lowercase())
+            .then_with(by_name),
         MonitorSortMode::SyncState => {
-            repo_sync_state_sort_key(left).cmp(&repo_sync_state_sort_key(right))
+            repo_sync_state_sort_key(&left.item).cmp(&repo_sync_state_sort_key(&right.item))
         }
-        MonitorSortMode::RecentActivity => repo_last_activity_sort_key(snapshot, left)
-            .cmp(&repo_last_activity_sort_key(snapshot, right))
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            }),
-        MonitorSortMode::Attention => repo_attention_rank(snapshot, left)
-            .cmp(&repo_attention_rank(snapshot, right))
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            }),
-        MonitorSortMode::CheckState => capability_sort_key(snapshot, left)
-            .cmp(&capability_sort_key(snapshot, right))
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            }),
-        MonitorSortMode::Manifest => manifest_sort_key(left)
-            .cmp(&manifest_sort_key(right))
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            }),
-        MonitorSortMode::Actions => manifest_action_count_sort_key(left)
-            .cmp(&manifest_action_count_sort_key(right))
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            }),
+        MonitorSortMode::RecentActivity => (left.last_commit_epoch_secs, left.attention_rank)
+            .cmp(&(right.last_commit_epoch_secs, right.attention_rank))
+            .then_with(by_name),
+        MonitorSortMode::Attention => left
+            .attention_rank
+            .cmp(&right.attention_rank)
+            .then_with(by_name),
+        MonitorSortMode::CheckState => capability_sort_key(&left.capability)
+            .cmp(&capability_sort_key(&right.capability))
+            .then_with(by_name),
+        MonitorSortMode::Manifest => manifest_sort_key(&left.item)
+            .cmp(&manifest_sort_key(&right.item))
+            .then_with(by_name),
+        MonitorSortMode::Actions => manifest_action_count_sort_key(&left.item)
+            .cmp(&manifest_action_count_sort_key(&right.item))
+            .then_with(by_name),
     };
 
-    if active_monitor_sort_descending(snapshot) {
+    if query.descending {
         ordering.reverse()
     } else {
         ordering
     }
 }
 
-fn repo_last_activity_sort_key(
-    snapshot: &StateSnapshot,
-    item: &RepositoryListItem,
-) -> (i64, u8, String) {
-    let committed_at_epoch_secs = snapshot
-        .repo_details_cache
-        .get(&item.id)
-        .and_then(|details| details.last_commit.as_ref())
-        .map(|commit| commit.committed_at_epoch_secs)
-        .unwrap_or(i64::MIN);
-    (
-        committed_at_epoch_secs,
-        repo_attention_rank(snapshot, item),
-        item.name.to_ascii_lowercase(),
-    )
-}
-
-fn matches_filter_mode(
-    item: &RepositoryListItem,
-    mode: MonitorFilterMode,
-    snapshot: &StateSnapshot,
-) -> bool {
+fn monitor_row_matches_mode(row: &MonitorRow, mode: MonitorFilterMode) -> bool {
     use ronomepo_core::{RepositoryState, RepositorySync};
 
+    let item = &row.item;
+    let summary = &row.capability;
     match mode {
         MonitorFilterMode::All => true,
         MonitorFilterMode::Dirty => {
@@ -3624,12 +3951,11 @@ fn matches_filter_mode(
                     RepositorySync::UpToDate | RepositorySync::NoUpstream
                 )
         }
-        MonitorFilterMode::Issues => !repo_attention_signals(snapshot, item).is_empty(),
-        MonitorFilterMode::NeedsAttention => repo_attention_rank(snapshot, item) <= 2,
-        MonitorFilterMode::Healthy => repo_attention_signals(snapshot, item).is_empty(),
-        MonitorFilterMode::Due => repo_needs_capability_attention(snapshot, item),
+        MonitorFilterMode::Issues => !row.attention_signals.is_empty(),
+        MonitorFilterMode::NeedsAttention => row.attention_rank <= 2,
+        MonitorFilterMode::Healthy => row.attention_signals.is_empty(),
+        MonitorFilterMode::Due => capability_summary_needs_attention(summary),
         MonitorFilterMode::Failing => {
-            let summary = capability_monitor_summary(item, snapshot);
             summary.policy_issues > 0
                 || summary.unsupported > 0
                 || summary.error > 0
@@ -3644,22 +3970,24 @@ fn matches_filter_mode(
                 )
         }
         MonitorFilterMode::NoChecks => {
-            let summary = capability_monitor_summary(item, snapshot);
             item.id != MONOREPO_ROW_ID && summary.declared == 0 && summary.stored == 0
         }
-        MonitorFilterMode::Enabled => workspace_repo_enabled(snapshot, item) == Some(true),
-        MonitorFilterMode::Disabled => workspace_repo_enabled(snapshot, item) == Some(false),
+        MonitorFilterMode::Enabled => row.enabled == Some(true),
+        MonitorFilterMode::Disabled => row.enabled == Some(false),
         MonitorFilterMode::HasActions => manifest_action_count(item) > 0,
     }
 }
 
 fn repo_attention_rank(snapshot: &StateSnapshot, item: &RepositoryListItem) -> u8 {
-    let signals = repo_attention_signals(snapshot, item);
+    attention_signals_rank(&repo_attention_signals(snapshot, item))
+}
+
+fn attention_signals_rank(signals: &[AttentionSignal]) -> u8 {
     if signals.is_empty() {
         return 7;
     }
 
-    match attention_rank(&signals) {
+    match attention_rank(signals) {
         0 => 0,
         1 => 1,
         2 => 3,
@@ -3678,8 +4006,7 @@ fn repo_sync_state_sort_key(item: &RepositoryListItem) -> (u8, usize, u8, String
     )
 }
 
-fn capability_sort_key(snapshot: &StateSnapshot, item: &RepositoryListItem) -> (u8, usize, String) {
-    let summary = capability_monitor_summary(item, snapshot);
+fn capability_sort_key(summary: &CapabilityMonitorSummary) -> (u8, usize) {
     let rank = if summary.policy_issues > 0 || summary.unsupported > 0 {
         0
     } else if summary.error > 0 {
@@ -3707,7 +4034,6 @@ fn capability_sort_key(snapshot: &StateSnapshot, item: &RepositoryListItem) -> (
                 .saturating_add(summary.stored)
                 .saturating_add(summary.policy_issues)
                 .saturating_add(summary.unsupported),
-        item.name.to_ascii_lowercase(),
     )
 }
 
@@ -3820,63 +4146,46 @@ extern "C" fn command_filter(
     })
 }
 
-fn update_monitor_filter_mode(mode: MonitorFilterMode) {
-    let view = {
+/// Applies `update` to the active view's settings and persists them.
+fn update_active_monitor_settings(update: impl FnOnce(&mut MonitorViewSettings)) {
+    let settings = {
         let mut app_state = state().lock().expect("state mutex poisoned");
-        match app_state.monitor_view_mode {
-            MonitorViewMode::Overview => app_state.overview_filter_mode = mode,
-            MonitorViewMode::Git => app_state.git_filter_mode = mode,
-            MonitorViewMode::Checks => app_state.checks_filter_mode = mode,
-            MonitorViewMode::Manifest => app_state.manifest_filter_mode = mode,
-        }
-        app_state.monitor_view_mode
+        let view = app_state.monitor_view_mode;
+        update(app_state.monitor_settings.view_mut(view));
+        app_state.monitor_settings
     };
-    persist_monitor_filter_mode(view, mode);
+    persist_plugin_config_direct(move |config| {
+        config.monitor_views = settings;
+    });
+}
+
+fn update_monitor_filter_mode(mode: MonitorFilterMode) {
+    update_active_monitor_settings(|settings| settings.filter = mode);
 }
 
 fn update_monitor_sort_mode(mode: MonitorSortMode) {
-    let view = {
-        let mut app_state = state().lock().expect("state mutex poisoned");
-        match app_state.monitor_view_mode {
-            MonitorViewMode::Overview => app_state.overview_sort_mode = mode,
-            MonitorViewMode::Git => app_state.git_sort_mode = mode,
-            MonitorViewMode::Checks => app_state.checks_sort_mode = mode,
-            MonitorViewMode::Manifest => app_state.manifest_sort_mode = mode,
-        }
-        app_state.monitor_view_mode
-    };
+    update_active_monitor_settings(|settings| settings.sort = mode);
     if mode == MonitorSortMode::RecentActivity {
         prefetch_monitor_sort_details();
     }
-    persist_monitor_sort_mode(view, mode);
 }
 
 fn update_monitor_sort_descending(descending: bool) {
-    let view = {
-        let mut app_state = state().lock().expect("state mutex poisoned");
-        match app_state.monitor_view_mode {
-            MonitorViewMode::Overview => app_state.overview_sort_descending = descending,
-            MonitorViewMode::Git => app_state.git_sort_descending = descending,
-            MonitorViewMode::Checks => app_state.checks_sort_descending = descending,
-            MonitorViewMode::Manifest => app_state.manifest_sort_descending = descending,
-        }
-        app_state.monitor_view_mode
-    };
-    persist_monitor_sort_descending(view, descending);
+    update_active_monitor_settings(|settings| settings.descending = descending);
 }
 
 fn update_monitor_view_mode(mode: MonitorViewMode) {
-    {
+    let sort_mode = {
         let mut app_state = state().lock().expect("state mutex poisoned");
         app_state.monitor_view_mode = mode;
-    }
-    if matches!(
-        active_monitor_sort_mode(&snapshot()),
-        MonitorSortMode::RecentActivity
-    ) {
+        app_state.monitor_settings.view(mode).sort
+    };
+    if sort_mode == MonitorSortMode::RecentActivity {
         prefetch_monitor_sort_details();
     }
-    persist_monitor_view_mode(mode);
+    persist_plugin_config_direct(move |config| {
+        config.monitor_view_mode = mode;
+    });
 }
 
 fn prefetch_monitor_sort_details() {
@@ -5142,41 +5451,106 @@ fn open_repo_overview_for_item(
 }
 
 fn attach_repo_monitor_context_menu(
-    relative_to: &impl IsA<gtk::Widget>,
+    anchor: &impl IsA<gtk::Widget>,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    let popover = build_repo_context_menu(relative_to, host_ptr);
+    // The menu is built when it opens and unparented once it closes: rows are
+    // replaced on refresh, and a popover parented to each of them would leak.
+    let open_menu: Rc<RefCell<Option<Popover>>> = Rc::default();
+    anchor.connect_unrealize({
+        let open_menu = Rc::clone(&open_menu);
+        move |_| close_repo_context_menu(&open_menu, None)
+    });
     let gesture = GestureClick::new();
     gesture.set_button(3);
-    gesture.connect_pressed({
-        let relative_to = relative_to.clone();
-        let popover = popover.clone();
-        move |_, _, x, y| {
-            if let Some(row) = relative_to.parent().and_downcast::<ListBoxRow>() {
-                if let Some(list) = row.parent().and_downcast::<ListBox>() {
-                    update_repo_context_selection(&list, &row);
-                    refresh_repo_context_menu(&popover, host_ptr);
-                }
+    gesture.connect_pressed(move |gesture, _, x, y| {
+        let Some(anchor) = gesture.widget() else {
+            return;
+        };
+        if let Some(row) = anchor.parent().and_downcast::<ListBoxRow>() {
+            if let Some(list) = row.parent().and_downcast::<ListBox>() {
+                update_repo_context_selection(&list, &row);
             }
-            popover.set_pointing_to(Some(&Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.popup();
         }
+        close_repo_context_menu(&open_menu, None);
+        let popover = build_repo_context_menu(&anchor, host_ptr);
+        popover.connect_closed({
+            let open_menu = Rc::clone(&open_menu);
+            move |popover| {
+                // Let the click that closed the menu finish dispatching first.
+                let open_menu = Rc::clone(&open_menu);
+                let popover = popover.clone();
+                glib::idle_add_local_once(move || {
+                    close_repo_context_menu(&open_menu, Some(&popover));
+                });
+            }
+        });
+        *open_menu.borrow_mut() = Some(popover.clone());
+        popover.set_pointing_to(Some(&Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.popup();
     });
-    relative_to.add_controller(gesture);
+    anchor.add_controller(gesture);
+}
+
+/// Pops down and unparents the open context menu; with `only`, only when that
+/// popover is still the open one.
+fn close_repo_context_menu(open_menu: &RefCell<Option<Popover>>, only: Option<&Popover>) {
+    let popover = {
+        let mut open_menu = open_menu.borrow_mut();
+        if only.is_some_and(|only| open_menu.as_ref() != Some(only)) {
+            return;
+        }
+        open_menu.take()
+    };
+    if let Some(popover) = popover {
+        popover.popdown();
+        if popover.parent().is_some() {
+            popover.unparent();
+        }
+    }
 }
 
 fn build_repo_context_menu(
-    relative_to: &impl IsA<gtk::Widget>,
+    anchor: &gtk::Widget,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> Popover {
     let popover = Popover::new();
     popover.set_autohide(true);
     popover.set_has_arrow(false);
     popover.set_position(PositionType::Bottom);
-    popover.set_parent(relative_to);
+    popover.set_parent(anchor);
 
-    refresh_repo_context_menu(&popover, host_ptr);
+    populate_repo_context_menu(&popover, host_ptr);
     popover
+}
+
+/// Returns a closure that pops `popover` down `delay` after the last call
+/// unless one of `hovered` is set by then. Calls restart one shared timeout
+/// instead of stacking a new one per pointer movement.
+fn hover_close_scheduler(
+    popover: &Popover,
+    delay: Duration,
+    hovered: [Rc<Cell<bool>>; 2],
+) -> Rc<dyn Fn()> {
+    let popover = popover.downgrade();
+    let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+    Rc::new(move || {
+        if let Some(source) = pending.borrow_mut().take() {
+            source.remove();
+        }
+        let popover = popover.clone();
+        let hovered = hovered.clone();
+        let pending_for_timeout = Rc::clone(&pending);
+        let source = glib::timeout_add_local_once(delay, move || {
+            pending_for_timeout.borrow_mut().take();
+            if hovered.iter().all(|hovered| !hovered.get()) {
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
+            }
+        });
+        *pending.borrow_mut() = Some(source);
+    })
 }
 
 fn attach_root_context_menu_close(
@@ -5216,7 +5590,7 @@ fn update_repo_context_selection(list: &ListBox, row: &ListBoxRow) {
     update_selected_repo_ids(selection_ids_from_list(list));
 }
 
-fn refresh_repo_context_menu(popover: &Popover, host_ptr: *const maruzzella_sdk::ffi::MzHostApi) {
+fn populate_repo_context_menu(popover: &Popover, host_ptr: *const maruzzella_sdk::ffi::MzHostApi) {
     let menu = GtkBox::new(Orientation::Vertical, 0);
     menu.set_margin_top(4);
     menu.set_margin_bottom(4);
@@ -5226,22 +5600,11 @@ fn refresh_repo_context_menu(popover: &Popover, host_ptr: *const maruzzella_sdk:
     let selection = selected_repository_items_from_state();
     let root_hovered = Rc::new(Cell::new(false));
     let child_hovered = Rc::new(Cell::new(false));
-    let schedule_close: Rc<dyn Fn()> = Rc::new({
-        let popover = popover.clone();
-        let root_hovered = Rc::clone(&root_hovered);
-        let child_hovered = Rc::clone(&child_hovered);
-        move || {
-            let popover = popover.clone();
-            let root_hovered = Rc::clone(&root_hovered);
-            let child_hovered = Rc::clone(&child_hovered);
-            glib::timeout_add_local(Duration::from_millis(140), move || {
-                if !root_hovered.get() && !child_hovered.get() {
-                    popover.popdown();
-                }
-                glib::ControlFlow::Break
-            });
-        }
-    });
+    let schedule_close = hover_close_scheduler(
+        popover,
+        Duration::from_millis(140),
+        [Rc::clone(&root_hovered), Rc::clone(&child_hovered)],
+    );
 
     let mut has_section = false;
     if append_repo_context_open_section(
@@ -5479,29 +5842,22 @@ fn append_context_submenu(
     let header_hovered = Rc::new(Cell::new(false));
     let submenu_hovered = Rc::new(Cell::new(false));
 
-    let schedule_close: Rc<dyn Fn()> = Rc::new({
-        let submenu_popover = submenu_popover.clone();
-        let header_hovered = Rc::clone(&header_hovered);
-        let submenu_hovered = Rc::clone(&submenu_hovered);
-        move || {
-            let submenu_popover = submenu_popover.clone();
-            let header_hovered = Rc::clone(&header_hovered);
-            let submenu_hovered = Rc::clone(&submenu_hovered);
-            glib::timeout_add_local(Duration::from_millis(120), move || {
-                if !header_hovered.get() && !submenu_hovered.get() {
-                    submenu_popover.popdown();
-                }
-                glib::ControlFlow::Break
-            });
-        }
-    });
+    let schedule_close = hover_close_scheduler(
+        &submenu_popover,
+        Duration::from_millis(120),
+        [Rc::clone(&header_hovered), Rc::clone(&submenu_hovered)],
+    );
 
-    let popup = submenu_popover.clone();
+    // Closures attached inside the popovers hold them weakly so the menus do
+    // not keep themselves alive after being unparented.
+    let popup = submenu_popover.downgrade();
     let header_hovered_for_enter = Rc::clone(&header_hovered);
     let motion = EventControllerMotion::new();
     motion.connect_enter(move |_, _, _| {
         header_hovered_for_enter.set(true);
-        popup.popup();
+        if let Some(popup) = popup.upgrade() {
+            popup.popup();
+        }
     });
     let header_hovered_for_leave = Rc::clone(&header_hovered);
     let schedule_close_for_header = Rc::clone(&schedule_close);
@@ -5513,12 +5869,14 @@ fn append_context_submenu(
 
     let submenu_hovered_for_enter = Rc::clone(&submenu_hovered);
     let root_child_hovered_for_enter = Rc::clone(root_child_hovered);
-    let popup = submenu_popover.clone();
+    let popup = submenu_popover.downgrade();
     let motion = EventControllerMotion::new();
     motion.connect_enter(move |_, _, _| {
         submenu_hovered_for_enter.set(true);
         root_child_hovered_for_enter.set(true);
-        popup.popup();
+        if let Some(popup) = popup.upgrade() {
+            popup.popup();
+        }
     });
     let submenu_hovered_for_leave = Rc::clone(&submenu_hovered);
     let root_child_hovered_for_leave = Rc::clone(root_child_hovered);
@@ -5533,8 +5891,11 @@ fn append_context_submenu(
     submenu.add_controller(motion);
 
     header.connect_clicked({
-        let submenu_popover = submenu_popover.clone();
+        let submenu_popover = submenu_popover.downgrade();
         move |_| {
+            let Some(submenu_popover) = submenu_popover.upgrade() else {
+                return;
+            };
             if submenu_popover.is_visible() {
                 submenu_popover.popdown();
             } else {
@@ -5544,10 +5905,13 @@ fn append_context_submenu(
     });
 
     header.connect_unrealize({
-        let submenu_popover = submenu_popover.clone();
+        let submenu_popover = submenu_popover.downgrade();
         let root_child_hovered = Rc::clone(root_child_hovered);
         move |_| {
             root_child_hovered.set(false);
+            let Some(submenu_popover) = submenu_popover.upgrade() else {
+                return;
+            };
             submenu_popover.popdown();
             if submenu_popover.parent().is_some() {
                 submenu_popover.unparent();
@@ -5556,11 +5920,13 @@ fn append_context_submenu(
     });
 
     parent_popover.connect_closed({
-        let submenu_popover = submenu_popover.clone();
+        let submenu_popover = submenu_popover.downgrade();
         let root_child_hovered = Rc::clone(root_child_hovered);
         move |_| {
             root_child_hovered.set(false);
-            submenu_popover.popdown();
+            if let Some(submenu_popover) = submenu_popover.upgrade() {
+                submenu_popover.popdown();
+            }
         }
     });
 
@@ -5606,15 +5972,17 @@ fn repo_context_supported_manifest_actions(
     actions
 }
 
+/// The repo manifest parsed by the last status scan, when it was valid.
+fn scanned_repo_manifest(item: &RepositoryListItem) -> Option<&Arc<RepoManifest>> {
+    let scan = item.repo_manifest.as_ref()?;
+    matches!(scan.state, RepoManifestScanState::Valid(_))
+        .then_some(scan.manifest.as_ref())
+        .flatten()
+}
+
 fn selection_has_implemented_capabilities(selection: &[RepositoryListItem]) -> bool {
     selection.iter().any(|item| {
-        let Some(scan) = item.repo_manifest.as_ref() else {
-            return false;
-        };
-        if !matches!(scan.state, RepoManifestScanState::Valid(_)) {
-            return false;
-        }
-        load_repo_manifest(&scan.path).is_ok_and(|manifest| {
+        scanned_repo_manifest(item).is_some_and(|manifest| {
             manifest.capabilities.iter().any(|capability| {
                 capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
             })
@@ -5637,7 +6005,7 @@ fn context_action_label(action: StandardActionName) -> String {
 
 fn selected_repo_manifest_targets(
     action: StandardActionName,
-) -> Vec<(RepositoryListItem, RepoManifest)> {
+) -> Vec<(RepositoryListItem, Arc<RepoManifest>)> {
     selected_repository_items_from_state()
         .into_iter()
         .filter_map(|item| {
@@ -5648,16 +6016,9 @@ fn selected_repo_manifest_targets(
             if !summary.supported_actions.contains(&action) {
                 return None;
             }
-            let manifest = load_repo_manifest(&scan.path).ok()?;
+            let manifest = Arc::clone(scanned_repo_manifest(&item)?);
             Some((item, manifest))
         })
-        .collect()
-}
-
-fn repo_capability_targets_from_items(items: Vec<RepositoryListItem>) -> Vec<CapabilityRunTarget> {
-    items
-        .into_iter()
-        .filter_map(|item| repo_capability_target_from_item(item, None))
         .collect()
 }
 
@@ -5665,11 +6026,7 @@ fn repo_capability_target_from_item(
     item: RepositoryListItem,
     capability_ids: Option<Vec<String>>,
 ) -> Option<CapabilityRunTarget> {
-    let scan = item.repo_manifest.as_ref()?;
-    if !matches!(scan.state, RepoManifestScanState::Valid(_)) {
-        return None;
-    }
-    let manifest = load_repo_manifest(&scan.path).ok()?;
+    let manifest = Arc::clone(scanned_repo_manifest(&item)?);
     if !manifest.capabilities.iter().any(|capability| {
         capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
             && capability_ids
@@ -5687,57 +6044,72 @@ fn repo_capability_target_from_item(
     })
 }
 
-fn capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'static str) {
+/// Capability run targets for the selected repos, or the whole workspace when
+/// none is selected, together with that scope's name. `include` picks the
+/// implemented capabilities to run; `None` runs all of them.
+fn capability_check_targets_from_state(
+    include: Option<
+        &dyn Fn(&StateSnapshot, &RepositoryListItem, &RepoCapabilityDeclaration) -> bool,
+    >,
+) -> (Vec<CapabilityRunTarget>, &'static str) {
     let snapshot = snapshot();
     let items = repository_items(&snapshot);
     let selected = selected_repository_items(&snapshot, &items);
-    if selected.is_empty() {
-        (repo_capability_targets_from_items(items), "workspace")
+    let (source_items, scope) = if selected.is_empty() {
+        (items, "workspace")
     } else {
-        (repo_capability_targets_from_items(selected), "selected")
-    }
-}
-
-fn stale_capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'static str) {
-    let snapshot = snapshot();
-    let items = repository_items(&snapshot);
-    let selected = selected_repository_items(&snapshot, &items);
-    let scope = if selected.is_empty() {
-        "workspace"
-    } else {
-        "selected"
+        (selected, "selected")
     };
-    let source_items = if selected.is_empty() { items } else { selected };
     let targets = source_items
         .into_iter()
         .filter_map(|item| {
-            let manifest = item
-                .repo_manifest
-                .as_ref()
-                .and_then(|scan| {
-                    matches!(scan.state, RepoManifestScanState::Valid(_)).then_some(scan)
-                })
-                .and_then(|scan| load_repo_manifest(&scan.path).ok())?;
-            let dirty_now = matches!(
-                item.status.state,
-                ronomepo_core::RepositoryState::Dirty | ronomepo_core::RepositoryState::Untracked
-            );
-            let capability_ids = manifest
-                .capabilities
-                .iter()
-                .filter(|capability| {
-                    capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
-                })
-                .filter(|capability| {
-                    capability_registry_state(&snapshot, &item.id, &capability.id)
-                        .is_none_or(|state| capability_state_is_stale(&item, state, dirty_now))
-                })
+            let Some(include) = include else {
+                return repo_capability_target_from_item(item, None);
+            };
+            let manifest = Arc::clone(scanned_repo_manifest(&item)?);
+            let capability_ids = implemented_capabilities(&manifest)
+                .filter(|capability| include(&snapshot, &item, capability))
                 .map(|capability| capability.id.clone())
                 .collect::<Vec<_>>();
             repo_capability_target_from_item(item, Some(capability_ids))
         })
         .collect();
     (targets, scope)
+}
+
+fn implemented_capabilities(
+    manifest: &RepoManifest,
+) -> impl Iterator<Item = &RepoCapabilityDeclaration> {
+    manifest.capabilities.iter().filter(|capability| {
+        capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
+    })
+}
+
+/// Whether the capability has no recorded result or its result is stale.
+fn capability_needs_rerun(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+    capability: &RepoCapabilityDeclaration,
+) -> bool {
+    let dirty_now = matches!(
+        item.status.state,
+        ronomepo_core::RepositoryState::Dirty | ronomepo_core::RepositoryState::Untracked
+    );
+    capability_registry_state(snapshot, &item.id, &capability.id)
+        .is_none_or(|state| capability_state_is_stale(item, state, dirty_now))
+}
+
+fn capability_is_due(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+    capability: &RepoCapabilityDeclaration,
+    now_epoch_secs: u64,
+) -> bool {
+    let state = capability_registry_state(snapshot, &item.id, &capability.id);
+    capability_due_reason(item, capability, state, now_epoch_secs)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn repo_due_capability_count(
@@ -5745,71 +6117,12 @@ fn repo_due_capability_count(
     item: &RepositoryListItem,
     now_epoch_secs: u64,
 ) -> usize {
-    let Some(manifest) = item
-        .repo_manifest
-        .as_ref()
-        .and_then(|scan| matches!(scan.state, RepoManifestScanState::Valid(_)).then_some(scan))
-        .and_then(|scan| load_repo_manifest(&scan.path).ok())
-    else {
+    let Some(manifest) = scanned_repo_manifest(item) else {
         return 0;
     };
-
-    manifest
-        .capabilities
-        .iter()
-        .filter(|capability| {
-            capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
-        })
-        .filter(|capability| {
-            let state = capability_registry_state(snapshot, &item.id, &capability.id);
-            capability_due_reason(item, capability, state, now_epoch_secs)
-                .ok()
-                .flatten()
-                .is_some()
-        })
+    implemented_capabilities(manifest)
+        .filter(|capability| capability_is_due(snapshot, item, capability, now_epoch_secs))
         .count()
-}
-
-fn due_capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'static str) {
-    let snapshot = snapshot();
-    let items = repository_items(&snapshot);
-    let selected = selected_repository_items(&snapshot, &items);
-    let scope = if selected.is_empty() {
-        "workspace"
-    } else {
-        "selected"
-    };
-    let source_items = if selected.is_empty() { items } else { selected };
-    let now = current_epoch_secs();
-    let targets = source_items
-        .into_iter()
-        .filter_map(|item| {
-            let manifest = item
-                .repo_manifest
-                .as_ref()
-                .and_then(|scan| {
-                    matches!(scan.state, RepoManifestScanState::Valid(_)).then_some(scan)
-                })
-                .and_then(|scan| load_repo_manifest(&scan.path).ok())?;
-            let capability_ids = manifest
-                .capabilities
-                .iter()
-                .filter(|capability| {
-                    capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
-                })
-                .filter(|capability| {
-                    let state = capability_registry_state(&snapshot, &item.id, &capability.id);
-                    capability_due_reason(&item, capability, state, now)
-                        .ok()
-                        .flatten()
-                        .is_some()
-                })
-                .map(|capability| capability.id.clone())
-                .collect::<Vec<_>>();
-            repo_capability_target_from_item(item, Some(capability_ids))
-        })
-        .collect();
-    (targets, scope)
 }
 
 fn submit_capability_check_targets(targets: Vec<CapabilityRunTarget>, scope: &str, mode: &str) {
@@ -5842,17 +6155,21 @@ fn submit_capability_check_targets(targets: Vec<CapabilityRunTarget>, scope: &st
 }
 
 fn run_selected_repo_capability_checks() {
-    let (targets, scope) = capability_check_targets_from_state();
+    let (targets, scope) = capability_check_targets_from_state(None);
     submit_capability_check_targets(targets, scope, "all");
 }
 
 fn run_stale_repo_capability_checks() {
-    let (targets, scope) = stale_capability_check_targets_from_state();
+    let (targets, scope) = capability_check_targets_from_state(Some(&capability_needs_rerun));
     submit_capability_check_targets(targets, scope, "stale");
 }
 
 fn run_due_repo_capability_checks() {
-    let (targets, scope) = due_capability_check_targets_from_state();
+    let now = current_epoch_secs();
+    let (targets, scope) =
+        capability_check_targets_from_state(Some(&|snapshot, item, capability| {
+            capability_is_due(snapshot, item, capability, now)
+        }));
     submit_capability_check_targets(targets, scope, "due");
 }
 
@@ -5866,38 +6183,58 @@ fn run_selected_repo_manifest_action(action: StandardActionName) {
         return;
     }
 
+    let repo_count = targets.len();
+    match submit_job(WorkerJob::RepoManifestActions { action, targets }) {
+        Ok(()) => append_log(format!(
+            "Queued Ronomepo {} for {repo_count} repo(s).",
+            standard_action_label(action)
+        )),
+        Err(message) => append_log(format!(
+            "Ronomepo {} failed to start: {message}",
+            standard_action_label(action)
+        )),
+    }
+}
+
+/// Runs a context-menu manifest action on a worker thread, logging progress
+/// and command output to the Operations log as it goes.
+fn run_repo_manifest_actions(
+    action: StandardActionName,
+    targets: Vec<(RepositoryListItem, Arc<RepoManifest>)>,
+) {
+    let main_context = glib::MainContext::default();
+    let log = |message: String| main_context.invoke(move || append_log(message));
+    let label = standard_action_label(action);
+
     for (item, manifest) in targets {
         match action {
             StandardActionName::ListArtifacts => {
                 match list_repo_artifacts(&item.status.repo_path, &manifest) {
+                    Ok(artifacts) if artifacts.is_empty() => log(format!(
+                        "Ronomepo list_artifacts for {} found no artifacts.",
+                        item.name
+                    )),
                     Ok(artifacts) => {
-                        if artifacts.is_empty() {
-                            append_log(format!(
-                                "Ronomepo list_artifacts for {} found no artifacts.",
-                                item.name
+                        log(format!(
+                            "Ronomepo list_artifacts for {}: {} artifact(s).",
+                            item.name,
+                            artifacts.len()
+                        ));
+                        for artifact in artifacts {
+                            log(format!(
+                                "  [{}] {} {}",
+                                artifact.item_id,
+                                artifact.name,
+                                artifact
+                                    .path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string())
+                                    .or(artifact.pattern.clone())
+                                    .unwrap_or_else(|| "<no-path>".to_string())
                             ));
-                        } else {
-                            append_log(format!(
-                                "Ronomepo list_artifacts for {}: {} artifact(s).",
-                                item.name,
-                                artifacts.len()
-                            ));
-                            for artifact in artifacts {
-                                append_log(format!(
-                                    "  [{}] {} {}",
-                                    artifact.item_id,
-                                    artifact.name,
-                                    artifact
-                                        .path
-                                        .as_ref()
-                                        .map(|path| path.display().to_string())
-                                        .or(artifact.pattern.clone())
-                                        .unwrap_or_else(|| "<no-path>".to_string())
-                                ));
-                            }
                         }
                     }
-                    Err(error) => append_log(format!(
+                    Err(error) => log(format!(
                         "Ronomepo list_artifacts failed for {}: {error}",
                         item.name
                     )),
@@ -5910,7 +6247,7 @@ fn run_selected_repo_manifest_action(action: StandardActionName) {
                             .iter()
                             .map(|report| report.findings.len())
                             .sum::<usize>();
-                        append_log(format!(
+                        log(format!(
                             "Ronomepo verify_dependencies_freshness for {}: {} report(s), {} finding(s).",
                             item.name,
                             reports.len(),
@@ -5918,18 +6255,15 @@ fn run_selected_repo_manifest_action(action: StandardActionName) {
                         ));
                         for report in reports {
                             if report.findings.is_empty() {
-                                append_log(format!("  [{}] no issues found.", report.item_id));
+                                log(format!("  [{}] no issues found.", report.item_id));
                             } else {
                                 for finding in report.findings {
-                                    append_log(format!(
-                                        "  [{}] {}",
-                                        report.item_id, finding.message
-                                    ));
+                                    log(format!("  [{}] {}", report.item_id, finding.message));
                                 }
                             }
                         }
                     }
-                    Err(error) => append_log(format!(
+                    Err(error) => log(format!(
                         "Ronomepo verify_dependencies_freshness failed for {}: {error}",
                         item.name
                     )),
@@ -5937,30 +6271,32 @@ fn run_selected_repo_manifest_action(action: StandardActionName) {
             }
             _ => match plan_repo_action(&item.status.repo_path, &manifest, action) {
                 Ok(plan) => {
-                    append_log(format!(
-                        "Running Ronomepo {} for {} ({} step(s)).",
-                        standard_action_label(action),
+                    log(format!(
+                        "Running Ronomepo {label} for {} ({} step(s)).",
                         item.name,
                         plan.steps.len()
                     ));
                     for step in plan.steps {
                         match step.executor {
                             RepoActionExecutor::Command(command) => {
-                                run_planned_repo_command(&item.name, action, command);
+                                let succeeded = run_planned_repo_command(&item.name, action, &command, &log);
+                                if !succeeded {
+                                    log(format!(
+                                        "Ronomepo {label} for {} stopped after a failed step.",
+                                        item.name
+                                    ));
+                                    break;
+                                }
                             }
-                            RepoActionExecutor::BuiltInInspector => {
-                                append_log(format!(
-                                    "Ronomepo {} for {} uses a built-in inspector and has no terminal command to launch.",
-                                    standard_action_label(action),
-                                    item.name
-                                ));
-                            }
+                            RepoActionExecutor::BuiltInInspector => log(format!(
+                                "Ronomepo {label} for {} uses a built-in inspector and has no command to run.",
+                                item.name
+                            )),
                         }
                     }
                 }
-                Err(error) => append_log(format!(
-                    "Ronomepo {} failed for {}: {error}",
-                    standard_action_label(action),
+                Err(error) => log(format!(
+                    "Ronomepo {label} failed for {}: {error}",
                     item.name
                 )),
             },
@@ -5968,35 +6304,55 @@ fn run_selected_repo_manifest_action(action: StandardActionName) {
     }
 }
 
-fn run_planned_repo_command(repo_name: &str, action: StandardActionName, command: PlannedCommand) {
-    let mut process = Command::new(&command.program);
-    process.args(&command.args);
-    process.current_dir(&command.workdir);
-    for (key, value) in &command.env {
-        process.env(key, value);
-    }
+/// Number of trailing output lines copied into the Operations log per command.
+const REPO_ACTION_OUTPUT_TAIL_LINES: usize = 20;
 
-    let command_text = if command.args.is_empty() {
-        command.program.clone()
-    } else {
-        format!("{} {}", command.program, command.args.join(" "))
+/// Runs one planned command to completion and logs its result and the tail of
+/// its output. Returns whether it succeeded.
+fn run_planned_repo_command(
+    repo_name: &str,
+    action: StandardActionName,
+    command: &PlannedCommand,
+    log: &impl Fn(String),
+) -> bool {
+    let label = standard_action_label(action);
+    let command_text = planned_command_text(command);
+    log(format!(
+        "Started Ronomepo {label} for {repo_name}: {command_text} (cwd: {}).",
+        command.workdir.display()
+    ));
+    let output = match run_planned_command_to_output(command) {
+        Ok(output) => output,
+        Err(error) => {
+            log(format!("Ronomepo {label} for {repo_name} failed: {error}"));
+            return false;
+        }
     };
-
-    match process.spawn() {
-        Ok(_) => append_log(format!(
-            "Started Ronomepo {} for {}: {} (cwd: {}).",
-            standard_action_label(action),
-            repo_name,
-            command_text,
-            command.workdir.display()
-        )),
-        Err(error) => append_log(format!(
-            "Failed to start Ronomepo {} for {}: {} ({error})",
-            standard_action_label(action),
-            repo_name,
-            command_text
-        )),
+    let succeeded = output.status.success();
+    log(format!(
+        "Ronomepo {label} for {repo_name} {} ({}).",
+        if succeeded { "succeeded" } else { "failed" },
+        output.status
+    ));
+    for line in command_output_tail(&output, REPO_ACTION_OUTPUT_TAIL_LINES) {
+        log(format!("  {line}"));
     }
+    succeeded
+}
+
+/// The last `limit` non-empty lines of stdout followed by stderr.
+fn command_output_tail(output: &Output, limit: usize) -> Vec<String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    lines[lines.len().saturating_sub(limit)..]
+        .iter()
+        .map(|line| line.to_string())
+        .collect()
 }
 
 fn append_context_button<F>(menu: &GtkBox, popover: &Popover, label: &str, action: F)
@@ -6012,9 +6368,11 @@ where
     text.set_halign(Align::Start);
     text.set_hexpand(true);
     button.set_child(Some(&text));
-    let popover = popover.clone();
+    let popover = popover.downgrade();
     button.connect_clicked(move |_| {
-        popover.popdown();
+        if let Some(popover) = popover.upgrade() {
+            popover.popdown();
+        }
         action();
     });
     menu.append(&button);
@@ -6040,6 +6398,11 @@ fn create_repo_monitor_view(
     content.set_margin_end(8);
 
     let initial_snapshot = snapshot();
+    // Set while a refresh mirrors the state into the controls, so their
+    // handlers do not treat it as user input.
+    let syncing = Rc::new(Cell::new(false));
+    let mut filter_buttons = Vec::new();
+    let mut sort_dropdowns = Vec::new();
 
     let view_row = GtkBox::new(Orientation::Horizontal, 8);
     view_row.set_hexpand(true);
@@ -6066,12 +6429,7 @@ fn create_repo_monitor_view(
     for view in monitor_view_modes() {
         let filter_box = GtkBox::new(Orientation::Horizontal, 0);
         filter_box.add_css_class("linked");
-        let active_filter = match *view {
-            MonitorViewMode::Overview => initial_snapshot.overview_filter_mode,
-            MonitorViewMode::Git => initial_snapshot.git_filter_mode,
-            MonitorViewMode::Checks => initial_snapshot.checks_filter_mode,
-            MonitorViewMode::Manifest => initial_snapshot.manifest_filter_mode,
-        };
+        let active_filter = initial_snapshot.monitor_settings.view(*view).filter;
         let mut first_filter_button: Option<ToggleButton> = None;
         for filter_mode in monitor_filter_modes_for_view(*view) {
             let button =
@@ -6083,12 +6441,16 @@ fn create_repo_monitor_view(
             }
             button.set_active(active_filter == *filter_mode);
             let filter_mode = *filter_mode;
-            button.connect_toggled(move |button| {
-                if button.is_active() {
-                    update_monitor_filter_mode(filter_mode);
-                    refresh_views();
+            button.connect_toggled({
+                let syncing = Rc::clone(&syncing);
+                move |button| {
+                    if button.is_active() && !syncing.get() {
+                        update_monitor_filter_mode(filter_mode);
+                        refresh_views();
+                    }
                 }
             });
+            filter_buttons.push((*view, filter_mode, button.clone()));
             filter_box.append(&button);
         }
         filter_stack.add_named(&filter_box, Some(monitor_view_mode_key(*view)));
@@ -6102,23 +6464,24 @@ fn create_repo_monitor_view(
             .map(|mode| monitor_sort_mode_label(*mode))
             .collect::<Vec<_>>();
         let dropdown = clickable_dropdown_from_strings(&labels);
-        let active_sort = match *view {
-            MonitorViewMode::Overview => initial_snapshot.overview_sort_mode,
-            MonitorViewMode::Git => initial_snapshot.git_sort_mode,
-            MonitorViewMode::Checks => initial_snapshot.checks_sort_mode,
-            MonitorViewMode::Manifest => initial_snapshot.manifest_sort_mode,
-        };
+        let active_sort = initial_snapshot.monitor_settings.view(*view).sort;
         dropdown.set_selected(monitor_sort_mode_index(*view, active_sort));
         dropdown.set_tooltip_text(Some("Sort repositories by the selected criterion"));
         let view = *view;
-        dropdown.connect_selected_notify(move |dropdown| {
-            let mode = monitor_sort_mode_from_index(view, dropdown.selected());
-            update_monitor_sort_mode(mode);
-            let snapshot = snapshot();
-            refresh_repository_views(&snapshot);
-            refresh_views();
+        dropdown.connect_selected_notify({
+            let syncing = Rc::clone(&syncing);
+            move |dropdown| {
+                if syncing.get() {
+                    return;
+                }
+                let mode = monitor_sort_mode_from_index(view, dropdown.selected());
+                update_monitor_sort_mode(mode);
+                // Sorting only affects the monitor lists, so skip the full refresh.
+                refresh_repository_views(&snapshot());
+            }
         });
         sort_stack.add_named(&dropdown, Some(monitor_view_mode_key(view)));
+        sort_dropdowns.push((view, dropdown));
     }
     sort_stack.set_visible_child_name(monitor_view_mode_key(initial_snapshot.monitor_view_mode));
 
@@ -6126,7 +6489,9 @@ fn create_repo_monitor_view(
     sort_box.set_halign(Align::End);
     sort_box.set_hexpand(false);
     sort_box.append(&sort_stack);
-    let sort_direction = Rc::new(Cell::new(active_monitor_sort_descending(&initial_snapshot)));
+    let sort_direction = Rc::new(Cell::new(
+        active_monitor_settings(&initial_snapshot).descending,
+    ));
     let sort_indicator = clickable_button();
     sort_indicator.add_css_class("flat");
     sort_indicator.set_tooltip_text(Some("Toggle sort direction"));
@@ -6142,9 +6507,7 @@ fn create_repo_monitor_view(
             sort_direction.set(next);
             sort_indicator_label.set_text(monitor_sort_direction_label(next));
             update_monitor_sort_descending(next);
-            let snapshot = snapshot();
-            refresh_repository_views(&snapshot);
-            refresh_views();
+            refresh_repository_views(&snapshot());
         }
     });
     sort_box.append(&sort_indicator);
@@ -6158,14 +6521,16 @@ fn create_repo_monitor_view(
     }
     header_stack.set_visible_child_name(monitor_view_mode_key(initial_snapshot.monitor_view_mode));
 
-    for (view, button) in view_buttons {
+    for (view, button) in &view_buttons {
+        let view = *view;
         let filter_stack = filter_stack.clone();
         let sort_stack = sort_stack.clone();
         let header_stack = header_stack.clone();
         let sort_direction = Rc::clone(&sort_direction);
         let sort_indicator_label = sort_indicator_label.clone();
+        let syncing = Rc::clone(&syncing);
         button.connect_toggled(move |button| {
-            if !button.is_active() {
+            if !button.is_active() || syncing.get() {
                 return;
             }
             update_monitor_view_mode(view);
@@ -6173,7 +6538,7 @@ fn create_repo_monitor_view(
             sort_stack.set_visible_child_name(monitor_view_mode_key(view));
             header_stack.set_visible_child_name(monitor_view_mode_key(view));
             let snapshot = snapshot();
-            let descending = active_monitor_sort_descending(&snapshot);
+            let descending = active_monitor_settings(&snapshot).descending;
             sort_direction.set(descending);
             sort_indicator_label.set_text(monitor_sort_direction_label(descending));
             refresh_views();
@@ -6194,19 +6559,24 @@ fn create_repo_monitor_view(
     controls.append(&filter_sort_row);
 
     let store = gio::ListStore::new::<BoxedAnyObject>();
-    let filter = CustomFilter::new(|object| {
-        let snapshot = snapshot();
-        repo_item_from_object(object)
-            .is_some_and(|item| repo_monitor_filter_matches(&item, &snapshot))
+    let query = Rc::new(RefCell::new(monitor_query(&initial_snapshot)));
+    let filter = CustomFilter::new({
+        let query = Rc::clone(&query);
+        move |object| {
+            with_monitor_row(object, |row| monitor_row_matches(row, &query.borrow()))
+                .unwrap_or(false)
+        }
     });
     let filter_model = gtk::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
-    let sorter = CustomSorter::new(|left, right| {
-        let snapshot = snapshot();
-        let left = repo_item_from_object(left);
-        let right = repo_item_from_object(right);
-        match (left, right) {
-            (Some(left), Some(right)) => repo_monitor_sort_cmp(&snapshot, &left, &right).into(),
-            _ => gtk::Ordering::Equal,
+    let sorter = CustomSorter::new({
+        let query = Rc::clone(&query);
+        move |left, right| {
+            let query = query.borrow();
+            with_monitor_row(left, |left| {
+                with_monitor_row(right, |right| monitor_row_cmp(&query, left, right))
+            })
+            .flatten()
+            .map_or(gtk::Ordering::Equal, Into::into)
         }
     });
     let sort_model = SortListModel::new(Some(filter_model.clone()), Some(sorter.clone()));
@@ -6218,9 +6588,8 @@ fn create_repo_monitor_view(
     list.set_valign(Align::Start);
     list.set_selection_mode(SelectionMode::Multiple);
     list.bind_model(Some(&sort_model), move |object| {
-        repo_item_from_object(object)
-            .map(|item| build_repo_monitor_row(&item, host))
-            .unwrap_or_else(|| GtkBox::new(Orientation::Horizontal, 0))
+        with_monitor_row(object, |row| build_repo_monitor_list_row(row, host))
+            .unwrap_or_else(|| ListBoxRow::new())
             .upcast()
     });
     {
@@ -6300,56 +6669,39 @@ fn create_repo_monitor_view(
         open_repo_overviews(host, std::slice::from_ref(&repo_id));
     });
 
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(0)
-        .child(&list)
-        .build();
-    scroller.set_valign(Align::Fill);
-    scroller.set_propagate_natural_height(false);
+    let scroller = vertical_view_scroller(&list);
 
-    let snapshot = snapshot();
     content.append(&controls);
     content.append(&header_stack);
     content.append(&scroller);
 
-    sync_repository_monitor_store(&store, &all_monitor_items(&snapshot));
-    filter.changed(FilterChange::Different);
-    sorter.changed(SorterChange::Different);
-    refresh_repository_view_handle(
-        &RepositoryViewHandle {
-            list: glib::WeakRef::new(),
-            scroller: glib::WeakRef::new(),
-            store: store.clone(),
-            filter: filter.clone(),
-            sorter: sorter.clone(),
-        },
-        &list,
-        &scroller,
-        &snapshot,
-    );
-
     let list_ref = glib::WeakRef::new();
     list_ref.set(Some(&list));
-    let scroller_ref = glib::WeakRef::new();
-    scroller_ref.set(Some(&scroller));
+    let handle = RepositoryViewHandle {
+        list: list_ref,
+        controls: MonitorControls {
+            syncing,
+            view_buttons,
+            filter_buttons,
+            sort_dropdowns,
+            sort_direction,
+            sort_direction_label: sort_indicator_label,
+            stacks: [filter_stack, sort_stack, header_stack],
+        },
+        store,
+        filter_model,
+        filter,
+        sorter,
+        query,
+        rows: RefCell::new(Vec::new()),
+        placeholder_for_manifest: Cell::new(None),
+    };
+    refresh_repository_view_handle(&handle, &list, &initial_snapshot);
     REPOSITORY_VIEWS.with(|views| {
-        views.borrow_mut().push(RepositoryViewHandle {
-            list: list_ref,
-            scroller: scroller_ref,
-            store,
-            filter,
-            sorter,
-        });
+        views.borrow_mut().push(handle);
     });
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(content.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(content)
 }
 
 fn repo_monitor_header_for_view(view: MonitorViewMode) -> GtkBox {
@@ -6466,7 +6818,7 @@ fn monitor_text_cell(text: &str, width_chars: i32, width_px: i32, expand: bool) 
     label
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CapabilityMonitorSummary {
     declared: usize,
     stored: usize,
@@ -6483,7 +6835,7 @@ struct CapabilityMonitorSummary {
 
 fn capability_monitor_summary(
     item: &RepositoryListItem,
-    snapshot: &StateSnapshot,
+    registry: &CapabilityRegistry,
 ) -> CapabilityMonitorSummary {
     if item.id == MONOREPO_ROW_ID {
         return CapabilityMonitorSummary::default();
@@ -6509,8 +6861,7 @@ fn capability_monitor_summary(
         ronomepo_core::RepositoryState::Dirty | ronomepo_core::RepositoryState::Untracked
     );
 
-    for state in snapshot
-        .capability_registry
+    for state in registry
         .states
         .iter()
         .filter(|state| state.repo_id == item.id)
@@ -6626,11 +6977,10 @@ fn capability_monitor_tooltip(summary: &CapabilityMonitorSummary) -> String {
     )
 }
 
-fn capability_monitor_search_text(item: &RepositoryListItem, snapshot: &StateSnapshot) -> String {
-    let summary = capability_monitor_summary(item, snapshot);
+fn capability_monitor_search_text(summary: &CapabilityMonitorSummary) -> String {
     format!(
         "capabilities {} policy {} unsupported {} stale {} warning {} failed {} error {} unknown {}",
-        capability_monitor_label(&summary),
+        capability_monitor_label(summary),
         summary.policy_issues,
         summary.unsupported,
         summary.stale,
@@ -6652,12 +7002,11 @@ fn repo_attention_detail_signals(
     snapshot: &StateSnapshot,
     item: &RepositoryListItem,
 ) -> Vec<AttentionSignal> {
-    let manifest = item
-        .repo_manifest
-        .as_ref()
-        .and_then(|scan| matches!(scan.state, RepoManifestScanState::Valid(_)).then_some(scan))
-        .and_then(|scan| load_repo_manifest(&scan.path).ok());
-    derive_attention_signals(item, manifest.as_ref(), &snapshot.capability_registry)
+    derive_attention_signals(
+        item,
+        scanned_repo_manifest(item).map(|manifest| &**manifest),
+        &snapshot.capability_registry,
+    )
 }
 
 fn attention_monitor_label(signals: &[AttentionSignal]) -> &'static str {
@@ -6719,22 +7068,14 @@ fn attention_monitor_search_text(signals: &[AttentionSignal]) -> String {
     text
 }
 
-fn monitor_attention_cell(snapshot: &StateSnapshot, item: &RepositoryListItem) -> Label {
-    let signals = repo_attention_signals(snapshot, item);
-    let text = attention_monitor_label(&signals);
-    let label = monitor_text_cell(
-        text,
+fn monitor_attention_cell(signals: &[AttentionSignal]) -> Label {
+    monitor_colored_cell(
+        attention_monitor_label(signals),
+        attention_monitor_color(signals),
         MONITOR_ATTENTION_COL_CHARS,
         MONITOR_ATTENTION_COL_WIDTH,
-        false,
-    );
-    attach_text_tooltip(&label, attention_monitor_tooltip(&signals));
-    let escaped = glib::markup_escape_text(text);
-    label.set_markup(&format!(
-        "<span foreground=\"{}\">{escaped}</span>",
-        attention_monitor_color(&signals)
-    ));
-    label
+        Some(attention_monitor_tooltip(signals)),
+    )
 }
 
 fn workspace_attention_lines(
@@ -6818,13 +7159,10 @@ fn repo_capability_detail_lines(
         return capability_registry_only_lines(snapshot, item);
     };
 
-    let manifest = match load_repo_manifest(&scan.path) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            lines.push(format!("Manifest could not be loaded: {error}"));
-            lines.extend(capability_registry_only_lines(snapshot, item));
-            return lines;
-        }
+    let Some(manifest) = scan.manifest.as_deref() else {
+        lines.push("Manifest has not been loaded by a status scan yet.".to_string());
+        lines.extend(capability_registry_only_lines(snapshot, item));
+        return lines;
     };
 
     let policy = assess_repo_capability_policy(&manifest);
@@ -6980,7 +7318,13 @@ fn capability_finding_severity_label(severity: CapabilityFindingSeverity) -> &'s
 }
 
 fn repo_needs_capability_attention(snapshot: &StateSnapshot, item: &RepositoryListItem) -> bool {
-    let summary = capability_monitor_summary(item, snapshot);
+    capability_summary_needs_attention(&capability_monitor_summary(
+        item,
+        &snapshot.capability_registry,
+    ))
+}
+
+fn capability_summary_needs_attention(summary: &CapabilityMonitorSummary) -> bool {
     summary.policy_issues > 0
         || summary.unsupported > 0
         || summary.error > 0
@@ -6990,40 +7334,45 @@ fn repo_needs_capability_attention(snapshot: &StateSnapshot, item: &RepositoryLi
         || summary.unknown > 0
 }
 
-fn monitor_capability_cell(item: &RepositoryListItem, snapshot: &StateSnapshot) -> Label {
-    let summary = capability_monitor_summary(item, snapshot);
-    let text = capability_monitor_label(&summary);
-    let label = monitor_text_cell(
-        text,
+fn monitor_capability_cell(summary: &CapabilityMonitorSummary) -> Label {
+    monitor_colored_cell(
+        capability_monitor_label(summary),
+        capability_monitor_color(summary),
         MONITOR_CAPABILITY_COL_CHARS,
         MONITOR_CAPABILITY_COL_WIDTH,
-        false,
-    );
-    attach_text_tooltip(&label, capability_monitor_tooltip(&summary));
-    let escaped = glib::markup_escape_text(text);
-    label.set_markup(&format!(
-        "<span foreground=\"{}\">{escaped}</span>",
-        capability_monitor_color(&summary)
-    ));
+        Some(capability_monitor_tooltip(summary)),
+    )
+}
+
+/// A fixed-width monitor cell showing `text` in `color`.
+fn monitor_colored_cell(
+    text: &str,
+    color: &str,
+    width_chars: i32,
+    width_px: i32,
+    tooltip: Option<String>,
+) -> Label {
+    let label = monitor_text_cell(text, width_chars, width_px, false);
+    if let Some(tooltip) = tooltip {
+        attach_text_tooltip(&label, tooltip);
+    }
+    set_colored_markup(&label, text, color);
     label
 }
 
+fn set_colored_markup(label: &Label, text: &str, color: &str) {
+    let escaped = glib::markup_escape_text(text);
+    label.set_markup(&format!("<span foreground=\"{color}\">{escaped}</span>"));
+}
+
 fn monitor_manifest_cell(scan: Option<&RepoManifestScan>) -> Label {
-    let label = monitor_text_cell(
+    monitor_colored_cell(
         manifest_presence_label(scan),
+        manifest_presence_color(scan),
         MONITOR_MANIFEST_COL_CHARS,
         MONITOR_MANIFEST_COL_WIDTH,
-        false,
-    );
-    if let Some(tooltip) = manifest_presence_tooltip(scan) {
-        attach_text_tooltip(&label, tooltip);
-    }
-    let escaped = glib::markup_escape_text(manifest_presence_label(scan));
-    label.set_markup(&format!(
-        "<span foreground=\"{}\">{escaped}</span>",
-        manifest_presence_color(scan)
-    ));
-    label
+        manifest_presence_tooltip(scan),
+    )
 }
 
 fn monitor_manifest_actions_cell(item: &RepositoryListItem) -> Label {
@@ -7043,27 +7392,24 @@ fn monitor_manifest_actions_cell(item: &RepositoryListItem) -> Label {
     label
 }
 
-fn monitor_enabled_cell(snapshot: &StateSnapshot, item: &RepositoryListItem) -> Label {
-    let enabled = workspace_repo_enabled(snapshot, item);
+fn monitor_enabled_cell(enabled: Option<bool>) -> Label {
     let text = match enabled {
         Some(true) => "Enabled",
         Some(false) => "Disabled",
         None => "-",
     };
-    let label = monitor_text_cell(
-        text,
-        MONITOR_STATE_COL_CHARS,
-        MONITOR_STATE_COL_WIDTH,
-        false,
-    );
-    let escaped = glib::markup_escape_text(text);
     let color = if enabled == Some(true) {
         "#7fdc8a"
     } else {
         "#8f96a3"
     };
-    label.set_markup(&format!("<span foreground=\"{color}\">{escaped}</span>"));
-    label
+    monitor_colored_cell(
+        text,
+        color,
+        MONITOR_STATE_COL_CHARS,
+        MONITOR_STATE_COL_WIDTH,
+        None,
+    )
 }
 
 fn manifest_presence_color(scan: Option<&RepoManifestScan>) -> &'static str {
@@ -7081,18 +7427,13 @@ fn manifest_presence_color(scan: Option<&RepoManifestScan>) -> &'static str {
 }
 
 fn monitor_state_cell(state: &ronomepo_core::RepositoryState) -> Label {
-    let label = monitor_text_cell(
+    monitor_colored_cell(
         status_label(state),
+        state_color(state),
         MONITOR_STATE_COL_CHARS,
         MONITOR_STATE_COL_WIDTH,
-        false,
-    );
-    let escaped = glib::markup_escape_text(status_label(state));
-    label.set_markup(&format!(
-        "<span foreground=\"{}\">{escaped}</span>",
-        state_color(state)
-    ));
-    label
+        None,
+    )
 }
 
 fn state_color(state: &ronomepo_core::RepositoryState) -> &'static str {
@@ -7107,16 +7448,9 @@ fn state_color(state: &ronomepo_core::RepositoryState) -> &'static str {
 
 fn monitor_sync_cell(sync: &ronomepo_core::RepositorySync) -> Label {
     let text = format_sync_label(sync);
-    let label = Label::new(Some(&text));
-    label.set_xalign(0.0);
+    let label = monitor_expand_cell(&text);
     label.add_css_class("mono");
-    label.set_hexpand(true);
-    label.set_ellipsize(EllipsizeMode::End);
-    let escaped = glib::markup_escape_text(&text);
-    label.set_markup(&format!(
-        "<span foreground=\"{}\">{escaped}</span>",
-        sync_color(sync)
-    ));
+    set_colored_markup(&label, &text, sync_color(sync));
     label
 }
 
@@ -7142,40 +7476,59 @@ fn create_monorepo_overview_view(
 
     let host = remember_host_ptr(host);
 
-    let root = GtkBox::new(Orientation::Vertical, 18);
+    let root = padded_view_root(18, 24);
     root.set_vexpand(true);
-    root.set_margin_top(24);
-    root.set_margin_bottom(24);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
 
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(0)
-        .child(&root)
-        .build();
-    scroller.set_valign(Align::Fill);
-    scroller.set_propagate_natural_height(false);
-
-    let snapshot = snapshot();
-    render_monorepo_overview_into(&root, &snapshot, host);
+    let scroller = vertical_view_scroller(&root);
 
     let root_ref = glib::WeakRef::new();
     root_ref.set(Some(&root));
-    MONOREPO_OVERVIEWS.with(|views| {
-        views.borrow_mut().push(ContainerViewHandle {
-            root: root_ref,
-            host_ptr: host as usize,
-        });
+    let view = Rc::new(MonorepoOverview {
+        root: root_ref,
+        top: GtkBox::new(Orientation::Vertical, 18),
+        selection_slot: GtkBox::new(Orientation::Vertical, 0),
+        files_slot: GtkBox::new(Orientation::Vertical, 0),
+        sections: GtkBox::new(Orientation::Vertical, 12),
+        reports: monorepo_report_controls(),
+        host_ptr: host as usize,
+        stale: Cell::new(false),
     });
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
-            as *mut std::ffi::c_void
-    }
+    let command_area = GtkBox::new(Orientation::Vertical, 8);
+    command_area.append(&overview_command_group(
+        "Workspace",
+        overview_actions(false),
+    ));
+    command_area.append(&overview_command_group(
+        "Selection",
+        view.selection_slot.clone(),
+    ));
+    command_area.append(&overview_command_group("Reports", view.reports.row.clone()));
+    command_area.append(&overview_command_group("Files", view.files_slot.clone()));
+    root.append(&view.top);
+    root.append(&command_area);
+    root.append(&view.sections);
+
+    render_monorepo_overview(&view, &snapshot());
+    // Refreshes skip the view while it is hidden; catch up when it shows.
+    root.connect_map({
+        let view = Rc::downgrade(&view);
+        move |_| {
+            let view = view.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(view) = view.upgrade() {
+                    if view.stale.get() {
+                        render_monorepo_overview(&view, &snapshot());
+                    }
+                }
+            });
+        }
+    });
+    MONOREPO_OVERVIEWS.with(|views| {
+        views.borrow_mut().push(view);
+    });
+
+    into_view_ptr(scroller)
 }
 
 fn create_commit_check_view(
@@ -7186,49 +7539,37 @@ fn create_commit_check_view(
         return std::ptr::null_mut();
     }
 
-    let host = remember_host_ptr(host);
+    remember_host_ptr(host);
 
-    let root = GtkBox::new(Orientation::Vertical, 18);
-    root.set_margin_top(24);
-    root.set_margin_bottom(24);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
+    let root = padded_view_root(18, 24);
 
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(0)
-        .child(&root)
-        .build();
-    scroller.set_valign(Align::Fill);
-    scroller.set_propagate_natural_height(false);
+    let scroller = vertical_view_scroller(&root);
 
-    let snapshot = snapshot();
-    render_commit_check_into(&root, &snapshot);
+    let editor = build_commit_check_view(&root, &snapshot());
 
     let root_ref = glib::WeakRef::new();
     root_ref.set(Some(&root));
     COMMIT_CHECK_VIEWS.with(|views| {
-        views.borrow_mut().push(ContainerViewHandle {
+        views.borrow_mut().push(CommitCheckViewHandle {
             root: root_ref,
-            host_ptr: host as usize,
+            editor,
         });
     });
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(scroller)
 }
 
-fn render_monorepo_overview_into(
-    root: &GtkBox,
-    snapshot: &StateSnapshot,
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-) {
-    clear_box(root);
+fn render_monorepo_overview(view: &MonorepoOverview, snapshot: &StateSnapshot) {
+    view.stale.set(false);
+    let host_ptr = view.host_ptr as *const maruzzella_sdk::ffi::MzHostApi;
+    for slot in [
+        &view.top,
+        &view.selection_slot,
+        &view.files_slot,
+        &view.sections,
+    ] {
+        clear_box(slot);
+    }
 
     let summary = workspace_summary(
         snapshot.manifest.as_ref(),
@@ -7314,17 +7655,13 @@ fn render_monorepo_overview_into(
         stats.append(&stat_card(label, &value.to_string()));
     }
 
-    let actions = overview_actions(false);
-    let selection_actions = monorepo_selection_actions(host_ptr, &items);
-    let report_actions = monorepo_report_actions(snapshot);
-    let file_actions = overview_file_actions(snapshot, host_ptr);
-    let command_area = GtkBox::new(Orientation::Vertical, 8);
-    command_area.append(&overview_command_group("Workspace", actions));
-    command_area.append(&overview_command_group("Selection", selection_actions));
-    command_area.append(&overview_command_group("Reports", report_actions));
-    command_area.append(&overview_command_group("Files", file_actions));
+    view.selection_slot
+        .append(&monorepo_selection_actions(snapshot, host_ptr, &items));
+    update_monorepo_report_controls(&view.reports, snapshot);
+    view.files_slot
+        .append(&overview_file_actions(snapshot, host_ptr));
 
-    let sections = GtkBox::new(Orientation::Vertical, 12);
+    let sections = &view.sections;
     let selection_scope = if selected.is_empty() {
         "No repos selected. Toolbar and overview actions apply to the whole workspace.".to_string()
     } else {
@@ -7359,7 +7696,7 @@ fn render_monorepo_overview_into(
         &sections,
         "Needs Attention",
         "Repos with open git, manifest, or capability attention signals.",
-        &attention_items(&items),
+        &attention_items(snapshot, &items),
         Some(8),
         host_ptr,
     );
@@ -7397,17 +7734,13 @@ fn render_monorepo_overview_into(
         },
         "Run Line Stats to inspect additions and deletions across the workspace.",
     );
-    append_log_section(&sections, "Recent Operations", &snapshot.logs, 8);
+    append_log_section(sections, "Recent Operations", &snapshot.logs, 8);
 
-    root.append(&hero);
-    root.append(&stats);
-    root.append(&command_area);
-    root.append(&sections);
+    view.top.append(&hero);
+    view.top.append(&stats);
 }
 
-fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
-    clear_box(root);
-
+fn build_commit_check_view(root: &GtkBox, initial: &StateSnapshot) -> Rc<CommitCheckEditor> {
     let hero = GtkBox::new(Orientation::Vertical, 4);
     let title = Label::new(Some("Commit Check"));
     title.set_xalign(0.0);
@@ -7445,81 +7778,63 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
     rules_help.set_wrap(true);
     rules_help.add_css_class("muted");
 
-    let rules_box = GtkBox::new(Orientation::Vertical, 8);
-    let rule_rows = Rc::new(RefCell::new(Vec::<CommitCheckRuleRowHandle>::new()));
-    let manifest_rules = snapshot
-        .manifest
-        .as_ref()
-        .and_then(|manifest| manifest.commit_check_rules.clone())
-        .unwrap_or_default();
-    for rule in &manifest_rules {
-        append_commit_check_rule_row(&rules_box, &rule_rows, Some(rule));
-    }
-
-    let rule_status_text = snapshot
-        .manifest_path
-        .as_ref()
-        .map(|path| {
-            format!(
-                "Loaded {} commit check rules from {}. Use Save Rules to persist edits.",
-                manifest_rules.len(),
-                path.display()
-            )
-        })
-        .unwrap_or_else(|| {
-            format!(
-                "Loaded {} commit check rules. No workspace manifest is loaded.",
-                manifest_rules.len()
-            )
-        });
-    let rule_status = Label::new(Some(&rule_status_text));
+    let rule_status = Label::new(None);
     rule_status.set_xalign(0.0);
     rule_status.set_wrap(true);
     rule_status.add_css_class("muted");
 
+    let editor = Rc::new(CommitCheckEditor {
+        rules_box: GtkBox::new(Orientation::Vertical, 8),
+        rule_rows: Rc::new(RefCell::new(Vec::new())),
+        status: rule_status,
+        baseline: RefCell::new(Vec::new()),
+    });
+    sync_commit_check_editor(&editor, initial, true);
+
     let rule_actions = GtkBox::new(Orientation::Horizontal, 8);
     let add_rule = clickable_button_with_label("Add Rule");
     add_rule.connect_clicked({
-        let rules_box = rules_box.clone();
-        let rule_rows = rule_rows.clone();
-        let rule_status = rule_status.clone();
+        let editor = Rc::clone(&editor);
         move |_| {
-            open_add_commit_check_rule_dialog(
-                active_window(),
-                rules_box.clone(),
-                rule_rows.clone(),
-                rule_status.clone(),
-            );
+            open_add_commit_check_rule_dialog(active_window(), Rc::clone(&editor));
         }
     });
     let save_rules = clickable_button_with_label("Save Rules");
     save_rules.connect_clicked({
-        let rule_rows = rule_rows.clone();
-        let rule_status = rule_status.clone();
-        move |_| match build_commit_check_rules_from_rows(&rule_rows.borrow()) {
-            Ok(rules) => {
-                rule_status.set_text("Saving commit check rules...");
-                match save_commit_check_rules(rules) {
-                    Ok(message) => {
-                        rule_status.set_text(&message);
-                        append_log(message);
-                        refresh_views();
-                    }
-                    Err(message) => {
-                        rule_status.set_text(&message);
-                        append_log(message);
-                        refresh_views();
+        let editor = Rc::clone(&editor);
+        move |_| {
+            let rules = build_commit_check_rules_from_rows(&editor.rule_rows.borrow());
+            match rules {
+                Ok(rules) => {
+                    editor.status.set_text("Saving commit check rules...");
+                    match save_commit_check_rules(rules.clone()) {
+                        Ok(message) => {
+                            // The rows are what was saved, so the next refresh
+                            // has nothing to sync.
+                            *editor.baseline.borrow_mut() = rules;
+                            editor.status.set_text(&message);
+                            append_log(message);
+                            refresh_views();
+                        }
+                        Err(message) => {
+                            editor.status.set_text(&message);
+                            append_log(message);
+                            refresh_views();
+                        }
                     }
                 }
-            }
-            Err(message) => {
-                rule_status.set_text(&message);
+                Err(message) => {
+                    editor.status.set_text(&message);
+                }
             }
         }
     });
     let discard_changes = clickable_button_with_label("Discard Changes");
-    discard_changes.connect_clicked(|_| {
-        refresh_views();
+    discard_changes.connect_clicked({
+        let editor = Rc::clone(&editor);
+        move |_| {
+            sync_commit_check_editor(&editor, &snapshot(), true);
+        }
     });
     for button in [add_rule, save_rules, discard_changes] {
         rule_actions.append(&button);
@@ -7530,8 +7845,92 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
     root.append(&rules_header);
     root.append(&rules_help);
     root.append(&rule_actions);
-    root.append(&rule_status);
-    root.append(&rules_box);
+    root.append(&editor.status);
+    root.append(&editor.rules_box);
+    editor
+}
+
+/// Brings the editor rows in line with the manifest's rules. Rows are rebuilt
+/// only when the rules changed (or `force`), and only while the rows hold no
+/// unsaved edits; otherwise just the newly added rules are appended.
+fn sync_commit_check_editor(editor: &CommitCheckEditor, snapshot: &StateSnapshot, force: bool) {
+    let manifest_rules = snapshot
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.commit_check_rules.clone())
+        .unwrap_or_default();
+    if !force && *editor.baseline.borrow() == manifest_rules {
+        return;
+    }
+
+    let row_rules = build_commit_check_rules_from_rows(&editor.rule_rows.borrow());
+    if !force && commit_check_rows_dirty(&row_rules, &editor.baseline.borrow()) {
+        let row_ids = editor
+            .rule_rows
+            .borrow()
+            .iter()
+            .map(|row| row.rule_id.clone())
+            .collect::<Vec<_>>();
+        let added = commit_check_rules_added(&editor.baseline.borrow(), &row_ids, &manifest_rules);
+        for rule in &added {
+            append_commit_check_rule_row(&editor.rules_box, &editor.rule_rows, Some(rule));
+        }
+        if !added.is_empty() {
+            editor.status.set_text(&format!(
+                "Added {} rule(s) saved elsewhere. Your unsaved edits were kept.",
+                added.len()
+            ));
+        }
+    } else {
+        clear_box(&editor.rules_box);
+        editor.rule_rows.borrow_mut().clear();
+        for rule in &manifest_rules {
+            append_commit_check_rule_row(&editor.rules_box, &editor.rule_rows, Some(rule));
+        }
+        editor.status.set_text(&commit_check_rule_status_text(
+            snapshot,
+            manifest_rules.len(),
+        ));
+    }
+    *editor.baseline.borrow_mut() = manifest_rules;
+}
+
+fn commit_check_rule_status_text(snapshot: &StateSnapshot, rule_count: usize) -> String {
+    snapshot
+        .manifest_path
+        .as_ref()
+        .map(|path| {
+            format!(
+                "Loaded {rule_count} commit check rules from {}. Use Save Rules to persist edits.",
+                path.display()
+            )
+        })
+        .unwrap_or_else(|| {
+            format!("Loaded {rule_count} commit check rules. No workspace manifest is loaded.")
+        })
+}
+
+/// Whether the editor rows differ from the rules they were loaded from. Rows
+/// that do not even form valid rules are being edited.
+fn commit_check_rows_dirty(
+    row_rules: &Result<Vec<CommitCheckRule>, String>,
+    baseline: &[CommitCheckRule],
+) -> bool {
+    !matches!(row_rules, Ok(rules) if rules == baseline)
+}
+
+/// Manifest rules that are neither in `baseline` nor already shown as a row.
+fn commit_check_rules_added(
+    baseline: &[CommitCheckRule],
+    row_ids: &[String],
+    manifest_rules: &[CommitCheckRule],
+) -> Vec<CommitCheckRule> {
+    manifest_rules
+        .iter()
+        .filter(|rule| !baseline.iter().any(|known| known.id == rule.id))
+        .filter(|rule| !row_ids.iter().any(|id| *id == rule.id))
+        .cloned()
+        .collect()
 }
 
 fn append_commit_check_rule_row(
@@ -7634,37 +8033,54 @@ fn append_commit_check_rule_row(
     });
 }
 
-fn open_add_commit_check_rule_dialog(
-    parent: Option<Window>,
-    rules_box: GtkBox,
-    rule_rows: Rc<RefCell<Vec<CommitCheckRuleRowHandle>>>,
-    status: Label,
-) {
-    let dialog = Dialog::builder()
-        .modal(true)
-        .title("Add Commit Check Rule")
-        .build();
-    if let Some(parent) = parent.as_ref() {
-        dialog.set_transient_for(Some(parent));
+/// A modal window showing `body` above a right-aligned row of `buttons`, used
+/// in place of the deprecated gtk::Dialog. Escape closes it.
+fn build_modal_window(
+    parent: Option<&Window>,
+    title: &str,
+    body: &impl IsA<gtk::Widget>,
+    buttons: &[&Button],
+) -> Window {
+    let window = Window::builder().modal(true).title(title).build();
+    if let Some(parent) = parent {
+        window.set_transient_for(Some(parent));
     }
-    let cancel = dialog.add_button("Cancel", ResponseType::Cancel);
-    mark_clickable(&cancel);
-    cancel.add_css_class(&button_css_class("secondary"));
-    let add = dialog.add_button("Add Rule", ResponseType::Accept);
-    mark_clickable(&add);
-    add.add_css_class(&button_css_class("primary"));
-    dialog.set_default_response(ResponseType::Accept);
-    dialog.add_css_class(&surface_css_class("workbench"));
-    dialog.add_css_class(&text_css_class("body"));
 
-    let content = dialog.content_area();
-    content.add_css_class(&surface_css_class("workbench"));
-    content.add_css_class(&text_css_class("body"));
+    let content = GtkBox::new(Orientation::Vertical, 12);
     content.set_margin_top(16);
     content.set_margin_bottom(16);
     content.set_margin_start(16);
     content.set_margin_end(16);
-    content.set_spacing(12);
+    content.append(body);
+
+    let button_row = GtkBox::new(Orientation::Horizontal, 8);
+    button_row.set_halign(Align::End);
+    for button in buttons {
+        mark_clickable(*button);
+        button_row.append(*button);
+    }
+    content.append(&button_row);
+    window.set_child(Some(&content));
+
+    let escape = gtk::EventControllerKey::new();
+    escape.connect_key_pressed(|controller, key, _, _| {
+        if key != gtk::gdk::Key::Escape {
+            return glib::Propagation::Proceed;
+        }
+        if let Some(window) = controller.widget().and_downcast::<Window>() {
+            window.close();
+        }
+        glib::Propagation::Stop
+    });
+    window.add_controller(escape);
+    window
+}
+
+fn open_add_commit_check_rule_dialog(parent: Option<Window>, editor: Rc<CommitCheckEditor>) {
+    let cancel = Button::with_label("Cancel");
+    cancel.add_css_class(&button_css_class("secondary"));
+    let add = Button::with_label("Add Rule");
+    add.add_css_class(&button_css_class("primary"));
 
     let body = GtkBox::new(Orientation::Vertical, 8);
     body.add_css_class(&surface_css_class("workbench"));
@@ -7713,10 +8129,32 @@ fn open_add_commit_check_rule_dialog(
     body.append(&labeled_field("Pattern Or Hash", &value));
     body.append(&labeled_field("Repository Scope", &repository_ids));
     body.append(&error);
-    content.append(&body);
+    for entry in [&name, &priority, &value, &repository_ids] {
+        entry.set_activates_default(true);
+    }
 
-    dialog.connect_response({
-        let dialog = dialog.clone();
+    let dialog = build_modal_window(
+        parent.as_ref(),
+        "Add Commit Check Rule",
+        &body,
+        &[&cancel, &add],
+    );
+    dialog.add_css_class(&surface_css_class("workbench"));
+    dialog.add_css_class(&text_css_class("body"));
+    dialog.set_default_widget(Some(&add));
+
+    cancel.connect_clicked({
+        let dialog = dialog.downgrade();
+        move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        }
+    });
+    // The handler lives on a button inside the window, so it must not hold the
+    // window strongly.
+    add.connect_clicked({
+        let dialog = dialog.downgrade();
         let enabled = enabled.clone();
         let allow = allow.clone();
         let hash_matcher = hash_matcher.clone();
@@ -7725,12 +8163,7 @@ fn open_add_commit_check_rule_dialog(
         let value = value.clone();
         let repository_ids = repository_ids.clone();
         let error = error.clone();
-        move |_, response| {
-            if response != ResponseType::Accept {
-                dialog.close();
-                return;
-            }
-
+        move |_| {
             let rule_name = name.text().trim().to_string();
             if rule_name.is_empty() {
                 error.set_text("Rule needs a name.");
@@ -7783,28 +8216,27 @@ fn open_add_commit_check_rule_dialog(
                 },
             };
 
-            let mut rules = match build_commit_check_rules_from_rows(&rule_rows.borrow()) {
-                Ok(rules) => rules,
-                Err(message) => {
-                    error.set_text(&message);
-                    return;
-                }
-            };
+            // Persist only the new rule on top of the saved rules; unsaved
+            // edits in the editor rows stay unsaved.
+            let mut rules = current_commit_check_rules();
             rules.push(rule.clone());
 
-            status.set_text("Saving commit check rule...");
+            editor.status.set_text("Saving commit check rule...");
             match save_commit_check_rules(rules) {
                 Ok(message) => {
-                    append_commit_check_rule_row(&rules_box, &rule_rows, Some(&rule));
-                    status.set_text(&format!("Saved rule \"{}\". {}", rule.name, message));
-                    append_log(message);
-                    dialog.close();
+                    if let Some(dialog) = dialog.upgrade() {
+                        dialog.close();
+                    }
                     refresh_commit_check_views_now();
+                    editor
+                        .status
+                        .set_text(&format!("Saved rule \"{}\". {}", rule.name, message));
+                    append_log(message);
                     refresh_log_surfaces();
                 }
                 Err(message) => {
                     error.set_text(&message);
-                    status.set_text(&message);
+                    editor.status.set_text(&message);
                     append_log(message);
                     refresh_log_surfaces();
                 }
@@ -7891,11 +8323,24 @@ fn build_commit_check_rules_from_rows(
 }
 
 fn new_commit_check_rule_id() -> String {
+    // Rows created in the same millisecond (e.g. several Add Rule clicks)
+    // would otherwise share an id and be removed together.
+    static RULE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
     let millis = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
-    format!("rule-{millis}")
+    let sequence = RULE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("rule-{millis}-{sequence}")
+}
+
+fn current_commit_check_rules() -> Vec<CommitCheckRule> {
+    let app_state = state().lock().expect("state mutex poisoned");
+    app_state
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.commit_check_rules.clone())
+        .unwrap_or_default()
 }
 
 fn save_commit_check_rules(rules: Vec<CommitCheckRule>) -> Result<String, String> {
@@ -7962,29 +8407,17 @@ fn create_repo_overview_view(
 
     root.append(&tab_bar);
 
-    let summary_root = repo_overview_page_root();
-    let git_root = repo_overview_page_root();
-    let manifest_root = repo_overview_page_root();
-    let activity_root = repo_overview_page_root();
-
-    stack.add_titled(
-        &repo_overview_scroll_page(&summary_root),
-        Some("summary"),
-        "Summary",
-    );
-    stack.add_titled(&repo_overview_scroll_page(&git_root), Some("git"), "Git");
-    stack.add_titled(
-        &repo_overview_scroll_page(&manifest_root),
-        Some("manifest"),
-        "Manifest",
-    );
-
-    stack.add_titled(
-        &repo_overview_scroll_page(&activity_root),
-        Some("activity"),
-        "Activity",
-    );
-    stack.set_visible_child_name("summary");
+    let mut pages = Vec::new();
+    for page in RepoOverviewPage::ALL {
+        let page_root = repo_overview_page_root();
+        stack.add_titled(
+            &vertical_view_scroller(&page_root),
+            Some(page.name()),
+            page.title(),
+        );
+        pages.push((page, page_root));
+    }
+    stack.set_visible_child_name(RepoOverviewPage::Summary.name());
     mark_clickable(&switcher);
     mark_clickable_descendant_buttons(&switcher);
 
@@ -8008,46 +8441,54 @@ fn create_repo_overview_view(
     let instance_key =
         unsafe { request.as_ref() }.and_then(|request| decode_mzstr(request.instance_key));
     let snapshot = snapshot();
-    render_repo_overview_pages(
-        &summary_root,
-        &git_root,
-        &manifest_root,
-        &activity_root,
-        &snapshot,
-        instance_key.as_deref(),
-        host,
-    );
     terminal_panel.append(&build_repo_terminal_panel(
         &snapshot,
         instance_key.as_deref(),
     ));
 
-    let summary_ref = glib::WeakRef::new();
-    summary_ref.set(Some(&summary_root));
-    let git_ref = glib::WeakRef::new();
-    git_ref.set(Some(&git_root));
-    let manifest_ref = glib::WeakRef::new();
-    manifest_ref.set(Some(&manifest_root));
-    let activity_ref = glib::WeakRef::new();
-    activity_ref.set(Some(&activity_root));
-    let terminal_ref = glib::WeakRef::new();
-    terminal_ref.set(Some(&terminal_panel));
+    let stack_ref = glib::WeakRef::new();
+    stack_ref.set(Some(&stack));
+    let view = Rc::new(RepoOverviewView {
+        stack: stack_ref,
+        pages,
+        stale: RefCell::new(RepoOverviewPage::ALL.into_iter().collect()),
+        terminal_root: terminal_panel,
+        instance_key,
+        host_ptr: host as usize,
+    });
+    for (page, page_root) in &view.pages {
+        if *page == RepoOverviewPage::Summary {
+            view.stale.borrow_mut().remove(page);
+            render_repo_overview_page(&view, *page, page_root, &snapshot);
+        }
+    }
+
+    // Stale tabs are rendered when they become visible, either by switching
+    // tabs or by this view's tab coming to the front.
+    stack.connect_visible_child_name_notify({
+        let view = Rc::downgrade(&view);
+        move |_| {
+            if let Some(view) = view.upgrade() {
+                render_visible_repo_overview_page_if_stale(&view);
+            }
+        }
+    });
+    stack.connect_map({
+        let view = Rc::downgrade(&view);
+        move |_| {
+            let view = view.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(view) = view.upgrade() {
+                    render_visible_repo_overview_page_if_stale(&view);
+                }
+            });
+        }
+    });
     REPO_OVERVIEWS.with(|views| {
-        views.borrow_mut().push(RepoOverviewViewHandle {
-            summary_root: summary_ref,
-            git_root: git_ref,
-            manifest_root: manifest_ref,
-            activity_root: activity_ref,
-            terminal_root: terminal_ref,
-            instance_key,
-            host_ptr: host as usize,
-        });
+        views.borrow_mut().push(view);
     });
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(root)
 }
 
 fn create_workspace_settings_view(
@@ -8058,40 +8499,9 @@ fn create_workspace_settings_view(
         return std::ptr::null_mut();
     }
 
-    let host = remember_host_ptr(host);
+    remember_host_ptr(host);
 
-    let root = GtkBox::new(Orientation::Vertical, 18);
-    root.set_margin_top(24);
-    root.set_margin_bottom(24);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
-
-    let snapshot = snapshot();
-    render_workspace_settings_into(&root, &snapshot, host);
-
-    let root_ref = glib::WeakRef::new();
-    root_ref.set(Some(&root));
-    FUCINA_POLICY_VIEWS.with(|views| {
-        views.borrow_mut().push(ContainerViewHandle {
-            root: root_ref,
-            host_ptr: host as usize,
-        });
-    });
-
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-            as *mut std::ffi::c_void
-    }
-}
-
-fn render_workspace_settings_into(
-    root: &GtkBox,
-    snapshot: &StateSnapshot,
-    _host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-) {
-    clear_box(root);
-    let policy_root =
-        fucina_policy_root(&snapshot.workspace_root, snapshot.manifest_path.as_deref());
+    let root = padded_view_root(18, 24);
 
     let heading = Label::new(Some("Fucina repository policy"));
     heading.set_xalign(0.0);
@@ -8105,12 +8515,60 @@ fn render_workspace_settings_into(
     explanation.set_wrap(true);
     root.append(&explanation);
 
+    let policy_area = GtkBox::new(Orientation::Vertical, 18);
     let action_status = Label::new(Some("Ready · detailed results appear in Operations"));
     action_status.set_xalign(0.0);
     action_status.set_wrap(true);
+    let repository_area = GtkBox::new(Orientation::Vertical, 0);
+    repository_area.set_vexpand(true);
+    root.append(&policy_area);
+    root.append(&action_status);
+    root.append(&repository_area);
 
-    match load_fucina_policy(&policy_root) {
+    let root_ref = glib::WeakRef::new();
+    root_ref.set(Some(&root));
+    let handle = FucinaPolicyViewHandle {
+        root: root_ref,
+        policy_area,
+        repository_area,
+        action_status,
+        rendered_source: RefCell::new(None),
+    };
+    sync_fucina_policy_view(&handle, &snapshot());
+    FUCINA_POLICY_VIEWS.with(|views| {
+        views.borrow_mut().push(handle);
+    });
+
+    into_view_ptr(root)
+}
+
+/// Re-renders the policy part of a Fucina view when repos.toml was replaced,
+/// edited or moved since it was last rendered.
+fn sync_fucina_policy_view(handle: &FucinaPolicyViewHandle, snapshot: &StateSnapshot) {
+    let policy_root =
+        fucina_policy_root(&snapshot.workspace_root, snapshot.manifest_path.as_deref());
+    let source = FucinaPolicySource {
+        modified: fs::metadata(policy_root.join("repos.toml"))
+            .and_then(|metadata| metadata.modified())
+            .ok(),
+        policy_root,
+    };
+    if handle.rendered_source.borrow().as_ref() == Some(&source) {
+        return;
+    }
+    render_fucina_policy(handle, &source.policy_root);
+    *handle.rendered_source.borrow_mut() = Some(source);
+}
+
+fn render_fucina_policy(handle: &FucinaPolicyViewHandle, policy_root: &Path) {
+    clear_box(&handle.policy_area);
+    clear_box(&handle.repository_area);
+    let root = &handle.policy_area;
+    let action_status = &handle.action_status;
+
+    match load_fucina_policy(policy_root) {
         Ok(policy) => {
+            action_status.set_visible(true);
             let summary = Label::new(Some(&format!(
                 "Schema {} · {} repositories",
                 policy.schema_version,
@@ -8133,34 +8591,33 @@ fn render_workspace_settings_into(
 
             connect_fucina_action(
                 &validate,
-                policy_root.clone(),
+                policy_root.to_path_buf(),
                 FucinaPolicyAction::Validate,
                 Vec::new(),
                 action_status.clone(),
             );
             connect_fucina_action(
                 &audit,
-                policy_root.clone(),
+                policy_root.to_path_buf(),
                 FucinaPolicyAction::Audit,
                 Vec::new(),
                 action_status.clone(),
             );
             connect_fucina_action(
                 &preview,
-                policy_root.clone(),
+                policy_root.to_path_buf(),
                 FucinaPolicyAction::ConfigurePreview,
                 Vec::new(),
                 action_status.clone(),
             );
-            connect_fucina_apply(&apply, policy_root.clone(), action_status.clone());
-            root.append(&action_status);
+            connect_fucina_apply(&apply, policy_root.to_path_buf(), action_status.clone());
 
             let repository_list = GtkBox::new(Orientation::Vertical, 6);
             for repository in &policy.repositories {
                 repository_list.append(&fucina_repository_row(
                     repository,
-                    &policy_root,
-                    &action_status,
+                    policy_root,
+                    action_status,
                 ));
             }
             let repositories = ScrolledWindow::builder()
@@ -8170,9 +8627,10 @@ fn render_workspace_settings_into(
                 .vexpand(true)
                 .child(&repository_list)
                 .build();
-            root.append(&repositories);
+            handle.repository_area.append(&repositories);
         }
         Err(message) => {
+            action_status.set_visible(false);
             let error = Label::new(Some(&message));
             error.set_xalign(0.0);
             error.set_wrap(true);
@@ -8341,27 +8799,35 @@ fn fucina_preview_allows_confirmation(preview: &Result<FucinaPolicyCommandResult
 }
 
 fn show_fucina_apply_confirmation(workspace_root: PathBuf, action_status: Label) {
-    let dialog = Dialog::builder()
-        .title("Apply Fucina configuration?")
-        .modal(true)
-        .build();
-    dialog.add_button("Cancel", ResponseType::Cancel);
-    let apply = dialog.add_button("Apply", ResponseType::Accept);
+    let cancel = Button::with_label("Cancel");
+    let apply = Button::with_label("Apply");
     apply.add_css_class("destructive-action");
-    dialog.set_default_response(ResponseType::Cancel);
     let content = Label::new(Some(
         "The preview succeeded. Apply only the safe changes accepted by the policy engine? Unexpected remotes and unresolved backup gates will still be refused.",
     ));
     content.set_wrap(true);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
-    dialog.content_area().append(&content);
-    dialog.connect_response(move |dialog, response| {
-        dialog.close();
-        if response != ResponseType::Accept {
-            return;
+    content.set_max_width_chars(60);
+    content.set_margin_top(2);
+    content.set_margin_bottom(2);
+    let dialog = build_modal_window(
+        active_window().as_ref(),
+        "Apply Fucina configuration?",
+        &content,
+        &[&cancel, &apply],
+    );
+    dialog.set_default_widget(Some(&cancel));
+    cancel.connect_clicked({
+        let dialog = dialog.downgrade();
+        move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        }
+    });
+    let dialog_ref = dialog.downgrade();
+    apply.connect_clicked(move |_| {
+        if let Some(dialog) = dialog_ref.upgrade() {
+            dialog.close();
         }
         action_status.set_text("Applying · see Operations for details");
         let action_status = action_status.clone();
@@ -8381,24 +8847,14 @@ fn run_fucina_action_async(
     workspace_root: PathBuf,
     action: FucinaPolicyAction,
     repositories: Vec<String>,
-    completion: impl Fn(Result<FucinaPolicyCommandResult, String>) + 'static,
+    completion: impl FnOnce(Result<FucinaPolicyCommandResult, String>) + 'static,
 ) {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(run_fucina_policy(&workspace_root, action, &repositories));
-    });
-    glib::timeout_add_local(Duration::from_millis(50), move || {
-        match receiver.try_recv() {
-            Ok(result) => {
-                completion(result);
-                glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                completion(Err("Fucina policy worker stopped unexpectedly".to_string()));
-                glib::ControlFlow::Break
-            }
-        }
+    glib::spawn_future_local(async move {
+        let result =
+            gio::spawn_blocking(move || run_fucina_policy(&workspace_root, action, &repositories))
+                .await
+                .unwrap_or_else(|_| Err("Fucina policy worker stopped unexpectedly".to_string()));
+        completion(result);
     });
 }
 
@@ -8464,39 +8920,6 @@ fn labeled_field(label: &str, widget: &impl IsA<gtk::Widget>) -> GtkBox {
     row.append(&title);
     row.append(widget);
     row
-}
-
-fn persist_monitor_view_mode(mode: MonitorViewMode) {
-    persist_plugin_config_direct(move |config| {
-        config.monitor_view_mode = mode;
-    });
-}
-
-fn persist_monitor_filter_mode(view: MonitorViewMode, mode: MonitorFilterMode) {
-    persist_plugin_config_direct(move |config| match view {
-        MonitorViewMode::Overview => config.overview_filter_mode = mode,
-        MonitorViewMode::Git => config.git_filter_mode = mode,
-        MonitorViewMode::Checks => config.checks_filter_mode = mode,
-        MonitorViewMode::Manifest => config.manifest_filter_mode = mode,
-    });
-}
-
-fn persist_monitor_sort_mode(view: MonitorViewMode, mode: MonitorSortMode) {
-    persist_plugin_config_direct(move |config| match view {
-        MonitorViewMode::Overview => config.overview_sort_mode = mode,
-        MonitorViewMode::Git => config.git_sort_mode = mode,
-        MonitorViewMode::Checks => config.checks_sort_mode = mode,
-        MonitorViewMode::Manifest => config.manifest_sort_mode = mode,
-    });
-}
-
-fn persist_monitor_sort_descending(view: MonitorViewMode, descending: bool) {
-    persist_plugin_config_direct(move |config| match view {
-        MonitorViewMode::Overview => config.overview_sort_descending = descending,
-        MonitorViewMode::Git => config.git_sort_descending = descending,
-        MonitorViewMode::Checks => config.checks_sort_descending = descending,
-        MonitorViewMode::Manifest => config.manifest_sort_descending = descending,
-    });
 }
 
 type PluginConfigUpdate = Box<dyn FnOnce(&mut RonomepoPluginConfig)>;
@@ -9099,8 +9522,64 @@ fn apply_loaded_manifest(
     app_state.repo_details_loading.clear();
     sync_repo_runtime_state(&mut app_state);
     drop(app_state);
+    reload_capability_registry();
     sync_watch_manager_from_state();
     schedule_workspace_scan();
+}
+
+fn read_capability_registry(workspace_root: &Path) -> Arc<CapabilityRegistry> {
+    Arc::new(
+        load_capability_registry(&default_capability_registry_path(workspace_root))
+            .unwrap_or_default(),
+    )
+}
+
+/// Re-reads the capability registry into the state cache. The file is read
+/// outside the state lock.
+fn reload_capability_registry() {
+    let workspace_root = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        app_state.workspace_root.clone()
+    };
+    let registry = read_capability_registry(&workspace_root);
+    let mut app_state = state().lock().expect("state mutex poisoned");
+    if app_state.workspace_root == workspace_root {
+        app_state.capability_registry = registry;
+    }
+}
+
+/// A vertical view root with the same padding on every side.
+fn padded_view_root(spacing: i32, padding: i32) -> GtkBox {
+    let root = GtkBox::new(Orientation::Vertical, spacing);
+    root.set_margin_top(padding);
+    root.set_margin_bottom(padding);
+    root.set_margin_start(padding);
+    root.set_margin_end(padding);
+    root
+}
+
+/// Wraps `child` in a vertically scrolling window that fills its view.
+fn vertical_view_scroller(child: &impl IsA<gtk::Widget>) -> ScrolledWindow {
+    let scroller = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(0)
+        .child(child)
+        .build();
+    scroller.set_valign(Align::Fill);
+    scroller.set_propagate_natural_height(false);
+    scroller
+}
+
+/// Hands a view factory's top-level widget to the host, which takes the
+/// reference.
+fn into_view_ptr(widget: impl IsA<gtk::Widget>) -> *mut std::ffi::c_void {
+    unsafe {
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(widget.upcast())
+            as *mut std::ffi::c_void
+    }
 }
 
 fn repo_overview_page_root() -> GtkBox {
@@ -9114,64 +9593,74 @@ fn repo_overview_page_root() -> GtkBox {
     root
 }
 
-fn repo_overview_scroll_page(root: &GtkBox) -> ScrolledWindow {
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(0)
-        .child(root)
-        .build();
-    scroller.set_valign(Align::Fill);
-    scroller.set_propagate_natural_height(false);
-    scroller
+fn visible_repo_overview_page(view: &RepoOverviewView) -> Option<(RepoOverviewPage, &GtkBox)> {
+    let stack = view.stack.upgrade()?;
+    if !stack.is_mapped() {
+        return None;
+    }
+    let visible = stack.visible_child_name()?;
+    view.pages
+        .iter()
+        .find(|(page, _)| page.name() == visible.as_str())
+        .map(|(page, root)| (*page, root))
 }
 
-fn render_repo_overview_pages(
-    summary_root: &GtkBox,
-    git_root: &GtkBox,
-    manifest_root: &GtkBox,
-    activity_root: &GtkBox,
-    snapshot: &StateSnapshot,
-    instance_key: Option<&str>,
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-) {
-    for root in [summary_root, git_root, manifest_root, activity_root] {
-        clear_box(root);
+fn render_visible_repo_overview_page(view: &RepoOverviewView, snapshot: &StateSnapshot) {
+    let Some((page, root)) = visible_repo_overview_page(view) else {
+        return;
+    };
+    if view.stale.borrow_mut().remove(&page) {
+        render_repo_overview_page(view, page, root, snapshot);
     }
+}
 
-    let target_repo_id = instance_key.or(snapshot.active_repo_id.as_deref());
+fn render_visible_repo_overview_page_if_stale(view: &RepoOverviewView) {
+    let Some((page, _)) = visible_repo_overview_page(view) else {
+        return;
+    };
+    if view.stale.borrow().contains(&page) {
+        render_visible_repo_overview_page(view, &snapshot());
+    }
+}
+
+fn render_repo_overview_page(
+    view: &RepoOverviewView,
+    page: RepoOverviewPage,
+    root: &GtkBox,
+    snapshot: &StateSnapshot,
+) {
+    clear_box(root);
+    let host_ptr = view.host_ptr as *const maruzzella_sdk::ffi::MzHostApi;
+
+    let target_repo_id = view
+        .instance_key
+        .as_deref()
+        .or(snapshot.active_repo_id.as_deref());
     let Some(active_repo_id) = target_repo_id else {
-        render_repo_overview_empty_page(
-            summary_root,
-            snapshot,
-            host_ptr,
-            "No repo target was provided. Open repo overviews from the left monitor.",
-        );
-        render_repo_overview_muted_page(git_root, "No repo target is attached to this tab.");
-        render_repo_overview_muted_page(manifest_root, "No repo target is attached to this tab.");
-        render_repo_overview_muted_page(activity_root, "No repo target is attached to this tab.");
+        if page == RepoOverviewPage::Summary {
+            render_repo_overview_empty_page(
+                root,
+                snapshot,
+                host_ptr,
+                "No repo target was provided. Open repo overviews from the left monitor.",
+            );
+        } else {
+            render_repo_overview_muted_page(root, "No repo target is attached to this tab.");
+        }
         return;
     };
 
-    let items = repository_items(snapshot);
-    let Some(item) = items.iter().find(|item| item.id == active_repo_id) else {
-        render_repo_overview_empty_page(
-            summary_root,
-            snapshot,
-            host_ptr,
-            "The active repo overview target is no longer present in the current manifest.",
-        );
-        render_repo_overview_muted_page(git_root, "This repository is no longer in the manifest.");
-        render_repo_overview_muted_page(
-            manifest_root,
-            "This repository is no longer in the manifest.",
-        );
-        render_repo_overview_muted_page(
-            activity_root,
-            "This repository is no longer in the manifest.",
-        );
+    let Some(item) = repo_item_by_id(snapshot, active_repo_id) else {
+        if page == RepoOverviewPage::Summary {
+            render_repo_overview_empty_page(
+                root,
+                snapshot,
+                host_ptr,
+                "The active repo overview target is no longer present in the current manifest.",
+            );
+        } else {
+            render_repo_overview_muted_page(root, "This repository is no longer in the manifest.");
+        }
         return;
     };
 
@@ -9182,12 +9671,25 @@ fn render_repo_overview_pages(
     }
 
     let attention_signals = repo_attention_detail_signals(snapshot, item);
-    let details = snapshot.repo_details_cache.get(&item.id);
-
-    render_repo_overview_summary_page(summary_root, snapshot, item, &attention_signals, host_ptr);
-    render_repo_overview_git_page(git_root, snapshot, item, details, host_ptr);
-    render_repo_overview_manifest_page(manifest_root, snapshot, item, host_ptr);
-    render_repo_overview_activity_page(activity_root, snapshot, item, host_ptr);
+    root.append(&repo_overview_context(item, snapshot, &attention_signals));
+    match page {
+        RepoOverviewPage::Summary => {
+            render_repo_overview_summary_page(root, snapshot, item, &attention_signals, host_ptr)
+        }
+        RepoOverviewPage::Git => render_repo_overview_git_page(
+            root,
+            snapshot,
+            item,
+            snapshot.repo_details_cache.get(&item.id),
+            host_ptr,
+        ),
+        RepoOverviewPage::Manifest => {
+            render_repo_overview_manifest_page(root, snapshot, item, host_ptr)
+        }
+        RepoOverviewPage::Activity => {
+            render_repo_overview_activity_page(root, snapshot, item, host_ptr)
+        }
+    }
 }
 
 fn render_repo_overview_empty_page(
@@ -9222,7 +9724,6 @@ fn render_repo_overview_summary_page(
     attention_signals: &[AttentionSignal],
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    root.append(&repo_overview_context(item, snapshot, attention_signals));
     root.append(&repo_overview_summary_facts_section(
         snapshot,
         item,
@@ -9249,8 +9750,6 @@ fn render_repo_overview_git_page(
     details: Option<&RepositoryDetails>,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    let attention_signals = repo_attention_detail_signals(snapshot, item);
-    root.append(&repo_overview_context(item, snapshot, &attention_signals));
     root.append(&repo_overview_action_section(
         "Git Actions",
         item,
@@ -9275,8 +9774,6 @@ fn render_repo_overview_manifest_page(
     item: &RepositoryListItem,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    let attention_signals = repo_attention_detail_signals(snapshot, item);
-    root.append(&repo_overview_context(item, snapshot, &attention_signals));
     root.append(&repo_overview_manifest_status_section(item));
     root.append(&repo_overview_action_section(
         "Manifest Actions",
@@ -9298,8 +9795,6 @@ fn render_repo_overview_activity_page(
     item: &RepositoryListItem,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    let attention_signals = repo_attention_detail_signals(snapshot, item);
-    root.append(&repo_overview_context(item, snapshot, &attention_signals));
     root.append(&repo_overview_activity_section(
         &repo_recent_logs(snapshot, item),
         18,
@@ -9312,7 +9807,7 @@ fn repo_overview_summary_facts_section(
     item: &RepositoryListItem,
     attention_signals: &[AttentionSignal],
 ) -> GtkBox {
-    let summary = capability_monitor_summary(item, snapshot);
+    let summary = capability_monitor_summary(item, &snapshot.capability_registry);
     let facts = [
         ("State", status_label(&item.status.state).to_string()),
         ("Sync", format_sync_label(&item.status.sync)),
@@ -9426,7 +9921,10 @@ fn repo_overview_context(
         "{} · attention {} · caps {} · due {} · {}",
         status_label(&item.status.state),
         attention_monitor_label(attention_signals),
-        capability_monitor_label(&capability_monitor_summary(item, snapshot)),
+        capability_monitor_label(&capability_monitor_summary(
+            item,
+            &snapshot.capability_registry
+        )),
         repo_due_capability_count(snapshot, item, current_epoch_secs()),
         if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
             "selected"
@@ -9617,6 +10115,11 @@ fn repo_overview_lines_body(lines: &[String], empty_message: &str, mono: bool) -
 }
 
 fn repo_overview_facts_body(facts: &[(&str, String)]) -> GtkBox {
+    facts_body(facts, 9)
+}
+
+/// Rows of dimmed keys (`key_width_chars` wide) and wrapping values.
+fn facts_body(facts: &[(&str, String)], key_width_chars: i32) -> GtkBox {
     let block = GtkBox::new(Orientation::Vertical, 6);
     for (label, value) in facts {
         let row = GtkBox::new(Orientation::Horizontal, 10);
@@ -9624,7 +10127,7 @@ fn repo_overview_facts_body(facts: &[(&str, String)]) -> GtkBox {
 
         let key = Label::new(Some(label));
         key.set_xalign(0.0);
-        key.set_width_chars(9);
+        key.set_width_chars(key_width_chars);
         key.add_css_class("dim-label");
 
         let value_label = Label::new(Some(value));
@@ -9933,9 +10436,11 @@ fn overview_actions(include_open_overview: bool) -> GtkBox {
     let operation_running = operation_in_flight();
     for (label, handler) in entries {
         let button = clickable_button_with_label(label);
-        if operation_running && matches!(label, "Pull" | "Push") {
-            button.set_sensitive(false);
-            button.set_tooltip_text(Some("Another operation is still running"));
+        if matches!(label, "Pull" | "Push") {
+            set_operation_button_running(&button, operation_running);
+            let button_ref = glib::WeakRef::new();
+            button_ref.set(Some(&button));
+            OPERATION_BUTTONS.with(|buttons| buttons.borrow_mut().push(button_ref));
         }
         button.connect_clicked(move |_| {
             let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
@@ -9943,6 +10448,24 @@ fn overview_actions(include_open_overview: bool) -> GtkBox {
         actions.append(&button);
     }
     actions
+}
+
+fn set_operation_button_running(button: &Button, operation_running: bool) {
+    button.set_sensitive(!operation_running);
+    button.set_tooltip_text(operation_running.then_some("Another operation is still running"));
+}
+
+fn refresh_operation_buttons() {
+    let operation_running = operation_in_flight();
+    OPERATION_BUTTONS.with(|buttons| {
+        buttons.borrow_mut().retain(|button_ref| {
+            let Some(button) = button_ref.upgrade() else {
+                return false;
+            };
+            set_operation_button_running(&button, operation_running);
+            true
+        });
+    });
 }
 
 fn overview_command_group(label: &str, actions: GtkBox) -> GtkBox {
@@ -10008,15 +10531,21 @@ fn clear_selection_button(selected_count: usize) -> Button {
 
 fn report_button(
     label: &str,
-    loading: bool,
     handler: extern "C" fn(maruzzella_sdk::ffi::MzBytes) -> maruzzella_sdk::ffi::MzStatus,
 ) -> Button {
-    let button = clickable_button_with_label(if loading { "Running..." } else { label });
-    button.set_sensitive(!loading);
+    let button = clickable_button_with_label(label);
     button.connect_clicked(move |_| {
         let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
     });
     button
+}
+
+fn set_report_button_loading(button: &Button, label: &str, loading: bool) {
+    let text = if loading { "Running..." } else { label };
+    if button.label().as_deref() != Some(text) {
+        button.set_label(text);
+    }
+    button.set_sensitive(!loading);
 }
 
 fn repo_target_button(item: &RepositoryListItem) -> Button {
@@ -10128,25 +10657,7 @@ fn append_facts_section(container: &GtkBox, heading: &str, facts: &[(&str, Strin
     heading_label.set_xalign(0.0);
     heading_label.add_css_class("title-4");
     block.append(&heading_label);
-
-    for (label, value) in facts {
-        let row = GtkBox::new(Orientation::Horizontal, 10);
-        row.set_hexpand(true);
-
-        let key = Label::new(Some(label));
-        key.set_xalign(0.0);
-        key.set_width_chars(12);
-        key.add_css_class("dim-label");
-
-        let value_label = Label::new(Some(value));
-        value_label.set_xalign(0.0);
-        value_label.set_hexpand(true);
-        value_label.set_wrap(true);
-
-        row.append(&key);
-        row.append(&value_label);
-        block.append(&row);
-    }
+    block.append(&facts_body(facts, 12));
 
     container.append(&block);
     container.append(&Separator::new(Orientation::Horizontal));
@@ -10242,6 +10753,7 @@ fn overview_file_actions(
 }
 
 fn monorepo_selection_actions(
+    snapshot: &StateSnapshot,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
     items: &[RepositoryListItem],
 ) -> GtkBox {
@@ -10249,16 +10761,13 @@ fn monorepo_selection_actions(
     let bucket_row = GtkBox::new(Orientation::Horizontal, 8);
     let scope_row = GtkBox::new(Orientation::Horizontal, 8);
 
-    let current_snapshot = snapshot();
-    let selected_ids = current_snapshot.selected_repo_ids.clone();
+    let selected_ids = snapshot.selected_repo_ids.clone();
     let selected_count = selected_ids.len();
 
     for button in [
         select_repo_bucket(
             "Select Attention",
-            collect_repo_ids(items, |item| {
-                repo_attention_rank(&current_snapshot, item) < 7
-            }),
+            collect_repo_ids(items, |item| repo_attention_rank(snapshot, item) < 7),
         ),
         select_repo_bucket(
             "Select Dirty",
@@ -10305,14 +10814,11 @@ fn monorepo_selection_actions(
     actions
 }
 
-fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
+fn monorepo_report_controls() -> MonorepoReportControls {
     let actions = GtkBox::new(Orientation::Horizontal, 8);
 
-    actions.append(&report_button(
-        "Check History",
-        snapshot.history_report_loading,
-        command_check_history,
-    ));
+    let check_history = report_button("Check History", command_check_history);
+    actions.append(&check_history);
 
     let open_commit_check = clickable_button_with_label("Open Commit Check");
     open_commit_check.connect_clicked(|_| {
@@ -10322,7 +10828,6 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
 
     let since_entry = Entry::new();
     since_entry.set_placeholder_text(Some("Since date YYYY-MM-DD"));
-    since_entry.set_text(&snapshot.line_stats_since);
     since_entry.set_hexpand(true);
     since_entry.connect_changed(|entry| {
         update_line_stats_since(entry.text().to_string());
@@ -10332,11 +10837,8 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
     });
     actions.append(&since_entry);
 
-    actions.append(&report_button(
-        "Line Stats",
-        snapshot.line_stats_loading,
-        command_line_stats,
-    ));
+    let line_stats = report_button("Line Stats", command_line_stats);
+    actions.append(&line_stats);
 
     let capability_checks = clickable_button_with_label("Capability Checks");
     capability_checks.connect_clicked(|_| {
@@ -10357,14 +10859,42 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
     actions.append(&due_capability_checks);
 
     let all_time = clickable_button_with_label("All Time");
-    all_time.set_sensitive(!snapshot.line_stats_loading);
     all_time.connect_clicked(|_| {
         update_line_stats_since(String::new());
         let _ = command_line_stats(maruzzella_sdk::ffi::MzBytes::empty());
     });
     actions.append(&all_time);
 
-    actions
+    MonorepoReportControls {
+        row: actions,
+        check_history,
+        since_entry,
+        line_stats,
+        all_time,
+    }
+}
+
+/// Updates the persistent report controls in place, so typing in the date
+/// entry survives refreshes.
+fn update_monorepo_report_controls(controls: &MonorepoReportControls, snapshot: &StateSnapshot) {
+    set_report_button_loading(
+        &controls.check_history,
+        "Check History",
+        snapshot.history_report_loading,
+    );
+    set_report_button_loading(
+        &controls.line_stats,
+        "Line Stats",
+        snapshot.line_stats_loading,
+    );
+    controls
+        .all_time
+        .set_sensitive(!snapshot.line_stats_loading);
+    // The entry writes every edit to the state, so they only differ when the
+    // date was changed elsewhere (e.g. by All Time).
+    if controls.since_entry.text().as_str() != snapshot.line_stats_since {
+        controls.since_entry.set_text(&snapshot.line_stats_since);
+    }
 }
 
 fn collect_repo_ids<F>(items: &[RepositoryListItem], predicate: F) -> Vec<String>
@@ -10495,11 +11025,13 @@ fn append_log_section(container: &GtkBox, heading: &str, logs: &[String], limit:
     container.append(&Separator::new(Orientation::Horizontal));
 }
 
-fn attention_items(items: &[RepositoryListItem]) -> Vec<RepositoryListItem> {
-    let current_snapshot = snapshot();
+fn attention_items(
+    snapshot: &StateSnapshot,
+    items: &[RepositoryListItem],
+) -> Vec<RepositoryListItem> {
     let mut attention = items
         .iter()
-        .filter(|item| repo_attention_rank(&current_snapshot, item) < 7)
+        .filter(|item| repo_attention_rank(snapshot, item) < 7)
         .cloned()
         .collect::<Vec<_>>();
     attention.sort_by_key(repo_monitor_sort_key);
@@ -10755,11 +11287,7 @@ fn create_repo_manifest_editor_view(
             })
         });
 
-    let root = GtkBox::new(Orientation::Vertical, 14);
-    root.set_margin_top(18);
-    root.set_margin_bottom(18);
-    root.set_margin_start(18);
-    root.set_margin_end(18);
+    let root = padded_view_root(14, 18);
 
     let snapshot = snapshot();
     let Some(repo_id) = repo_id else {
@@ -10772,29 +11300,14 @@ fn create_repo_manifest_editor_view(
         body.add_css_class("muted");
         root.append(&title);
         root.append(&body);
-        return unsafe {
-            <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-                as *mut std::ffi::c_void
-        };
+        return into_view_ptr(root);
     };
 
     render_repo_manifest_editor_into(&root, &snapshot, &repo_id, host);
 
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(0)
-        .child(&root)
-        .build();
-    scroller.set_valign(Align::Fill);
-    scroller.set_propagate_natural_height(false);
+    let scroller = vertical_view_scroller(&root);
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(scroller)
 }
 
 fn render_repo_manifest_editor_into(
@@ -11577,27 +12090,25 @@ fn create_text_editor_view(
 
     let host = remember_host_ptr(host);
 
-    let root = GtkBox::new(Orientation::Vertical, 12);
-    root.set_margin_top(18);
-    root.set_margin_bottom(18);
-    root.set_margin_start(18);
-    root.set_margin_end(18);
+    let root = padded_view_root(12, 18);
 
-    let initial_path = unsafe { request.as_ref() }
-        .and_then(|request| decode_mzstr(request.instance_key))
-        .or_else(|| {
-            unsafe { request.as_ref() }.and_then(|request| {
-                if request.payload.ptr.is_null() || request.payload.len == 0 {
-                    None
-                } else {
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(request.payload.ptr, request.payload.len)
-                    };
-                    let text = String::from_utf8_lossy(bytes).trim().to_string();
-                    (!text.is_empty()).then_some(text)
-                }
-            })
-        });
+    let instance_key =
+        unsafe { request.as_ref() }.and_then(|request| decode_mzstr(request.instance_key));
+    let initial_path = instance_key.clone().or_else(|| {
+        unsafe { request.as_ref() }.and_then(|request| {
+            if request.payload.ptr.is_null() || request.payload.len == 0 {
+                None
+            } else {
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(request.payload.ptr, request.payload.len) };
+                let text = String::from_utf8_lossy(bytes).trim().to_string();
+                (!text.is_empty()).then_some(text)
+            }
+        })
+    });
+    let instance_key = instance_key.unwrap_or_default();
+    let editor_id = register_text_editor(instance_key.clone());
+    root.connect_destroy(move |_| unregister_text_editor(editor_id));
 
     let title = Label::new(Some("Text Editor"));
     title.set_xalign(0.0);
@@ -11623,22 +12134,13 @@ fn create_text_editor_view(
     status.set_wrap(true);
 
     let buffer = TextBuffer::new(None);
-    let editor_key = initial_path
-        .as_deref()
-        .map(resolve_editor_path)
-        .map(|path| path.to_string_lossy().to_string());
-    let suppress_dirty = Arc::new(AtomicBool::new(true));
+    // Set while the editor itself replaces the buffer text.
+    let suppress_dirty = Rc::new(Cell::new(false));
     buffer.connect_changed({
-        let editor_key = editor_key.clone();
-        let suppress_dirty = suppress_dirty.clone();
+        let suppress_dirty = Rc::clone(&suppress_dirty);
         move |_| {
-            if suppress_dirty.load(Ordering::SeqCst) {
-                return;
-            }
-            if let Some(editor_key) = editor_key.as_ref() {
-                DIRTY_TEXT_EDITORS.with(|dirty| {
-                    dirty.borrow_mut().insert(editor_key.clone());
-                });
+            if !suppress_dirty.get() {
+                set_text_editor_dirty(editor_id, true);
             }
         }
     });
@@ -11655,31 +12157,27 @@ fn create_text_editor_view(
         .child(&text)
         .build();
 
+    let widgets = TextEditorWidgets {
+        id: editor_id,
+        buffer: buffer.clone(),
+        status: status.clone(),
+        title: title.clone(),
+        path_entry: path_entry.clone(),
+        suppress_dirty,
+    };
+
     if let Some(path) = initial_path.as_deref() {
         path_entry.set_text(path);
         let resolved = resolve_editor_path(path);
         title.set_text(&editor_title_for_path(&resolved));
-        queue_editor_load(
-            &buffer,
-            &status,
-            &title,
-            &path_entry,
-            &resolved,
-            suppress_dirty.clone(),
-        );
-    } else {
-        suppress_dirty.store(false, Ordering::SeqCst);
+        queue_editor_load(&widgets, &resolved);
     }
 
     open_button.connect_clicked({
-        let path_entry = path_entry.clone();
-        let buffer = buffer.clone();
-        let status = status.clone();
-        let title = title.clone();
+        let widgets = widgets.clone();
         let initial_path = initial_path.clone();
-        let suppress_dirty = suppress_dirty.clone();
         move |_| {
-            let path = resolve_editor_path(path_entry.text().as_str());
+            let path = resolve_editor_path(widgets.path_entry.text().as_str());
             let current_instance = initial_path
                 .as_deref()
                 .map(resolve_editor_path)
@@ -11687,33 +12185,26 @@ fn create_text_editor_view(
             if !current_instance.as_os_str().is_empty() && current_instance != path {
                 open_text_editor_for_path(host, &path);
             } else {
-                queue_editor_load(
-                    &buffer,
-                    &status,
-                    &title,
-                    &path_entry,
-                    &path,
-                    suppress_dirty.clone(),
-                );
-                title.set_text(&editor_title_for_path(&path));
+                queue_editor_load(&widgets, &path);
+                widgets.title.set_text(&editor_title_for_path(&path));
             }
         }
     });
 
     save_button.connect_clicked({
-        let path_entry = path_entry.clone();
-        let buffer = buffer.clone();
-        let status = status.clone();
-        let title = title.clone();
+        let widgets = widgets.clone();
         move |_| {
-            let path = resolve_editor_path(path_entry.text().as_str());
-            let content = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+            let path = resolve_editor_path(widgets.path_entry.text().as_str());
+            let content = widgets.buffer.text(
+                &widgets.buffer.start_iter(),
+                &widgets.buffer.end_iter(),
+                true,
+            );
             queue_editor_save(
-                &buffer,
-                &status,
-                &title,
+                &widgets,
                 &path,
                 content.to_string(),
+                &instance_key,
                 host as usize,
             );
         }
@@ -11733,10 +12224,57 @@ fn create_text_editor_view(
     root.append(&status);
     root.append(&scroller);
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(root)
+}
+
+/// Widgets of one text editor view that its load and save completions touch.
+/// The completions only run on the GTK thread.
+#[derive(Clone)]
+struct TextEditorWidgets {
+    id: usize,
+    buffer: TextBuffer,
+    status: Label,
+    title: Label,
+    path_entry: Entry,
+    suppress_dirty: Rc<Cell<bool>>,
+}
+
+fn register_text_editor(instance_key: String) -> usize {
+    static NEXT_TEXT_EDITOR_ID: AtomicUsize = AtomicUsize::new(1);
+    let id = NEXT_TEXT_EDITOR_ID.fetch_add(1, Ordering::Relaxed);
+    TEXT_EDITORS.with(|editors| {
+        editors.borrow_mut().insert(
+            id,
+            TextEditorState {
+                instance_key,
+                dirty: false,
+            },
+        );
+    });
+    id
+}
+
+fn unregister_text_editor(id: usize) {
+    TEXT_EDITORS.with(|editors| {
+        editors.borrow_mut().remove(&id);
+    });
+}
+
+fn set_text_editor_dirty(id: usize, dirty: bool) {
+    TEXT_EDITORS.with(|editors| {
+        if let Some(editor) = editors.borrow_mut().get_mut(&id) {
+            editor.dirty = dirty;
+        }
+    });
+}
+
+fn text_editor_instance_dirty(instance_key: &str) -> bool {
+    TEXT_EDITORS.with(|editors| {
+        editors
+            .borrow()
+            .values()
+            .any(|editor| editor.dirty && editor.instance_key == instance_key)
+    })
 }
 
 fn prepare_text_editor_teardown(request: *const MzViewTeardownRequest) -> MzViewTeardownResult {
@@ -11748,12 +12286,8 @@ fn prepare_text_editor_teardown(request: *const MzViewTeardownRequest) -> MzView
             ),
         };
     };
-    let is_dirty = decode_mzstr(request.view.instance_key).is_some_and(|instance_key| {
-        let key = resolve_editor_path(&instance_key)
-            .to_string_lossy()
-            .to_string();
-        DIRTY_TEXT_EDITORS.with(|dirty| dirty.borrow().contains(&key))
-    });
+    let instance_key = decode_mzstr(request.view.instance_key).unwrap_or_default();
+    let is_dirty = text_editor_instance_dirty(&instance_key);
     MzViewTeardownResult {
         decision: if is_dirty {
             MzViewTeardownDecision::Confirm
@@ -11774,165 +12308,100 @@ fn resolve_editor_path(input: &str) -> PathBuf {
     if path.is_absolute() {
         path
     } else {
-        snapshot().workspace_root.join(path)
+        let app_state = state().lock().expect("state mutex poisoned");
+        app_state.workspace_root.join(path)
     }
 }
 
-fn queue_editor_load(
-    buffer: &TextBuffer,
-    status: &Label,
-    title: &Label,
-    path_entry: &Entry,
-    path: &Path,
-    suppress_dirty: Arc<AtomicBool>,
-) {
-    suppress_dirty.store(true, Ordering::SeqCst);
-    status.set_text(&format!("Loading {}...", path.display()));
-    let (sender, receiver) = mpsc::channel::<EditorLoadMessage>();
-    let buffer = glib::SendWeakRef::from(buffer.downgrade());
-    let status = glib::SendWeakRef::from(status.downgrade());
-    let title = glib::SendWeakRef::from(title.downgrade());
-    let path_entry = glib::SendWeakRef::from(path_entry.downgrade());
-    let queue_error_buffer = buffer.clone();
-    let queue_error_status = status.clone();
-    let completion_suppress_dirty = suppress_dirty.clone();
-    let main_context = glib::MainContext::default();
-    thread::spawn(move || {
-        let Ok(message) = receiver.recv() else {
-            return;
-        };
-        main_context.invoke(move || {
-            let Some(path_entry) = path_entry.upgrade() else {
-                return;
-            };
-            if resolve_editor_path(path_entry.text().as_str()) != message.path {
-                completion_suppress_dirty.store(false, Ordering::SeqCst);
-                return;
-            }
-            let Some(buffer) = buffer.upgrade() else {
-                return;
-            };
-            let Some(status) = status.upgrade() else {
-                return;
-            };
-            let Some(title) = title.upgrade() else {
-                return;
-            };
-            match message.result {
+fn queue_editor_load(widgets: &TextEditorWidgets, path: &Path) {
+    widgets.suppress_dirty.set(true);
+    widgets
+        .status
+        .set_text(&format!("Loading {}...", path.display()));
+    let widgets = widgets.clone();
+    let path = path.to_path_buf();
+    glib::spawn_future_local(async move {
+        let read_path = path.clone();
+        let result = gio::spawn_blocking(move || {
+            fs::read_to_string(&read_path).map_err(|error| error.to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err("the file reader stopped unexpectedly".to_string()));
+
+        // The user may have pointed the editor elsewhere in the meantime.
+        if resolve_editor_path(widgets.path_entry.text().as_str()) == path {
+            match result {
                 Ok(content) => {
-                    buffer.set_text(&content);
-                    DIRTY_TEXT_EDITORS.with(|dirty| {
-                        dirty
-                            .borrow_mut()
-                            .remove(&message.path.to_string_lossy().to_string());
-                    });
-                    status.set_text(&format!("Loaded {}", message.path.display()));
-                    title.set_text(&editor_title_for_path(&message.path));
+                    widgets.buffer.set_text(&content);
+                    widgets
+                        .status
+                        .set_text(&format!("Loaded {}", path.display()));
+                    widgets.title.set_text(&editor_title_for_path(&path));
                 }
                 Err(error) => {
-                    buffer.set_text("");
-                    status.set_text(&format!(
-                        "Failed to open {}: {error}",
-                        message.path.display()
-                    ));
+                    widgets.buffer.set_text("");
+                    widgets
+                        .status
+                        .set_text(&format!("Failed to open {}: {error}", path.display()));
                 }
             }
-            completion_suppress_dirty.store(false, Ordering::SeqCst);
-        });
+            // Either way the buffer no longer holds unsaved edits.
+            set_text_editor_dirty(widgets.id, false);
+        }
+        widgets.suppress_dirty.set(false);
     });
-
-    if let Err(message) = submit_job(WorkerJob::EditorLoad {
-        path: path.to_path_buf(),
-        reply: sender,
-    }) {
-        if let Some(buffer) = queue_error_buffer.upgrade() {
-            buffer.set_text("");
-        }
-        if let Some(status) = queue_error_status.upgrade() {
-            status.set_text(&format!(
-                "Failed to queue load for {}: {message}",
-                path.display()
-            ));
-        }
-        suppress_dirty.store(false, Ordering::SeqCst);
-    }
 }
 
 fn queue_editor_save(
-    buffer: &TextBuffer,
-    status: &Label,
-    title: &Label,
+    widgets: &TextEditorWidgets,
     path: &Path,
     content: String,
+    instance_key: &str,
     host_ptr: usize,
 ) {
-    status.set_text(&format!("Saving {}...", path.display()));
-    let (sender, receiver) = mpsc::channel::<EditorSaveMessage>();
-    let status = glib::SendWeakRef::from(status.downgrade());
-    let title = glib::SendWeakRef::from(title.downgrade());
-    let buffer = glib::SendWeakRef::from(buffer.downgrade());
+    widgets
+        .status
+        .set_text(&format!("Saving {}...", path.display()));
+    let widgets = widgets.clone();
     let path = path.to_path_buf();
-    let saved_content = content.clone();
-    let queue_error_status = status.clone();
-    let main_context = glib::MainContext::default();
-    thread::spawn(move || {
-        let Ok(message) = receiver.recv() else {
-            return;
-        };
-        main_context.invoke(move || {
-            let Some(status) = status.upgrade() else {
-                return;
-            };
-            let Some(title) = title.upgrade() else {
-                return;
-            };
-            match message.result {
-                Ok(()) => {
-                    if let Some(buffer) = buffer.upgrade() {
-                        let current = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
-                        if current.as_str() == saved_content {
-                            DIRTY_TEXT_EDITORS.with(|dirty| {
-                                dirty
-                                    .borrow_mut()
-                                    .remove(&message.path.to_string_lossy().to_string());
-                            });
-                        }
-                    }
-                    status.set_text(&format!("Saved {}", message.path.display()));
-                    let title_text = editor_title_for_path(&message.path);
-                    title.set_text(&title_text);
-                    if host_ptr != 0 {
-                        let host = unsafe {
-                            HostApi::from_raw(&*(host_ptr as *const maruzzella_sdk::ffi::MzHostApi))
-                        };
-                        let mut query = maruzzella_sdk::ViewQuery::new(PLUGIN_ID, VIEW_TEXT_EDITOR);
-                        let path_key = message.path.to_string_lossy().to_string();
-                        query.instance_key = Some(&path_key);
-                        let _ = host.update_view_title(&query, &title_text);
-                    }
+    let instance_key = instance_key.to_string();
+    glib::spawn_future_local(async move {
+        let write_path = path.clone();
+        let saved_content = content.clone();
+        let result = gio::spawn_blocking(move || {
+            fs::write(&write_path, content).map_err(|error| error.to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err("the file writer stopped unexpectedly".to_string()));
+
+        match result {
+            Ok(()) => {
+                let buffer = &widgets.buffer;
+                let current = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+                if current.as_str() == saved_content {
+                    set_text_editor_dirty(widgets.id, false);
                 }
-                Err(error) => {
-                    status.set_text(&format!(
-                        "Failed to save {}: {error}",
-                        message.path.display()
-                    ));
+                widgets
+                    .status
+                    .set_text(&format!("Saved {}", path.display()));
+                let title_text = editor_title_for_path(&path);
+                widgets.title.set_text(&title_text);
+                if host_ptr != 0 {
+                    let host = unsafe {
+                        HostApi::from_raw(&*(host_ptr as *const maruzzella_sdk::ffi::MzHostApi))
+                    };
+                    let mut query = maruzzella_sdk::ViewQuery::new(PLUGIN_ID, VIEW_TEXT_EDITOR);
+                    query.instance_key = Some(&instance_key);
+                    let _ = host.update_view_title(&query, &title_text);
                 }
             }
-        });
-    });
-
-    if let Err(message) = submit_job(WorkerJob::EditorSave {
-        path: path.clone(),
-        content,
-        reply: sender,
-    }) {
-        if let Some(status) = queue_error_status.upgrade() {
-            status.set_text(&format!(
-                "Failed to queue save for {}: {message}",
-                path.display()
-            ));
+            Err(error) => {
+                widgets
+                    .status
+                    .set_text(&format!("Failed to save {}: {error}", path.display()));
+            }
         }
-    }
+    });
 }
 
 fn editor_title_for_path(path: &Path) -> String {
@@ -11981,13 +12450,13 @@ fn create_operations_view(
 
     let host = remember_host_ptr(host);
 
-    let root = GtkBox::new(Orientation::Vertical, 12);
-    root.set_margin_top(18);
-    root.set_margin_bottom(18);
-    root.set_margin_start(18);
-    root.set_margin_end(18);
+    let root = padded_view_root(12, 18);
 
-    let summary = Label::new(Some(&operation_summary_text(&snapshot().logs)));
+    let (cursor, logs) = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        (log_cursor(&app_state), app_state.logs.clone())
+    };
+    let summary = Label::new(Some(&operation_summary_text(&logs)));
     summary.set_xalign(0.0);
     summary.add_css_class("muted");
     summary.set_wrap(true);
@@ -12013,11 +12482,15 @@ fn create_operations_view(
         .unwrap_or_else(|| clickable_button_with_label("Clear"));
 
     let buffer = TextBuffer::new(None);
-    buffer.set_text(&snapshot().logs.join("\n"));
-    let buffer_ref = glib::WeakRef::new();
-    buffer_ref.set(Some(&buffer));
+    let buffer_handle = OperationBufferHandle {
+        buffer: glib::WeakRef::new(),
+        shown: Cell::new(LogCursor::default()),
+        line_counts: RefCell::new(Default::default()),
+    };
+    buffer_handle.buffer.set(Some(&buffer));
+    sync_operation_buffer(&buffer_handle, &buffer, cursor, &logs);
     OPERATION_BUFFERS.with(|buffers| {
-        buffers.borrow_mut().push(buffer_ref);
+        buffers.borrow_mut().push(buffer_handle);
     });
     let summary_ref = glib::WeakRef::new();
     summary_ref.set(Some(&summary));
@@ -12026,29 +12499,16 @@ fn create_operations_view(
     });
 
     if view_host.is_none() {
-        refresh.connect_clicked({
-            let buffer = buffer.clone();
-            let summary = summary.clone();
-            move |_| {
-                let snapshot = snapshot();
-                buffer.set_text(&snapshot.logs.join("\n"));
-                summary.set_text(&operation_summary_text(&snapshot.logs));
+        refresh.connect_clicked(|_| refresh_log_surfaces());
+        clear.connect_clicked(|_| {
+            {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                app_state.logs.clear();
+                app_state.last_log_message = None;
+                push_log_line(&mut app_state, "Operations log cleared.".to_string());
             }
-        });
-        clear.connect_clicked({
-            let buffer = buffer.clone();
-            let summary = summary.clone();
-            move |_| {
-                {
-                    let mut app_state = state().lock().expect("state mutex poisoned");
-                    app_state.logs.clear();
-                    app_state.logs.push("Operations log cleared.".to_string());
-                }
-                let snapshot = snapshot();
-                buffer.set_text(&snapshot.logs.join("\n"));
-                summary.set_text(&operation_summary_text(&snapshot.logs));
-                refresh_views();
-            }
+            refresh_log_surfaces();
+            refresh_views();
         });
     }
 
@@ -12119,10 +12579,7 @@ fn create_operations_view(
     suppress_scroll_events.set(true);
     schedule_scroll_to_bottom(&scroller, suppress_scroll_events);
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(root)
 }
 
 fn operation_summary_text(logs: &[String]) -> String {
@@ -12914,6 +13371,7 @@ mod tests {
             repo_manifest: Some(RepoManifestScan {
                 path: repo_path.join("ronomepo.repo.json"),
                 state: RepoManifestScanState::Missing,
+                manifest: None,
             }),
         });
         app_state.repo_runtime.insert(
@@ -12994,6 +13452,280 @@ mod tests {
         assert!(mark_repo_stale(&mut app_state, "alpha"));
         assert!(!mark_repo_stale(&mut app_state, "alpha"));
         assert!(app_state.repo_runtime["alpha"].needs_rescan());
+    }
+
+    fn test_monitor_row(name: &str, state: RepositoryState, sync: RepositorySync) -> MonitorRow {
+        build_monitor_row(
+            test_repository_item(name, state, sync),
+            MonitorViewMode::Overview,
+            &CapabilityRegistry::default(),
+            Some(true),
+            i64::MIN,
+        )
+    }
+
+    #[test]
+    fn monitor_store_update_touches_only_changed_rows() {
+        let rows = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|name| test_monitor_row(name, RepositoryState::Clean, RepositorySync::UpToDate))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            monitor_store_update(&rows, &rows),
+            MonitorStoreUpdate::Unchanged
+        );
+
+        let mut next = rows.clone();
+        next[2] = test_monitor_row("c", RepositoryState::Dirty, RepositorySync::UpToDate);
+        assert_eq!(
+            monitor_store_update(&rows, &next),
+            MonitorStoreUpdate::Positions(vec![2])
+        );
+
+        let mut reordered = rows.clone();
+        reordered.swap(0, 1);
+        assert_eq!(
+            monitor_store_update(&rows, &reordered),
+            MonitorStoreUpdate::Replace
+        );
+        assert_eq!(
+            monitor_store_update(&rows, &rows[..3]),
+            MonitorStoreUpdate::Replace
+        );
+
+        let switched_view = rows
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                row.view_mode = MonitorViewMode::Git;
+                row
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            monitor_store_update(&rows, &switched_view),
+            MonitorStoreUpdate::Replace
+        );
+    }
+
+    #[test]
+    fn monitor_row_filter_combines_mode_and_search_text() {
+        let dirty = test_monitor_row("Alpha", RepositoryState::Dirty, RepositorySync::UpToDate);
+        let clean = test_monitor_row("Beta", RepositoryState::Clean, RepositorySync::UpToDate);
+        let mut query = MonitorQuery::default();
+        assert!(monitor_row_matches(&dirty, &query));
+        assert!(monitor_row_matches(&clean, &query));
+
+        query.filter_mode = MonitorFilterMode::Dirty;
+        assert!(monitor_row_matches(&dirty, &query));
+        assert!(!monitor_row_matches(&clean, &query));
+
+        query.filter_mode = MonitorFilterMode::All;
+        query.filter_text = "alpha".to_string();
+        assert!(monitor_row_matches(&dirty, &query));
+        assert!(!monitor_row_matches(&clean, &query));
+
+        // Fields are matched one at a time, never across a field boundary.
+        query.filter_text = "alphagit@".to_string();
+        assert!(!monitor_row_matches(&dirty, &query));
+        query.filter_text = "org/beta.git".to_string();
+        assert!(monitor_row_matches(&clean, &query));
+    }
+
+    #[test]
+    fn monitor_row_sort_keeps_monorepo_last_in_both_directions() {
+        let mut monorepo = test_monitor_row(
+            "(monorepo)",
+            RepositoryState::Clean,
+            RepositorySync::UpToDate,
+        );
+        monorepo.item.id = MONOREPO_ROW_ID.to_string();
+        let rows = vec![
+            monorepo,
+            test_monitor_row("beta", RepositoryState::Clean, RepositorySync::UpToDate),
+            test_monitor_row("Alpha", RepositoryState::Clean, RepositorySync::UpToDate),
+        ];
+        let mut query = MonitorQuery::default();
+        let sorted_names = |query: &MonitorQuery| {
+            let mut rows = rows.clone();
+            rows.sort_by(|left, right| monitor_row_cmp(query, left, right));
+            rows.into_iter()
+                .map(|row| row.item.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sorted_names(&query), vec!["Alpha", "beta", "(monorepo)"]);
+        query.descending = true;
+        assert_eq!(sorted_names(&query), vec!["beta", "Alpha", "(monorepo)"]);
+    }
+
+    #[test]
+    fn commit_check_rule_ids_are_unique_within_a_millisecond() {
+        let ids = (0..64)
+            .map(|_| new_commit_check_rule_id())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 64);
+    }
+
+    #[test]
+    fn commit_check_editor_dirty_tracking_and_added_rules() {
+        let rules = default_commit_check_rules();
+        assert!(rules.len() >= 2);
+        let baseline = rules[..1].to_vec();
+
+        assert!(!commit_check_rows_dirty(&Ok(baseline.clone()), &baseline));
+        assert!(commit_check_rows_dirty(&Ok(Vec::new()), &baseline));
+        assert!(commit_check_rows_dirty(
+            &Err("Rule 1 needs a name.".to_string()),
+            &baseline
+        ));
+        let mut edited = baseline.clone();
+        edited[0].priority += 1;
+        assert!(commit_check_rows_dirty(&Ok(edited), &baseline));
+
+        let added = commit_check_rules_added(&baseline, &[], &rules);
+        assert_eq!(added, rules[1..].to_vec());
+        let shown = vec![rules[1].id.clone()];
+        let added = commit_check_rules_added(&baseline, &shown, &rules);
+        assert_eq!(added, rules[2..].to_vec());
+    }
+
+    #[test]
+    fn log_view_edits_only_touch_changed_entries() {
+        let cursor = |first_seq, end_seq, rewrites| LogCursor {
+            first_seq,
+            end_seq,
+            rewrites,
+        };
+        let shown = cursor(0, 3, 0);
+        assert_eq!(log_view_edit(shown, shown), LogViewEdit::Unchanged);
+        // Appended lines.
+        assert_eq!(
+            log_view_edit(shown, cursor(0, 5, 0)),
+            LogViewEdit::Update {
+                drop_front: 0,
+                keep: 3
+            }
+        );
+        // The last line was rewritten, possibly before more lines arrived.
+        assert_eq!(
+            log_view_edit(shown, cursor(0, 3, 1)),
+            LogViewEdit::Update {
+                drop_front: 0,
+                keep: 2
+            }
+        );
+        assert_eq!(
+            log_view_edit(shown, cursor(0, 5, 2)),
+            LogViewEdit::Update {
+                drop_front: 0,
+                keep: 2
+            }
+        );
+        // Old lines were trimmed at the front.
+        assert_eq!(
+            log_view_edit(cursor(0, 500, 0), cursor(2, 502, 0)),
+            LogViewEdit::Update {
+                drop_front: 2,
+                keep: 498
+            }
+        );
+        // Cleared and restarted with one line.
+        assert_eq!(
+            log_view_edit(shown, cursor(3, 4, 0)),
+            LogViewEdit::Update {
+                drop_front: 3,
+                keep: 0
+            }
+        );
+        assert_eq!(log_view_edit(shown, cursor(0, 2, 0)), LogViewEdit::Reset);
+    }
+
+    #[test]
+    fn log_cursor_follows_appends_rewrites_and_trimming() {
+        let mut app_state = AppState::default();
+        push_log_line(&mut app_state, "one".to_string());
+        push_log_line(&mut app_state, "two".to_string());
+        push_log_line(&mut app_state, "two".to_string());
+        assert_eq!(
+            log_cursor(&app_state),
+            LogCursor {
+                first_seq: 0,
+                end_seq: 2,
+                rewrites: 1
+            }
+        );
+        for index in 0..MAX_LOG_ENTRIES {
+            push_log_line(&mut app_state, format!("line {index}"));
+        }
+        let cursor = log_cursor(&app_state);
+        assert_eq!(cursor.end_seq, 2 + MAX_LOG_ENTRIES as u64);
+        assert_eq!(
+            cursor.end_seq - cursor.first_seq,
+            app_state.logs.len() as u64
+        );
+    }
+
+    #[test]
+    fn command_output_tail_keeps_last_non_empty_lines() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"one\n\ntwo\nthree\n".to_vec(),
+            stderr: b"warn\n".to_vec(),
+        };
+        assert_eq!(
+            command_output_tail(&output, 3),
+            vec!["two", "three", "warn"]
+        );
+        assert_eq!(command_output_tail(&output, 10).len(), 4);
+    }
+
+    #[test]
+    fn plugin_config_migrates_flat_monitor_fields() {
+        let legacy = serde_json::json!({
+            "last_workspace_path": "/work",
+            "import_banner_dismissed": false,
+            "monitor_view_mode": "git",
+            "monitor_filter_mode": "dirty",
+            "monitor_sort_mode": "sync_state",
+            "git_filter_mode": "diverged",
+            "git_sort_mode": "branch",
+            "git_sort_descending": true,
+            "manifest_filter_mode": "has_actions",
+        });
+        let config: RonomepoPluginConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(config.monitor_view_mode, MonitorViewMode::Git);
+        let settings = config.monitor_views;
+        assert_eq!(
+            settings.overview,
+            MonitorViewSettings {
+                filter: MonitorFilterMode::Issues,
+                sort: MonitorSortMode::SyncState,
+                descending: false,
+            }
+        );
+        assert_eq!(
+            settings.git,
+            MonitorViewSettings {
+                filter: MonitorFilterMode::Diverged,
+                sort: MonitorSortMode::Branch,
+                descending: true,
+            }
+        );
+        assert_eq!(settings.manifest.filter, MonitorFilterMode::HasActions);
+        assert_eq!(settings.checks, MonitorViewSettings::default());
+
+        // Saving writes the grouped form, which loads back unchanged and wins
+        // over any flat fields still present.
+        let mut saved = serde_json::to_value(&config).unwrap();
+        assert!(saved.get("git_filter_mode").is_none());
+        saved["git_filter_mode"] = serde_json::json!("clean");
+        let reloaded: RonomepoPluginConfig = serde_json::from_value(saved).unwrap();
+        assert_eq!(reloaded.monitor_views, settings);
+        // The dropped fields are tolerated on load and not written back.
+        assert!(serde_json::to_value(&reloaded)
+            .unwrap()
+            .get("last_workspace_path")
+            .is_none());
     }
 
     #[test]
@@ -13096,15 +13828,6 @@ mod tests {
             }
             _ => panic!("expected a failed fetch result"),
         }
-
-        let (reply, receiver) = mpsc::channel();
-        let job = WorkerJob::EditorLoad {
-            path: PathBuf::from("notes.txt"),
-            reply,
-        };
-        assert!(worker_job_panic_recovery(&job)("boom".to_string()).is_none());
-        let message = receiver.recv().expect("editor gets a reply");
-        assert_eq!(message.result, Err("boom".to_string()));
     }
 
     fn empty_test_manifest(root: PathBuf) -> WorkspaceManifest {
@@ -13284,16 +14007,17 @@ mod tests {
             "monitor_sort_descending": true
         }"#;
         let config = RonomepoPluginConfig::decode(legacy).unwrap();
-        assert_eq!(config.overview_filter_mode, MonitorFilterMode::Issues);
-        assert_eq!(config.overview_sort_mode, MonitorSortMode::Branch);
-        assert!(config.overview_sort_descending);
+        let overview = config.monitor_views.overview;
+        assert_eq!(overview.filter, MonitorFilterMode::Issues);
+        assert_eq!(overview.sort, MonitorSortMode::Branch);
+        assert!(overview.descending);
 
         let encoded = serde_json::to_value(&config).unwrap();
         assert!(encoded.get("monitor_sort_mode").is_none());
         assert!(encoded.get("last_workspace_path").is_none());
+        assert!(encoded.get("import_banner_dismissed").is_none());
         let reloaded = RonomepoPluginConfig::decode(&serde_json::to_vec(&config).unwrap()).unwrap();
-        assert_eq!(reloaded.overview_sort_mode, MonitorSortMode::Branch);
-        assert_eq!(reloaded.overview_filter_mode, MonitorFilterMode::Issues);
+        assert_eq!(reloaded.monitor_views.overview, overview);
 
         assert!(RonomepoPluginConfig::decode(b"not json").is_err());
         assert!(RonomepoPluginConfig::decode(b"").is_ok());
@@ -13314,10 +14038,10 @@ mod tests {
             &path,
             vec![
                 Box::new(|config: &mut RonomepoPluginConfig| {
-                    config.git_sort_mode = MonitorSortMode::Branch;
+                    config.monitor_views.git.sort = MonitorSortMode::Branch;
                 }),
                 Box::new(|config: &mut RonomepoPluginConfig| {
-                    config.git_sort_descending = true;
+                    config.monitor_views.git.descending = true;
                 }),
             ],
         );
@@ -13327,8 +14051,8 @@ mod tests {
         let payload: Vec<u8> =
             serde_json::from_value(document[PLUGIN_ID]["payload"].clone()).unwrap();
         let config = RonomepoPluginConfig::decode(&payload).unwrap();
-        assert_eq!(config.git_sort_mode, MonitorSortMode::Branch);
-        assert!(config.git_sort_descending);
+        assert_eq!(config.monitor_views.git.sort, MonitorSortMode::Branch);
+        assert!(config.monitor_views.git.descending);
         let leftovers = fs::read_dir(path.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1, "temporary file left behind");
 
@@ -13369,22 +14093,34 @@ mod tests {
     #[test]
     fn text_editor_teardown_confirms_only_for_dirty_instances() {
         let instance_key = "/tmp/ronomepo-dirty-editor.txt";
-        DIRTY_TEXT_EDITORS.with(|dirty| dirty.borrow_mut().clear());
         let mut request = MzViewTeardownRequest::default();
         request.view.instance_key = maruzzella_sdk::ffi::MzStr {
             ptr: instance_key.as_ptr(),
             len: instance_key.len(),
         };
 
+        let editor = register_text_editor(instance_key.to_string());
+        let keyless = register_text_editor(String::new());
         let ready = prepare_text_editor_teardown(&request);
         assert_eq!(ready.decision, MzViewTeardownDecision::Ready);
 
-        DIRTY_TEXT_EDITORS.with(|dirty| {
-            dirty.borrow_mut().insert(instance_key.to_string());
-        });
+        // A dirty editor without an instance key does not block keyed ones.
+        set_text_editor_dirty(keyless, true);
+        let ready = prepare_text_editor_teardown(&request);
+        assert_eq!(ready.decision, MzViewTeardownDecision::Ready);
+        assert!(text_editor_instance_dirty(""));
+
+        set_text_editor_dirty(editor, true);
         let confirm = prepare_text_editor_teardown(&request);
         assert_eq!(confirm.decision, MzViewTeardownDecision::Confirm);
-        DIRTY_TEXT_EDITORS.with(|dirty| dirty.borrow_mut().clear());
+
+        set_text_editor_dirty(editor, false);
+        assert!(!text_editor_instance_dirty(instance_key));
+        set_text_editor_dirty(editor, true);
+        unregister_text_editor(editor);
+        unregister_text_editor(keyless);
+        assert!(!text_editor_instance_dirty(instance_key));
+        assert!(!text_editor_instance_dirty(""));
     }
 }
 
