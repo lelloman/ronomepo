@@ -5387,11 +5387,11 @@ fn fetch_repository_remote(repo_path: &Path) -> Result<(), String> {
     if !repo_path.exists() {
         return Err(format!("{} is missing locally", repo_path.display()));
     }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(["fetch", "--quiet", "--all", "--prune"])
-        .output()
+    // Same as core's pull/push: never block on a credential or ssh prompt,
+    // and give up on a remote that stops responding.
+    let mut command = ronomepo_core::network_git_command(Some(repo_path));
+    command.args(["fetch", "--quiet", "--all", "--prune"]);
+    let output = ronomepo_core::run_with_timeout(command, ronomepo_core::NETWORK_GIT_TIMEOUT)
         .map_err(|error| error.to_string())?;
     if output.status.success() {
         Ok(())
