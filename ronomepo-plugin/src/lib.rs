@@ -207,15 +207,17 @@ const RUNTIME_PROFILE_ENV: &str = "RONOMEPO_PROFILE";
 
 pub struct RonomepoPlugin;
 
+// Older configs also carry `last_workspace_path` and `import_banner_dismissed`;
+// neither was ever used, and serde ignores the unknown keys.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct RonomepoPluginConfig {
-    last_workspace_path: Option<String>,
-    import_banner_dismissed: bool,
-    #[serde(default)]
+    /// Settings from before per-view monitor modes. Only read, and folded into
+    /// the overview settings by `migrate_legacy_monitor_settings`.
+    #[serde(default, skip_serializing)]
     monitor_filter_mode: MonitorFilterMode,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     monitor_sort_mode: MonitorSortMode,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     monitor_sort_descending: bool,
     #[serde(default)]
     monitor_view_mode: MonitorViewMode,
@@ -243,6 +245,38 @@ struct RonomepoPluginConfig {
     checks_sort_descending: bool,
     #[serde(default)]
     manifest_sort_descending: bool,
+}
+
+impl RonomepoPluginConfig {
+    fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        let mut config = if bytes.is_empty() {
+            Self::default()
+        } else {
+            serde_json::from_slice::<Self>(bytes)?
+        };
+        config.migrate_legacy_monitor_settings();
+        Ok(config)
+    }
+
+    /// Carries the pre-view-mode monitor settings over to the overview view.
+    /// The legacy fields are not serialized, so this applies once per config.
+    fn migrate_legacy_monitor_settings(&mut self) {
+        if self.overview_filter_mode == MonitorFilterMode::All
+            && matches!(
+                self.monitor_filter_mode,
+                MonitorFilterMode::Dirty | MonitorFilterMode::ToSync | MonitorFilterMode::Issues
+            )
+        {
+            self.overview_filter_mode = MonitorFilterMode::Issues;
+        }
+        if self.overview_sort_mode == MonitorSortMode::Name {
+            self.overview_sort_mode = self.monitor_sort_mode;
+        }
+        self.overview_sort_descending |= self.monitor_sort_descending;
+        self.monitor_filter_mode = MonitorFilterMode::default();
+        self.monitor_sort_mode = MonitorSortMode::default();
+        self.monitor_sort_descending = false;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1444,7 +1478,7 @@ impl Plugin for RonomepoPlugin {
     fn register(host: &HostApi<'_>) -> Result<(), MzStatusCode> {
         host.log(MzLogLevel::Info, "Registering Ronomepo plugin");
 
-        let config = ensure_config(host)?;
+        let config = load_config(host)?;
         initialize_state(&config);
 
         host.register_command(
@@ -1556,22 +1590,20 @@ impl Plugin for RonomepoPlugin {
     }
 }
 
-fn ensure_config(host: &HostApi<'_>) -> Result<RonomepoPluginConfig, MzStatusCode> {
+/// Reads the stored config. An undecodable one is reported and replaced by
+/// defaults for this session, but left on disk untouched.
+fn load_config(host: &HostApi<'_>) -> Result<RonomepoPluginConfig, MzStatusCode> {
     let bytes = host.read_config()?;
-    let mut config = if bytes.is_empty() {
-        RonomepoPluginConfig::default()
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or_default()
-    };
-
-    if config.last_workspace_path.is_none() {
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        config.last_workspace_path = Some(current_dir.to_string_lossy().to_string());
-        let payload = serde_json::to_vec(&config).map_err(|_| MzStatusCode::InternalError)?;
-        host.write_config(&payload)?;
-    }
-
-    Ok(config)
+    Ok(
+        RonomepoPluginConfig::decode(&bytes).unwrap_or_else(|error| {
+            host.log(
+                MzLogLevel::Warn,
+                "Ronomepo config could not be decoded; using defaults",
+            );
+            diag::log(format!("plugin config could not be decoded: {error}"));
+            RonomepoPluginConfig::default()
+        }),
+    )
 }
 
 fn initialize_state(config: &RonomepoPluginConfig) {
@@ -1583,7 +1615,6 @@ fn initialize_state(config: &RonomepoPluginConfig) {
     let workspace_root = env::var_os("RONOMEPO_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
-        .or_else(|| config.last_workspace_path.as_deref().map(PathBuf::from))
         .map(normalize_workspace_root)
         .unwrap_or_else(|| PathBuf::from("."));
     let manifest_path = default_manifest_path(&workspace_root);
@@ -1600,29 +1631,15 @@ fn initialize_state(config: &RonomepoPluginConfig) {
     app_state.repo_details_cache.clear();
     app_state.repo_details_loading.clear();
     app_state.monitor_view_mode = config.monitor_view_mode;
-    app_state.overview_filter_mode = if config.overview_filter_mode == MonitorFilterMode::All {
-        match config.monitor_filter_mode {
-            MonitorFilterMode::Dirty | MonitorFilterMode::ToSync | MonitorFilterMode::Issues => {
-                MonitorFilterMode::Issues
-            }
-            _ => MonitorFilterMode::All,
-        }
-    } else {
-        config.overview_filter_mode
-    };
+    app_state.overview_filter_mode = config.overview_filter_mode;
     app_state.git_filter_mode = config.git_filter_mode;
     app_state.checks_filter_mode = config.checks_filter_mode;
     app_state.manifest_filter_mode = config.manifest_filter_mode;
-    app_state.overview_sort_mode = if config.overview_sort_mode == MonitorSortMode::Name {
-        config.monitor_sort_mode
-    } else {
-        config.overview_sort_mode
-    };
+    app_state.overview_sort_mode = config.overview_sort_mode;
     app_state.git_sort_mode = config.git_sort_mode;
     app_state.checks_sort_mode = config.checks_sort_mode;
     app_state.manifest_sort_mode = config.manifest_sort_mode;
-    app_state.overview_sort_descending =
-        config.monitor_sort_descending || config.overview_sort_descending;
+    app_state.overview_sort_descending = config.overview_sort_descending;
     app_state.git_sort_descending = config.git_sort_descending;
     app_state.checks_sort_descending = config.checks_sort_descending;
     app_state.manifest_sort_descending = config.manifest_sort_descending;
@@ -8431,9 +8448,9 @@ fn persist_plugin_config_direct(update: impl FnOnce(&mut RonomepoPluginConfig)) 
         .cloned()
         .and_then(|value| serde_json::from_value::<StoredPluginConfigEntry>(value).ok())
         .and_then(|entry| match entry {
-            StoredPluginConfigEntry::Legacy(payload) => serde_json::from_slice(&payload).ok(),
+            StoredPluginConfigEntry::Legacy(payload) => RonomepoPluginConfig::decode(&payload).ok(),
             StoredPluginConfigEntry::Versioned { payload, .. } => {
-                serde_json::from_slice(&payload).ok()
+                RonomepoPluginConfig::decode(&payload).ok()
             }
         })
         .unwrap_or_default();
@@ -13067,6 +13084,31 @@ mod tests {
         app_state.watch_manager_sync_in_flight = false;
         assert_eq!(take_deferred_watch_dirs(&mut app_state), dirs);
         assert!(app_state.deferred_watch_dirs.is_empty());
+    }
+
+    #[test]
+    fn legacy_monitor_settings_migrate_once_and_old_keys_still_decode() {
+        let legacy = br#"{
+            "last_workspace_path": "/somewhere",
+            "import_banner_dismissed": true,
+            "monitor_filter_mode": "dirty",
+            "monitor_sort_mode": "branch",
+            "monitor_sort_descending": true
+        }"#;
+        let config = RonomepoPluginConfig::decode(legacy).unwrap();
+        assert_eq!(config.overview_filter_mode, MonitorFilterMode::Issues);
+        assert_eq!(config.overview_sort_mode, MonitorSortMode::Branch);
+        assert!(config.overview_sort_descending);
+
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert!(encoded.get("monitor_sort_mode").is_none());
+        assert!(encoded.get("last_workspace_path").is_none());
+        let reloaded = RonomepoPluginConfig::decode(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(reloaded.overview_sort_mode, MonitorSortMode::Branch);
+        assert_eq!(reloaded.overview_filter_mode, MonitorFilterMode::Issues);
+
+        assert!(RonomepoPluginConfig::decode(b"not json").is_err());
+        assert!(RonomepoPluginConfig::decode(b"").is_ok());
     }
 
     #[test]
