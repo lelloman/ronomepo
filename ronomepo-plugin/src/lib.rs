@@ -1,3 +1,5 @@
+mod diag;
+
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -37,7 +39,7 @@ use maruzzella_sdk::{
     MzViewTeardownResult, OpenViewRequest, Plugin, PluginDependency, PluginDescriptor,
     SurfaceContributionSpec, ToolbarWidgetSpec, Version, ViewFactorySpec,
 };
-use notify::event::{AccessKind, AccessMode};
+use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};
 use notify::{
     Config as NotifyConfig, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
 };
@@ -421,10 +423,24 @@ enum WatchBackendKind {
 }
 
 struct WatchManager {
-    _backend: WatchBackend,
+    backend: WatchBackend,
     backend_kind: WatchBackendKind,
+    /// Number of directories registered (each one non-recursively).
     watched_paths: usize,
     unreadable_paths: Vec<PathBuf>,
+    source: WatchSource,
+    /// Git-ignored directories found so far; never watched, nor anything below them.
+    ignored_dirs: HashSet<PathBuf>,
+}
+
+/// What a watch manager was built from. A sync whose source matches the
+/// current manager's is a no-op, so scans and operations do not re-register
+/// every directory in the workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WatchSource {
+    workspace_root: PathBuf,
+    workspace_git_dir: Option<PathBuf>,
+    repo_roots: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -435,6 +451,9 @@ struct PendingWatchEvents {
     repo_ids: HashSet<String>,
     flush_scheduled: bool,
     backend_rescan: bool,
+    /// Directories created (or moved in) under a watched directory. Watches are
+    /// per directory, so these need registering before their contents report.
+    new_dirs: HashSet<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -489,6 +508,9 @@ enum WorkerJob {
     WatchManagerSync {
         manifest: Option<WorkspaceManifest>,
         sync_seq: usize,
+    },
+    WatchNewDirs {
+        dirs: Vec<PathBuf>,
     },
     RefreshWorkspace {
         workspace_root: PathBuf,
@@ -873,6 +895,7 @@ fn emit_runtime_profile(reason: &str) {
     let Some(line) = runtime_profile_summary(reason) else {
         return;
     };
+    diag::log(&line);
     eprintln!("{line}");
 }
 
@@ -995,6 +1018,10 @@ fn run_worker_job(queued_job: QueuedJob) {
                 .map(|manifest| build_watch_manager(&manifest))
                 .transpose();
             Some(WorkerResult::WatchManagerSyncCompleted { sync_seq, result })
+        }
+        WorkerJob::WatchNewDirs { dirs } => {
+            watch_new_dirs(dirs);
+            None
         }
         WorkerJob::RefreshWorkspace {
             workspace_root,
@@ -1270,6 +1297,7 @@ fn ensure_config(host: &HostApi<'_>) -> Result<RonomepoPluginConfig, MzStatusCod
 }
 
 fn initialize_state(config: &RonomepoPluginConfig) {
+    glib::MainContext::default().invoke(diag::start_main_thread_watchdog);
     ensure_background_loops_started();
 
     let workspace_root = env::var_os("RONOMEPO_WORKSPACE_ROOT")
@@ -1640,6 +1668,7 @@ fn append_log(message: String) {
 
 /// Timestamps `message` and collapses consecutive repeats into the last line.
 fn push_log_line(app_state: &mut AppState, message: String) {
+    diag::log(format!("app-log: {message}"));
     let stamp = log_timestamp();
     let repeated = app_state.last_log_message.as_deref() == Some(message.as_str())
         && !app_state.logs.is_empty();
@@ -1821,6 +1850,7 @@ fn handle_operation_event(
     manifest: WorkspaceManifest,
     event: OperationEvent,
 ) {
+    let _timed = diag::timed("operation-event");
     if matches!(event.kind, OperationEventKind::Failed)
         && matches!(operation, "Pull" | "Push" | "Push Force")
     {
@@ -1842,7 +1872,27 @@ fn handle_operation_event(
     }
 }
 
+fn worker_result_label(result: &WorkerResult) -> &'static str {
+    match result {
+        WorkerResult::WorkspaceScanCompleted { .. } => "worker-result:WorkspaceScanCompleted",
+        WorkerResult::WorkspaceRootStatusRefreshed { .. } => {
+            "worker-result:WorkspaceRootStatusRefreshed"
+        }
+        WorkerResult::RepositoryStatusRefreshed { .. } => "worker-result:RepositoryStatusRefreshed",
+        WorkerResult::RepositoryRemoteFetchCompleted { .. } => {
+            "worker-result:RepositoryRemoteFetchCompleted"
+        }
+        WorkerResult::RepoDetailsLoaded { .. } => "worker-result:RepoDetailsLoaded",
+        WorkerResult::WatchManagerSyncCompleted { .. } => "worker-result:WatchManagerSyncCompleted",
+        WorkerResult::RefreshWorkspaceCompleted { .. } => "worker-result:RefreshWorkspaceCompleted",
+        WorkerResult::HistoryReportCompleted { .. } => "worker-result:HistoryReportCompleted",
+        WorkerResult::LineStatsCompleted { .. } => "worker-result:LineStatsCompleted",
+        WorkerResult::CapabilityChecksCompleted { .. } => "worker-result:CapabilityChecksCompleted",
+    }
+}
+
 fn handle_worker_result(result: WorkerResult) {
+    let _timed = diag::timed(worker_result_label(&result));
     match result {
         WorkerResult::WorkspaceScanCompleted {
             workspace_status,
@@ -1994,13 +2044,23 @@ fn handle_worker_result(result: WorkerResult) {
                     log_watch_sync_outcome(None, unreadable);
                     LAST_WATCH_SYNC_SEQ_COMPLETED.store(sync_seq, Ordering::Relaxed);
                     WATCH_SYNC_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                    {
+                    let previous = {
                         let mut slot = watch_manager()
                             .lock()
                             .expect("watch manager mutex poisoned");
-                        *slot = manager;
+                        let previous = std::mem::replace(&mut *slot, manager);
                         record_watch_manager_metrics(slot.as_ref(), "watch-backend-changed");
-                    }
+                        previous
+                    };
+                    let previous_paths = previous.as_ref().map_or(0, |m| m.watched_paths);
+                    let _drop_timed = diag::timed_with(
+                        "drop-previous-watch-manager",
+                        format!("had_previous={} sync_seq={sync_seq}", previous.is_some()),
+                    );
+                    drop(previous);
+                    diag::log(format!(
+                        "watch manager replaced sync_seq={sync_seq} previous_roots={previous_paths}"
+                    ));
                     emit_runtime_profile("watch-sync");
                 }
                 Err(message) => {
@@ -2139,6 +2199,7 @@ fn refresh_views() {
 }
 
 fn refresh_views_now() {
+    let _timed = diag::timed("refresh-views");
     let snapshot = snapshot();
     refresh_repository_views(&snapshot);
     refresh_overview_views(&snapshot);
@@ -2292,6 +2353,7 @@ fn refresh_operation_views(snapshot: &StateSnapshot) {
 }
 
 fn refresh_log_surfaces() {
+    let _timed = diag::timed("refresh-log-surfaces");
     let snapshot = snapshot();
     refresh_operation_views(&snapshot);
 }
@@ -3595,6 +3657,7 @@ fn schedule_due_remote_fetches() {
 }
 
 fn schedule_workspace_scan() {
+    diag::log("workspace scan requested");
     let (workspace_root, manifest) = {
         let mut app_state = state().lock().expect("state mutex poisoned");
         if app_state.repository_items_loading {
@@ -3762,11 +3825,29 @@ fn log_watch_sync_outcome(failure: Option<String>, unreadable: Vec<PathBuf>) {
 }
 
 fn sync_watch_manager_from_state() {
+    sync_watch_manager(false);
+}
+
+/// Rebuilds the watch manager in the background. Unless `force`d, this is a
+/// no-op when the set of watched roots has not changed.
+fn sync_watch_manager(force: bool) {
     let manifest = {
         let mut app_state = state().lock().expect("state mutex poisoned");
         if app_state.watch_manager_sync_in_flight {
             app_state.watch_manager_sync_pending = true;
             WATCH_SYNC_PENDING_COLLAPSES.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let unchanged = !force
+            && app_state.manifest.as_ref().is_some_and(|manifest| {
+                let source = watch_source(manifest);
+                watch_manager()
+                    .lock()
+                    .expect("watch manager mutex poisoned")
+                    .as_ref()
+                    .is_some_and(|manager| manager.source == source)
+            });
+        if unchanged {
             return;
         }
         app_state.watch_manager_sync_in_flight = true;
@@ -3790,45 +3871,73 @@ fn sync_watch_manager_from_state() {
 }
 
 fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, String> {
+    let started = Instant::now();
+    diag::log(format!(
+        "watch manager build started repos={}",
+        manifest.repos.len()
+    ));
+    let result = build_watch_manager_inner(manifest);
+    diag::log(format!(
+        "watch manager build finished in {}ms ok={} roots={} unreadable={} error={:?}",
+        started.elapsed().as_millis(),
+        result.is_ok(),
+        result.as_ref().map_or(0, |m| m.watched_paths),
+        result.as_ref().map_or(0, |m| m.unreadable_paths.len()),
+        result.as_ref().err(),
+    ));
+    result
+}
+
+fn watch_source(manifest: &WorkspaceManifest) -> WatchSource {
     let workspace_root = normalized_watch_path(&manifest.root);
-    let repos = manifest
+    let workspace_git_dir = Some(workspace_root.join(".git")).filter(|path| path.exists());
+    let mut repo_roots = manifest
         .repos
         .iter()
-        .map(|repo| {
-            (
-                repo.id.clone(),
-                normalized_watch_path(&workspace_root.join(&repo.dir_name)),
-            )
-        })
-        .filter(|(_, path)| path.exists())
+        .map(|repo| normalized_watch_path(&workspace_root.join(&repo.dir_name)))
+        .filter(|path| path.exists())
         .collect::<Vec<_>>();
+    repo_roots.sort();
+    repo_roots.dedup();
+    WatchSource {
+        workspace_root,
+        workspace_git_dir,
+        repo_roots,
+    }
+}
 
+fn build_watch_manager_inner(manifest: &WorkspaceManifest) -> Result<WatchManager, String> {
+    let source = watch_source(manifest);
     let (mut backend, backend_kind) = create_watch_backend(Arc::new(manifest.clone()))?;
-    let workspace_git_dir = workspace_root.join(".git");
     let mut watched_paths = 0;
-
-    if workspace_root.exists() {
-        watch_backend_mut(&mut backend)
-            .watch(&workspace_root, RecursiveMode::NonRecursive)
-            .map_err(|error| format!("{}: {error}", workspace_root.display()))?;
-        watched_paths += 1;
-    }
-    if workspace_git_dir.exists() {
-        watch_backend_mut(&mut backend)
-            .watch(&workspace_git_dir, RecursiveMode::Recursive)
-            .map_err(|error| format!("{}: {error}", workspace_git_dir.display()))?;
-        watched_paths += 1;
-    }
-
     let mut unreadable_paths = Vec::new();
-    for (_, path) in &repos {
-        watch_tree_skipping_unreadable(
+    let mut ignored_dirs = HashSet::new();
+
+    if source.workspace_root.exists() {
+        watch_backend_mut(&mut backend)
+            .watch(&source.workspace_root, RecursiveMode::NonRecursive)
+            .map_err(|error| format!("{}: {error}", source.workspace_root.display()))?;
+        watched_paths += 1;
+    }
+    if let Some(git_dir) = &source.workspace_git_dir {
+        watched_paths += watch_dir_tree(
             watch_backend_mut(&mut backend),
-            path,
+            git_dir,
+            &ignored_dirs,
             &mut unreadable_paths,
         )
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-        watched_paths += 1;
+        .map_err(|error| format!("{}: {error}", git_dir.display()))?;
+    }
+
+    for repo_root in &source.repo_roots {
+        ignored_dirs.extend(git_ignored_dirs(repo_root, repo_root));
+        watched_paths += watch_dir_tree(
+            watch_backend_mut(&mut backend),
+            repo_root,
+            &ignored_dirs,
+            &mut unreadable_paths,
+        )
+        .map_err(|error| format!("{}: {error}", repo_root.display()))?;
     }
 
     if watched_paths == 0 {
@@ -3836,46 +3945,175 @@ fn build_watch_manager(manifest: &WorkspaceManifest) -> Result<WatchManager, Str
     }
 
     Ok(WatchManager {
-        _backend: backend,
+        backend,
         backend_kind,
         watched_paths,
         unreadable_paths,
+        source,
+        ignored_dirs,
     })
 }
 
-/// Watches `root` recursively, skipping subdirectories the current user cannot
-/// read (e.g. root-owned capture dirs inside a repo). One such directory makes
-/// a recursive inotify registration fail as a whole, so on permission errors
-/// `root` is watched non-recursively and each child subtree is retried.
-fn watch_tree_skipping_unreadable(
+/// Git-ignored directories at or below `dir` inside `repo_root`, as absolute
+/// paths. Build outputs, dependency caches and toolchains live there and can
+/// hold 100k+ directories, none of which affect repository status.
+fn git_ignored_dirs(repo_root: &Path, dir: &Path) -> Vec<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--",
+        ])
+        .arg(dir)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .filter_map(|entry| entry.strip_suffix('/'))
+        .map(|relative| repo_root.join(relative))
+        .collect()
+}
+
+/// Git internals that change constantly but never affect status on their own.
+fn is_unwatched_git_internal_dir(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == "objects" || name == "lfs")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".git")
+}
+
+fn is_under_ignored_dir(ignored: &HashSet<PathBuf>, path: &Path) -> bool {
+    !ignored.is_empty() && path.ancestors().any(|ancestor| ignored.contains(ancestor))
+}
+
+/// Watches `root` and its subdirectories one directory at a time, skipping
+/// `ignored` subtrees, `.git/objects`, symlinks (matching
+/// `follow_symlinks(false)`) and directories the current user cannot read
+/// (e.g. root-owned capture dirs inside a repo). Returns how many directories
+/// were registered. Only a failure on `root` itself is an error.
+fn watch_dir_tree(
     watcher: &mut dyn Watcher,
     root: &Path,
+    ignored: &HashSet<PathBuf>,
     unreadable: &mut Vec<PathBuf>,
-) -> notify::Result<()> {
-    let error = match watcher.watch(root, RecursiveMode::Recursive) {
-        Ok(()) => return Ok(()),
-        Err(error) if is_permission_denied(&error) => error,
-        Err(error) => return Err(error),
-    };
-    // Drop whatever the failed registration added before hitting the error.
-    let _ = watcher.unwatch(root);
-
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(read_error) if read_error.kind() == std::io::ErrorKind::PermissionDenied => {
-            unreadable.push(root.to_path_buf());
-            return Ok(());
+) -> notify::Result<usize> {
+    let mut registered = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let is_root = dir == root;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                unreadable.push(dir);
+                continue;
+            }
+            Err(error) if is_root => return Err(notify::Error::io(error)),
+            // Vanished while walking.
+            Err(_) => continue,
+        };
+        match watcher.watch(&dir, RecursiveMode::NonRecursive) {
+            Ok(()) => registered += 1,
+            Err(error) if is_permission_denied(&error) => {
+                unreadable.push(dir);
+                continue;
+            }
+            Err(error) if is_root => return Err(error),
+            Err(_) => continue,
         }
-        Err(_) => return Err(error),
-    };
-    watcher.watch(root, RecursiveMode::NonRecursive)?;
-    for entry in entries.flatten() {
-        // `file_type` does not follow symlinks, matching `follow_symlinks(false)`.
-        if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-            watch_tree_skipping_unreadable(watcher, &entry.path(), unreadable)?;
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            if ignored.contains(&path) || is_unwatched_git_internal_dir(&path) {
+                continue;
+            }
+            stack.push(path);
         }
     }
-    Ok(())
+    Ok(registered)
+}
+
+/// Registers directories created after the watch manager was built, along with
+/// anything already inside them, unless they are git-ignored. Runs on a worker:
+/// it spawns git, and the inotify backend cannot be driven from its own
+/// event callback.
+fn watch_new_dirs(mut dirs: Vec<PathBuf>) {
+    let mut slot = watch_manager()
+        .lock()
+        .expect("watch manager mutex poisoned");
+    let Some(manager) = slot.as_mut() else {
+        return;
+    };
+    // Parents first, so a registered parent's walk covers its children.
+    dirs.sort_by_key(|dir| dir.components().count());
+    let mut added = 0;
+    for dir in dirs {
+        let dir = normalized_watch_path(&dir);
+        if !dir.is_dir()
+            || is_under_ignored_dir(&manager.ignored_dirs, &dir)
+            || dir.ancestors().any(is_unwatched_git_internal_dir)
+        {
+            continue;
+        }
+        let repo_root = manager
+            .source
+            .repo_roots
+            .iter()
+            .filter(|root| dir.starts_with(root) && dir != **root)
+            .max_by_key(|root| root.components().count())
+            .cloned();
+        let in_workspace_git = manager
+            .source
+            .workspace_git_dir
+            .as_ref()
+            .is_some_and(|git_dir| dir.starts_with(git_dir));
+        if let Some(repo_root) = &repo_root {
+            manager
+                .ignored_dirs
+                .extend(git_ignored_dirs(repo_root, &dir));
+            if manager.ignored_dirs.contains(&dir) {
+                continue;
+            }
+        } else if !in_workspace_git {
+            // New top-level workspace entries (e.g. a fresh clone) are picked up
+            // by the full resync that follows the manifest/scan change.
+            continue;
+        }
+        if let Ok(count) = watch_dir_tree(
+            watch_backend_mut(&mut manager.backend),
+            &dir,
+            &manager.ignored_dirs,
+            &mut manager.unreadable_paths,
+        ) {
+            added += count;
+        }
+    }
+    if added > 0 {
+        manager.watched_paths += added;
+        WATCHED_PATH_COUNT.store(manager.watched_paths, Ordering::Relaxed);
+        diag::log(format!(
+            "watching {added} new directories (total {})",
+            manager.watched_paths
+        ));
+    }
 }
 
 fn is_permission_denied(error: &notify::Error) -> bool {
@@ -3971,6 +4209,14 @@ fn watch_event_may_change_status(event: &notify::Event) -> bool {
     }
 }
 
+fn watch_event_may_add_dir(event: &notify::Event) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Create(CreateKind::Folder | CreateKind::Any)
+            | EventKind::Modify(ModifyKind::Name(_))
+    )
+}
+
 fn record_watch_event(
     pending: &mut PendingWatchEvents,
     manifest: &WorkspaceManifest,
@@ -3983,6 +4229,13 @@ fn record_watch_event(
     }
     if pending.backend_rescan {
         return;
+    }
+    if watch_event_may_add_dir(event) {
+        for path in &event.paths {
+            if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+                pending.new_dirs.insert(path.clone());
+            }
+        }
     }
     for path in &event.paths {
         if workspace_watch_path_matches(manifest, path) {
@@ -4003,6 +4256,7 @@ fn schedule_watch_event_flush() {
 
 fn flush_pending_watch_events() {
     WATCH_EVENT_FLUSHES.fetch_add(1, Ordering::Relaxed);
+    let mut timed = diag::timed("flush-watch-events");
     let pending = {
         let mut pending = pending_watch_events()
             .lock()
@@ -4011,9 +4265,25 @@ fn flush_pending_watch_events() {
         std::mem::take(&mut *pending)
     };
 
+    timed.set_detail(format!(
+        "backend_rescan={} workspace_touched={} repos={} total_events={}",
+        pending.backend_rescan,
+        pending.workspace_touched,
+        pending.repo_ids.len(),
+        WATCH_EVENTS_RECEIVED.load(Ordering::Relaxed)
+    ));
     if pending.backend_rescan {
+        diag::log("watcher backend requested rescan (dropped events / overflow)");
         handle_watch_backend_rescan();
         return;
+    }
+    if !pending.new_dirs.is_empty() {
+        let dirs = pending.new_dirs.into_iter().collect();
+        if let Err(error) = submit_job(WorkerJob::WatchNewDirs { dirs }) {
+            append_log(format!(
+                "Repository watcher could not add new directories: {error}"
+            ));
+        }
     }
 
     handle_watch_touches(pending.workspace_touched, pending.repo_ids);
@@ -4058,6 +4328,8 @@ fn handle_watch_backend_rescan() {
     );
     schedule_workspace_root_status_refresh(workspace_root);
     schedule_pending_local_rescans();
+    // Dropped events may include directory creations that were never registered.
+    sync_watch_manager(true);
 }
 
 fn workspace_watch_path_matches(manifest: &WorkspaceManifest, path: &Path) -> bool {
@@ -11442,7 +11714,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut watcher = RecommendedWatcher::new(tx, repository_watch_config()).unwrap();
         let mut unreadable = Vec::new();
-        let result = watch_tree_skipping_unreadable(&mut watcher, &alpha, &mut unreadable);
+        let result = watch_dir_tree(&mut watcher, &alpha, &HashSet::new(), &mut unreadable);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         result.unwrap();
         assert_eq!(unreadable, vec![locked]);
@@ -11450,6 +11722,68 @@ mod tests {
         fs::write(alpha.join("src/nested/lib.rs"), "// v1\n").unwrap();
         let pending = collect_watch_events(&rx, &manifest);
         assert!(pending.repo_ids.contains("alpha"), "{:?}", pending.repo_ids);
+    }
+
+    #[test]
+    fn git_ignored_directories_and_git_objects_are_not_watched() {
+        let root = temp_test_dir("watch-ignored");
+        let manifest = two_repo_watch_manifest(&root);
+        let alpha = root.join("alpha");
+        fs::create_dir_all(alpha.join("src/nested")).unwrap();
+        fs::create_dir_all(alpha.join("target/debug/deps")).unwrap();
+        fs::write(alpha.join(".gitignore"), "target/\n").unwrap();
+        fs::write(alpha.join("src/lib.rs"), "// v1\n").unwrap();
+        run_git(&alpha, &["init", "-q", "-b", "main"]);
+        run_git(&alpha, &["add", "."]);
+        run_git(&alpha, &["commit", "-q", "-m", "initial"]);
+
+        let ignored = git_ignored_dirs(&alpha, &alpha)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(ignored, HashSet::from([alpha.join("target")]));
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = RecommendedWatcher::new(tx, repository_watch_config()).unwrap();
+        let mut unreadable = Vec::new();
+        let registered = watch_dir_tree(&mut watcher, &alpha, &ignored, &mut unreadable).unwrap();
+        // alpha, src, src/nested and .git minus objects; never target/**.
+        let git_dirs = walk_dirs(&alpha.join(".git"))
+            .into_iter()
+            .filter(|dir| !dir.starts_with(alpha.join(".git/objects")))
+            .count();
+        assert_eq!(registered, 3 + git_dirs);
+        collect_watch_events(&rx, &manifest);
+
+        fs::write(alpha.join("target/debug/deps/a.o"), "x").unwrap();
+        let pending = collect_watch_events(&rx, &manifest);
+        assert!(pending.repo_ids.is_empty(), "{:?}", pending.repo_ids);
+
+        fs::write(alpha.join("src/nested/lib.rs"), "// v1\n").unwrap();
+        let pending = collect_watch_events(&rx, &manifest);
+        assert_eq!(pending.repo_ids, HashSet::from(["alpha".to_string()]));
+
+        // New directories are queued for registration; their contents only
+        // report once registered.
+        fs::create_dir(alpha.join("src/fresh")).unwrap();
+        let pending = collect_watch_events(&rx, &manifest);
+        assert_eq!(pending.new_dirs, HashSet::from([alpha.join("src/fresh")]));
+
+        drop(watcher);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn walk_dirs(root: &Path) -> Vec<PathBuf> {
+        let mut dirs = vec![root.to_path_buf()];
+        let mut index = 0;
+        while index < dirs.len() {
+            for entry in fs::read_dir(&dirs[index]).unwrap().flatten() {
+                if entry.file_type().unwrap().is_dir() {
+                    dirs.push(entry.path());
+                }
+            }
+            index += 1;
+        }
+        dirs
     }
 
     #[test]
