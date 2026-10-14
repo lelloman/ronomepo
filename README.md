@@ -63,12 +63,14 @@ That means:
 - Ronomepo provides the domain model, repository scanning, Git operations, and views.
 - The initial product can be developed as a focused plugin while still feeling like a standalone desktop tool.
 
-The first useful workbench should expose:
+The workbench currently exposes:
 
-- a repository list
-- per-repository status details
-- batch actions for clone, pull, push, and hook setup
-- diagnostics for missing directories or failed Git commands
+- a repository list with status, filters and sorting
+- per-repository overview pages (Git state, repo manifest, capabilities)
+- toolbar actions for Refresh, Pull, Push, Monorepo Overview and Commit Check
+- per-repository actions (pull, push, push without commit checks, clone,
+  apply hooks) from the repository context menu and the repository overview
+- an Operations panel with the log of every Git operation
 - workspace metadata loaded from a manifest file
 
 ## Legacy Mapping
@@ -83,21 +85,25 @@ The current `mono` script already defines the minimum viable feature set:
 
 Ronomepo should reach parity with these workflows before expanding into richer desktop-specific features.
 
-## Proposed Workspace Model
+## Workspace Model
 
-Ronomepo should use a manifest file stored at the workspace root, likely something like `ronomepo.json`.
+The workspace inventory is `ronomepo.json` at the workspace root. It contains:
 
-A first-pass schema should include:
+- `name`: workspace name
+- `root`: workspace root path
+- `repos`: repository entries with `id`, `name`, `dir_name` (directory
+  under the root), `remote_url` and `enabled`
+- `shared_hooks_path` (optional): directory applied as `core.hooksPath`;
+  defaults to `<root>/hooks` when that directory exists
+- `commit_check_rules` (optional): rules the push preflight evaluates
+  against unpushed commits; seeded with defaults on first use
 
-- workspace name
-- workspace root path
-- shared hooks path
-- repository entries
-- per-repository id, display name, local directory, remote URL
-- optional tags or groups
-- optional enabled/disabled flag
+See [examples/sample-workspace/ronomepo.json](./examples/sample-workspace/ronomepo.json).
+When no manifest exists, the legacy `repos.txt` in the workspace root can be
+imported to bootstrap one.
 
-The legacy `repos.txt` can be imported automatically during bootstrap.
+Ronomepo also keeps derived state under `<root>/.ronomepo/` (for example
+`capability-state.json` with the latest capability check results).
 
 ## Subrepo Capability Manifest
 
@@ -195,6 +201,47 @@ The app should still be scriptable later, but the desktop workflow is the primar
 
 ## Current Status
 
-This repository currently contains only planning work. The implementation will start from documentation, data model design, and a thin Maruzzella-hosted plugin skeleton.
+The app is functional. The Cargo workspace is split into three crates:
 
-See [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) for the phased delivery plan.
+- `ronomepo-core`: workspace and repo manifests, Git status scanning, Git
+  operations, commit checks, capabilities and attention signals
+- `ronomepo-plugin`: the Maruzzella plugin (state, background workers,
+  repository watchers and GTK views)
+- `ronomepo-app`: the desktop binary hosting the plugin
+
+## Building And Running
+
+The Cargo workspace patches the `maruzzella` crates to a sibling checkout
+(`[patch.crates-io]` in `Cargo.toml`), so a Maruzzella checkout must exist at
+`../maruzzella` next to this repository.
+
+```sh
+cargo run -p ronomepo-app -- --workspace ~/path/to/workspace
+```
+
+The workspace root is taken from `--workspace <path>`, `--workspace=<path>` or
+the first positional argument, and defaults to the current directory. A
+leading `~` is expanded.
+
+Environment variables:
+
+- `RONOMEPO_WORKSPACE_ROOT`: set by the app for the plugin from the
+  argument above (when the plugin is hosted elsewhere it can be set directly)
+- `RONOMEPO_USE_SYSTEM_INPUT_METHOD`: keep the system GTK input method; by
+  default Ronomepo forces GTK's simple input context to avoid IBus stalls
+- `RONOMEPO_PROFILE`: when set to anything other than `0`, log runtime
+  profiling summaries (scheduler, watchers, in-flight jobs) to the
+  diagnostics log
+- `RONOMEPO_EDITOR`, then `VISUAL`, then `EDITOR`: editor used by
+  "Open In Editor"
+
+Git operations never prompt: credential prompts are disabled, ssh runs in
+batch mode, and each clone, pull or push is cancelled after five minutes.
+
+Files outside the workspace:
+
+- `$XDG_CONFIG_HOME/ronomepo/` (default `~/.config/ronomepo/`): shell layout
+  (`layout.json`) and plugin configuration (`plugins.json`)
+- `$XDG_STATE_HOME/ronomepo/ronomepo.log` (default
+  `~/.local/state/ronomepo/ronomepo.log`): diagnostics log, rotated to
+  `ronomepo.log.1` at 10 MiB
