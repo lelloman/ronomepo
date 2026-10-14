@@ -4001,14 +4001,15 @@ fn collect_repo_line_stats(
     repository_name: &str,
     since_date: Option<&str>,
 ) -> LineStatsRow {
-    if !repo_path.exists() {
-        return LineStatsRow {
-            repository_name: repository_name.to_string(),
-            additions: 0,
-            deletions: 0,
-            net: 0,
-            missing: true,
-        };
+    let empty_row = |missing| LineStatsRow {
+        repository_name: repository_name.to_string(),
+        additions: 0,
+        deletions: 0,
+        net: 0,
+        missing,
+    };
+    if !is_git_repository(repo_path) {
+        return empty_row(true);
     }
 
     let mut command = read_only_git(repo_path);
@@ -4017,14 +4018,14 @@ fn collect_repo_line_stats(
         command.arg(format!("--since={since_date}"));
     }
     command.arg("--numstat").arg("--format=");
-    let Ok(output) = command.output() else {
-        return LineStatsRow {
-            repository_name: repository_name.to_string(),
-            additions: 0,
-            deletions: 0,
-            net: 0,
-            missing: false,
-        };
+    let output = match command.stderr(Stdio::null()).output() {
+        Ok(output) if output.status.success() => output,
+        // A branch without commits has no history to count; any other
+        // failure means the numbers are unknown, not zero.
+        _ => {
+            let has_head = git_stdout(repo_path, ["rev-parse", "--verify", "-q", "HEAD"]).is_some();
+            return empty_row(has_head);
+        }
     };
 
     let stats = String::from_utf8_lossy(&output.stdout);
@@ -5419,6 +5420,29 @@ mod tests {
         assert_eq!(stats.rows.len(), 2);
         assert!(stats.total_additions >= 2);
         assert!(stats.total_net >= 2);
+    }
+
+    #[test]
+    fn line_stats_do_not_report_failed_git_log_as_zero() {
+        let repo_path = temp_dir_path("line-stats-failure");
+        init_git_repo(&repo_path);
+        assert!(!collect_repo_line_stats(&repo_path, "alpha", None).missing);
+
+        // A corrupt HEAD makes git log fail even though the repository exists.
+        fs::write(
+            repo_path.join(".git").join("refs/heads/main"),
+            "0".repeat(40),
+        )
+        .unwrap();
+        let row = collect_repo_line_stats(&repo_path, "alpha", None);
+        assert!(row.missing);
+
+        let unborn = temp_dir_path("line-stats-unborn");
+        fs::create_dir_all(&unborn).unwrap();
+        run_git(&unborn, ["init", "-b", "main"]);
+        let row = collect_repo_line_stats(&unborn, "beta", None);
+        assert!(!row.missing);
+        assert_eq!(row.additions, 0);
     }
 
     #[test]
