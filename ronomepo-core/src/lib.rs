@@ -3720,6 +3720,10 @@ enum CompiledCommitCheckMatcher {
     CommitHash(String),
 }
 
+/// Commit-hash rules accept abbreviated hashes, as long as they are not so
+/// short that they are likely to match unrelated commits.
+const MIN_COMMIT_HASH_PREFIX_LEN: usize = 7;
+
 fn compile_commit_check_rules(rules: &[CommitCheckRule]) -> CompiledCommitCheckRules {
     let mut ordered_rules = rules.to_vec();
     ordered_rules.sort_by(|left, right| {
@@ -3748,7 +3752,20 @@ fn compile_commit_check_rules(rules: &[CommitCheckRule]) -> CompiledCommitCheckR
                 }
             },
             CommitCheckRuleMatcher::CommitHash { hash } => {
-                CompiledCommitCheckMatcher::CommitHash(hash.trim().to_ascii_lowercase())
+                let hash = hash.trim().to_ascii_lowercase();
+                if hash.len() < MIN_COMMIT_HASH_PREFIX_LEN
+                    || !hash.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    invalid.push(InvalidCommitCheckRule {
+                        rule_id: rule.id.clone(),
+                        rule_name: rule.name.clone(),
+                        message: format!(
+                            "commit hash must be at least {MIN_COMMIT_HASH_PREFIX_LEN} hex characters"
+                        ),
+                    });
+                    continue;
+                }
+                CompiledCommitCheckMatcher::CommitHash(hash)
             }
         };
 
@@ -3880,8 +3897,10 @@ fn commit_matches_rule(
             }
             (!matching_lines.is_empty()).then_some(matching_lines)
         }
-        CompiledCommitCheckMatcher::CommitHash(hash) => (commit.commit_hash.to_ascii_lowercase()
-            == *hash)
+        CompiledCommitCheckMatcher::CommitHash(hash) => commit
+            .commit_hash
+            .to_ascii_lowercase()
+            .starts_with(hash.as_str())
             .then(|| vec![commit.commit_hash.clone()]),
     }
 }
@@ -5423,9 +5442,9 @@ mod tests {
                 "Generated: Claude",
             ],
         );
-        let hash = git_stdout(&repo_path, ["rev-parse", "HEAD"]).unwrap();
+        let hash = git_stdout(&repo_path, ["rev-parse", "--short=7", "HEAD"]).unwrap();
 
-        let manifest = WorkspaceManifest {
+        let mut manifest = WorkspaceManifest {
             name: "Example".to_string(),
             root: repo_path.to_path_buf(),
             repos: vec![],
@@ -5457,6 +5476,18 @@ mod tests {
         let report = collect_commit_check_report(&manifest, &[], 25);
         assert!(report.invalid_rules.is_empty());
         assert!(report.matches.is_empty());
+
+        // Prefixes shorter than the minimum are rejected rather than matching.
+        if let Some(CommitCheckRuleMatcher::CommitHash { hash }) = manifest
+            .commit_check_rules
+            .as_mut()
+            .map(|rules| &mut rules[1].matcher)
+        {
+            hash.truncate(6);
+        }
+        let report = collect_commit_check_report(&manifest, &[], 25);
+        assert_eq!(report.invalid_rules.len(), 1);
+        assert_eq!(report.matches.len(), 1);
     }
 
     #[test]
