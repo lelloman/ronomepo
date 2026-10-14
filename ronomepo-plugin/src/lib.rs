@@ -7,6 +7,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::rc::Rc;
@@ -577,6 +578,22 @@ enum WorkerResult {
     CapabilityChecksCompleted {
         result: Result<CapabilityRunReport, String>,
     },
+    JobPanicked {
+        recovery: JobRecovery,
+        message: String,
+    },
+}
+
+/// State to reset on the main thread for a job that panicked and has no
+/// failure result of its own.
+enum JobRecovery {
+    OperationBatch {
+        batch_id: usize,
+        operation: &'static str,
+    },
+    WorkspaceScan,
+    RepoStatus(String),
+    RepoDetails(String),
 }
 
 struct RefreshWorkspaceResult {
@@ -945,7 +962,9 @@ fn submit_queued_job(queued_job: QueuedJob) -> Result<(), String> {
 fn worker_loop(receiver: Arc<Mutex<mpsc::Receiver<QueuedJob>>>) {
     loop {
         let queued_job = {
-            let receiver = receiver.lock().expect("worker receiver poisoned");
+            let receiver = receiver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             receiver.recv()
         };
         let Ok(queued_job) = queued_job else {
@@ -957,7 +976,147 @@ fn worker_loop(receiver: Arc<Mutex<mpsc::Receiver<QueuedJob>>>) {
 
 fn run_worker_job(queued_job: QueuedJob) {
     let key = queued_job.key.clone();
-    let result = match queued_job.job {
+    let label = worker_job_label(&queued_job.job);
+    let recover = worker_job_panic_recovery(&queued_job.job);
+    // A panicking job must still release its key and reset the state flags that
+    // were set when it was queued; otherwise that work never runs again.
+    let result = match panic::catch_unwind(AssertUnwindSafe(|| execute_worker_job(queued_job.job)))
+    {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = panic_message(payload.as_ref());
+            report_panic(label, &message);
+            recover(format!("{label} panicked: {message}"))
+        }
+    };
+
+    complete_worker_job(&executor().in_flight, key, || {
+        if let Some(result) = result {
+            dispatch_worker_result(result);
+        }
+    });
+}
+
+fn worker_job_label(job: &WorkerJob) -> &'static str {
+    match job {
+        WorkerJob::OperationBatch { .. } => "worker-job:OperationBatch",
+        WorkerJob::WorkspaceScan { .. } => "worker-job:WorkspaceScan",
+        WorkerJob::WorkspaceRootStatusRefresh { .. } => "worker-job:WorkspaceRootStatusRefresh",
+        WorkerJob::RepositoryStatusRefresh { .. } => "worker-job:RepositoryStatusRefresh",
+        WorkerJob::RepositoryRemoteFetch { .. } => "worker-job:RepositoryRemoteFetch",
+        WorkerJob::RepoDetailsLoad { .. } => "worker-job:RepoDetailsLoad",
+        WorkerJob::WatchManagerSync { .. } => "worker-job:WatchManagerSync",
+        WorkerJob::WatchNewDirs { .. } => "worker-job:WatchNewDirs",
+        WorkerJob::RefreshWorkspace { .. } => "worker-job:RefreshWorkspace",
+        WorkerJob::HistoryReport { .. } => "worker-job:HistoryReport",
+        WorkerJob::LineStats { .. } => "worker-job:LineStats",
+        WorkerJob::CapabilityChecks { .. } => "worker-job:CapabilityChecks",
+        WorkerJob::EditorLoad { .. } => "worker-job:EditorLoad",
+        WorkerJob::EditorSave { .. } => "worker-job:EditorSave",
+    }
+}
+
+/// Builds the result reported in place of a job's own when it panics, so the
+/// main thread clears whatever "in flight" state the job was holding.
+fn worker_job_panic_recovery(job: &WorkerJob) -> Box<dyn FnOnce(String) -> Option<WorkerResult>> {
+    match job {
+        WorkerJob::OperationBatch { kind, batch_id, .. } => {
+            let recovery = JobRecovery::OperationBatch {
+                batch_id: *batch_id,
+                operation: operation_kind_title(*kind),
+            };
+            Box::new(move |message| Some(WorkerResult::JobPanicked { recovery, message }))
+        }
+        WorkerJob::WorkspaceScan { .. } => Box::new(|message| {
+            Some(WorkerResult::JobPanicked {
+                recovery: JobRecovery::WorkspaceScan,
+                message,
+            })
+        }),
+        WorkerJob::RepositoryStatusRefresh { item } => {
+            let recovery = JobRecovery::RepoStatus(item.id.clone());
+            Box::new(move |message| Some(WorkerResult::JobPanicked { recovery, message }))
+        }
+        WorkerJob::RepoDetailsLoad { repo_id, .. } => {
+            let recovery = JobRecovery::RepoDetails(repo_id.clone());
+            Box::new(move |message| Some(WorkerResult::JobPanicked { recovery, message }))
+        }
+        WorkerJob::RepositoryRemoteFetch {
+            repo_id, repo_name, ..
+        } => {
+            let repo_id = repo_id.clone();
+            let repo_name = repo_name.clone();
+            Box::new(move |message| {
+                Some(WorkerResult::RepositoryRemoteFetchCompleted {
+                    repo_id,
+                    repo_name,
+                    result: Err(message),
+                })
+            })
+        }
+        WorkerJob::WatchManagerSync { sync_seq, .. } => {
+            let sync_seq = *sync_seq;
+            Box::new(move |message| {
+                Some(WorkerResult::WatchManagerSyncCompleted {
+                    sync_seq,
+                    result: Err(message),
+                })
+            })
+        }
+        WorkerJob::RefreshWorkspace { status_sender, .. } => {
+            let status_sender = status_sender.clone();
+            Box::new(move |message| {
+                Some(WorkerResult::RefreshWorkspaceCompleted {
+                    result: Err(message),
+                    status_sender,
+                })
+            })
+        }
+        WorkerJob::HistoryReport { .. } => Box::new(|message| {
+            Some(WorkerResult::HistoryReportCompleted {
+                result: Err(message),
+            })
+        }),
+        WorkerJob::LineStats { .. } => Box::new(|message| {
+            Some(WorkerResult::LineStatsCompleted {
+                result: Err(message),
+            })
+        }),
+        WorkerJob::CapabilityChecks { .. } => Box::new(|message| {
+            Some(WorkerResult::CapabilityChecksCompleted {
+                result: Err(message),
+            })
+        }),
+        WorkerJob::EditorLoad { path, reply } => {
+            let path = path.clone();
+            let reply = reply.clone();
+            Box::new(move |message| {
+                let _ = reply.send(EditorLoadMessage {
+                    path,
+                    result: Err(message),
+                });
+                None
+            })
+        }
+        WorkerJob::EditorSave { path, reply, .. } => {
+            let path = path.clone();
+            let reply = reply.clone();
+            Box::new(move |message| {
+                let _ = reply.send(EditorSaveMessage {
+                    path,
+                    result: Err(message),
+                });
+                None
+            })
+        }
+        WorkerJob::WorkspaceRootStatusRefresh { .. } | WorkerJob::WatchNewDirs { .. } => {
+            Box::new(|_| None)
+        }
+    }
+}
+
+fn execute_worker_job(job: WorkerJob) -> Option<WorkerResult> {
+    match job {
         WorkerJob::OperationBatch {
             manifest,
             selected_repo_ids,
@@ -969,8 +1128,11 @@ fn run_worker_job(queued_job: QueuedJob) {
             run_workspace_operation(&manifest, &selected_repo_ids, kind, |event| {
                 let event = event.clone();
                 let manifest = manifest.clone();
-                main_context
-                    .invoke(move || handle_operation_event(batch_id, operation, manifest, event));
+                main_context.invoke(move || {
+                    guard_panics("handle_operation_event", (), || {
+                        handle_operation_event(batch_id, operation, manifest, event)
+                    })
+                });
             });
             None
         }
@@ -1070,13 +1232,97 @@ fn run_worker_job(queued_job: QueuedJob) {
             let _ = reply.send(EditorSaveMessage { path, result });
             None
         }
-    };
+    }
+}
 
-    complete_worker_job(&executor().in_flight, key, || {
-        if let Some(result) = result {
-            dispatch_worker_result(result);
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+/// Logs a caught panic. The panicking code may have held one of the global
+/// locks, so clear their poison first: the caller recovers and carries on, and
+/// every later `lock().expect(..)` would otherwise panic too.
+fn report_panic(context: &str, message: &str) {
+    state().clear_poison();
+    executor().in_flight.clear_poison();
+    watch_manager().clear_poison();
+    pending_watch_events().clear_poison();
+    diag::log(format!("PANIC in {context}: {message}"));
+    append_log(format!("Internal error in {context}: {message}"));
+}
+
+/// Runs `body` and turns a panic into `fallback`. Panics must not unwind into
+/// the host through `extern "C"` entry points (that aborts the process), nor
+/// out of main-loop callbacks.
+fn guard_panics<T>(context: &'static str, fallback: T, body: impl FnOnce() -> T) -> T {
+    match panic::catch_unwind(AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(payload) => {
+            report_panic(context, &panic_message(payload.as_ref()));
+            fallback
         }
-    });
+    }
+}
+
+fn guard_command(
+    context: &'static str,
+    body: impl FnOnce() -> maruzzella_sdk::ffi::MzStatus,
+) -> maruzzella_sdk::ffi::MzStatus {
+    guard_panics(
+        context,
+        maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError),
+        body,
+    )
+}
+
+macro_rules! guarded_view_factory {
+    ($wrapper:ident, $factory:ident) => {
+        extern "C" fn $wrapper(
+            host: *const maruzzella_sdk::ffi::MzHostApi,
+            request: *const maruzzella_sdk::ffi::MzViewRequest,
+        ) -> *mut std::ffi::c_void {
+            guard_panics(stringify!($factory), std::ptr::null_mut(), || {
+                $factory(host, request)
+            })
+        }
+    };
+}
+
+guarded_view_factory!(create_repo_monitor_view_ffi, create_repo_monitor_view);
+guarded_view_factory!(
+    create_monorepo_overview_view_ffi,
+    create_monorepo_overview_view
+);
+guarded_view_factory!(create_repo_overview_view_ffi, create_repo_overview_view);
+guarded_view_factory!(
+    create_repo_manifest_editor_view_ffi,
+    create_repo_manifest_editor_view
+);
+guarded_view_factory!(create_commit_check_view_ffi, create_commit_check_view);
+guarded_view_factory!(
+    create_workspace_settings_view_ffi,
+    create_workspace_settings_view
+);
+guarded_view_factory!(create_text_editor_view_ffi, create_text_editor_view);
+guarded_view_factory!(create_operations_view_ffi, create_operations_view);
+
+extern "C" fn prepare_text_editor_teardown_ffi(
+    request: *const MzViewTeardownRequest,
+) -> MzViewTeardownResult {
+    guard_panics(
+        "prepare_text_editor_teardown",
+        MzViewTeardownResult {
+            decision: MzViewTeardownDecision::Confirm,
+            message: maruzzella_sdk::ffi::MzStr::from_static(
+                "Could not check this text editor for unsaved changes.",
+            ),
+        },
+        || prepare_text_editor_teardown(request),
+    )
 }
 
 fn complete_worker_job(
@@ -1089,7 +1335,7 @@ fn complete_worker_job(
     if let Some(key) = key {
         in_flight
             .lock()
-            .expect("executor mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&key);
     }
     publish_result();
@@ -1097,7 +1343,8 @@ fn complete_worker_job(
 
 fn dispatch_worker_result(result: WorkerResult) {
     let main_context = glib::MainContext::default();
-    main_context.invoke(move || handle_worker_result(result));
+    main_context
+        .invoke(move || guard_panics("handle_worker_result", (), || handle_worker_result(result)));
 }
 
 fn empty_repository_status(repo_path: PathBuf) -> ronomepo_core::RepositoryStatus {
@@ -1216,42 +1463,42 @@ impl Plugin for RonomepoPlugin {
             VIEW_REPO_MONITOR,
             "Repository Monitor",
             MzViewPlacement::SidePanel,
-            create_repo_monitor_view,
+            create_repo_monitor_view_ffi,
         ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
             VIEW_MONOREPO_OVERVIEW,
             "Monorepo Overview",
             MzViewPlacement::Workbench,
-            create_monorepo_overview_view,
+            create_monorepo_overview_view_ffi,
         ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
             VIEW_REPO_OVERVIEW,
             "Repo Overview",
             MzViewPlacement::Workbench,
-            create_repo_overview_view,
+            create_repo_overview_view_ffi,
         ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
             VIEW_REPO_MANIFEST_EDITOR,
             "Repo Manifest Editor",
             MzViewPlacement::Workbench,
-            create_repo_manifest_editor_view,
+            create_repo_manifest_editor_view_ffi,
         ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
             VIEW_COMMIT_CHECK,
             "Commit Check",
             MzViewPlacement::Workbench,
-            create_commit_check_view,
+            create_commit_check_view_ffi,
         ))?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
             VIEW_FUCINA_POLICY,
             "Fucina Policy",
             MzViewPlacement::Workbench,
-            create_workspace_settings_view,
+            create_workspace_settings_view_ffi,
         ))?;
         host.register_view_factory(
             ViewFactorySpec::new(
@@ -1259,16 +1506,16 @@ impl Plugin for RonomepoPlugin {
                 VIEW_TEXT_EDITOR,
                 "Text Editor",
                 MzViewPlacement::Workbench,
-                create_text_editor_view,
+                create_text_editor_view_ffi,
             )
-            .with_prepare_teardown(prepare_text_editor_teardown),
+            .with_prepare_teardown(prepare_text_editor_teardown_ffi),
         )?;
         host.register_view_factory(ViewFactorySpec::new(
             PLUGIN_ID,
             VIEW_OPERATIONS,
             "Operations",
             MzViewPlacement::BottomPanel,
-            create_operations_view,
+            create_operations_view_ffi,
         ))?;
 
         Ok(())
@@ -1360,67 +1607,86 @@ fn initialize_state(config: &RonomepoPluginConfig) {
 extern "C" fn command_refresh_workspace(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    match queue_refresh_workspace(None) {
-        Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
-        Err(message) => {
-            append_log(format!("Refresh failed: {message}"));
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
-        }
-    }
+    guard_command(
+        "command_refresh_workspace",
+        || match queue_refresh_workspace(None) {
+            Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
+            Err(message) => {
+                append_log(format!("Refresh failed: {message}"));
+                refresh_views();
+                maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
+            }
+        },
+    )
 }
 
 extern "C" fn command_clone_missing(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    launch_operation(OperationKind::CloneMissing);
-    maruzzella_sdk::ffi::MzStatus::OK
+    guard_command("command_clone_missing", || {
+        launch_operation(OperationKind::CloneMissing);
+        maruzzella_sdk::ffi::MzStatus::OK
+    })
 }
 
 extern "C" fn command_pull(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    launch_operation(OperationKind::Pull);
-    maruzzella_sdk::ffi::MzStatus::OK
+    guard_command("command_pull", || {
+        launch_operation(OperationKind::Pull);
+        maruzzella_sdk::ffi::MzStatus::OK
+    })
 }
 
 extern "C" fn command_push(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    launch_operation(OperationKind::Push);
-    maruzzella_sdk::ffi::MzStatus::OK
+    guard_command("command_push", || {
+        launch_operation(OperationKind::Push);
+        maruzzella_sdk::ffi::MzStatus::OK
+    })
 }
 
 extern "C" fn command_push_force(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    launch_operation(OperationKind::PushForce);
-    maruzzella_sdk::ffi::MzStatus::OK
+    guard_command("command_push_force", || {
+        launch_operation(OperationKind::PushForce);
+        maruzzella_sdk::ffi::MzStatus::OK
+    })
 }
 
 extern "C" fn command_apply_hooks(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    launch_operation(OperationKind::ApplyHooks);
-    maruzzella_sdk::ffi::MzStatus::OK
+    guard_command("command_apply_hooks", || {
+        launch_operation(OperationKind::ApplyHooks);
+        maruzzella_sdk::ffi::MzStatus::OK
+    })
 }
 
 extern "C" fn command_open_overview(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    open_workbench_view_command(VIEW_MONOREPO_OVERVIEW, "Monorepo Overview")
+    guard_command("command_open_overview", || {
+        open_workbench_view_command(VIEW_MONOREPO_OVERVIEW, "Monorepo Overview")
+    })
 }
 
 extern "C" fn command_open_commit_check(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    open_workbench_view_command(VIEW_COMMIT_CHECK, "Commit Check")
+    guard_command("command_open_commit_check", || {
+        open_workbench_view_command(VIEW_COMMIT_CHECK, "Commit Check")
+    })
 }
 
 extern "C" fn command_open_fucina_policy(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    open_workbench_view_command(VIEW_FUCINA_POLICY, "Fucina Policy")
+    guard_command("command_open_fucina_policy", || {
+        open_workbench_view_command(VIEW_FUCINA_POLICY, "Fucina Policy")
+    })
 }
 
 fn open_workbench_view_command(view_id: &str, title: &str) -> maruzzella_sdk::ffi::MzStatus {
@@ -1438,60 +1704,69 @@ fn open_workbench_view_command(view_id: &str, title: &str) -> maruzzella_sdk::ff
 extern "C" fn command_exit(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    if let Some(application) = gio::Application::default() {
-        application.quit();
-        maruzzella_sdk::ffi::MzStatus::OK
-    } else {
-        append_log("Cannot exit because no GTK application is active.".to_string());
-        refresh_views();
-        maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
-    }
+    guard_command("command_exit", || {
+        if let Some(application) = gio::Application::default() {
+            application.quit();
+            maruzzella_sdk::ffi::MzStatus::OK
+        } else {
+            append_log("Cannot exit because no GTK application is active.".to_string());
+            refresh_views();
+            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
+        }
+    })
 }
 
 extern "C" fn command_check_history(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    match queue_history_report(25) {
+    guard_command("command_check_history", || match queue_history_report(25) {
         Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
         Err(message) => {
             append_log(message);
             refresh_views();
             maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
         }
-    }
+    })
 }
 
 extern "C" fn command_line_stats(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    match queue_line_stats_report_from_state() {
-        Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
-        Err(message) => {
-            append_log(message);
-            refresh_views();
-            maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
-        }
-    }
+    guard_command(
+        "command_line_stats",
+        || match queue_line_stats_report_from_state() {
+            Ok(()) => maruzzella_sdk::ffi::MzStatus::OK,
+            Err(message) => {
+                append_log(message);
+                refresh_views();
+                maruzzella_sdk::ffi::MzStatus::new(MzStatusCode::InternalError)
+            }
+        },
+    )
 }
 
 extern "C" fn command_refresh_logs(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    refresh_log_surfaces();
-    maruzzella_sdk::ffi::MzStatus::OK
+    guard_command("command_refresh_logs", || {
+        refresh_log_surfaces();
+        maruzzella_sdk::ffi::MzStatus::OK
+    })
 }
 
 extern "C" fn command_clear_logs(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    {
-        let mut app_state = state().lock().expect("state mutex poisoned");
-        app_state.logs.clear();
-        app_state.last_log_message = None;
-        push_log_line(&mut app_state, "Operations log cleared.".to_string());
-    }
-    refresh_views();
-    maruzzella_sdk::ffi::MzStatus::OK
+    guard_command("command_clear_logs", || {
+        {
+            let mut app_state = state().lock().expect("state mutex poisoned");
+            app_state.logs.clear();
+            app_state.last_log_message = None;
+            push_log_line(&mut app_state, "Operations log cleared.".to_string());
+        }
+        refresh_views();
+        maruzzella_sdk::ffi::MzStatus::OK
+    })
 }
 
 fn queue_refresh_workspace(status_sender: Option<mpsc::Sender<String>>) -> Result<(), String> {
@@ -1814,6 +2089,7 @@ fn worker_result_label(result: &WorkerResult) -> &'static str {
         WorkerResult::HistoryReportCompleted { .. } => "worker-result:HistoryReportCompleted",
         WorkerResult::LineStatsCompleted { .. } => "worker-result:LineStatsCompleted",
         WorkerResult::CapabilityChecksCompleted { .. } => "worker-result:CapabilityChecksCompleted",
+        WorkerResult::JobPanicked { .. } => "worker-result:JobPanicked",
     }
 }
 
@@ -2077,6 +2353,39 @@ fn handle_worker_result(result: WorkerResult) {
             append_log(message);
             schedule_workspace_scan();
             refresh_views();
+        }
+        WorkerResult::JobPanicked { recovery, message } => {
+            recover_panicked_job(recovery, message);
+            refresh_views();
+        }
+    }
+}
+
+fn recover_panicked_job(recovery: JobRecovery, message: String) {
+    match recovery {
+        JobRecovery::OperationBatch {
+            batch_id,
+            operation,
+        } => {
+            append_log(format!("[run {batch_id}] {operation} aborted: {message}"));
+            sync_watch_manager_from_state();
+        }
+        JobRecovery::WorkspaceScan => {
+            let mut app_state = state().lock().expect("state mutex poisoned");
+            app_state.repository_items_loading = false;
+            // Do not rerun right away: the same scan would likely panic again.
+            app_state.repository_items_refresh_pending = false;
+        }
+        JobRecovery::RepoStatus(repo_id) => {
+            // The repo stays stale, so the next periodic rescan retries it.
+            let mut app_state = state().lock().expect("state mutex poisoned");
+            if let Some(runtime) = app_state.repo_runtime.get_mut(&repo_id) {
+                runtime.local_refresh_in_flight = false;
+            }
+        }
+        JobRecovery::RepoDetails(repo_id) => {
+            let mut app_state = state().lock().expect("state mutex poisoned");
+            app_state.repo_details_loading.remove(&repo_id);
         }
     }
 }
@@ -3258,15 +3567,17 @@ fn update_monitor_filter(filter: String) {
 extern "C" fn command_filter(
     payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
-    let text = if payload.ptr.is_null() || payload.len == 0 {
-        String::new()
-    } else {
-        let bytes = unsafe { std::slice::from_raw_parts(payload.ptr, payload.len) };
-        String::from_utf8_lossy(bytes).into_owned()
-    };
-    update_monitor_filter(text);
-    refresh_views();
-    maruzzella_sdk::ffi::MzStatus::OK
+    guard_command("command_filter", || {
+        let text = if payload.ptr.is_null() || payload.len == 0 {
+            String::new()
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(payload.ptr, payload.len) };
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        update_monitor_filter(text);
+        refresh_views();
+        maruzzella_sdk::ffi::MzStatus::OK
+    })
 }
 
 fn update_monitor_filter_mode(mode: MonitorFilterMode) {
@@ -5307,7 +5618,7 @@ where
     menu.append(&button);
 }
 
-extern "C" fn create_repo_monitor_view(
+fn create_repo_monitor_view(
     host: *const maruzzella_sdk::ffi::MzHostApi,
     _request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
@@ -6419,7 +6730,7 @@ fn sync_color(sync: &ronomepo_core::RepositorySync) -> &'static str {
     }
 }
 
-extern "C" fn create_monorepo_overview_view(
+fn create_monorepo_overview_view(
     host: *const maruzzella_sdk::ffi::MzHostApi,
     _request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
@@ -6465,7 +6776,7 @@ extern "C" fn create_monorepo_overview_view(
     }
 }
 
-extern "C" fn create_commit_check_view(
+fn create_commit_check_view(
     host: *const maruzzella_sdk::ffi::MzHostApi,
     _request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
@@ -7215,7 +7526,7 @@ fn save_commit_check_rules(rules: Vec<CommitCheckRule>) -> Result<String, String
     ))
 }
 
-extern "C" fn create_repo_overview_view(
+fn create_repo_overview_view(
     host: *const maruzzella_sdk::ffi::MzHostApi,
     request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
@@ -7337,7 +7648,7 @@ extern "C" fn create_repo_overview_view(
     }
 }
 
-extern "C" fn create_workspace_settings_view(
+fn create_workspace_settings_view(
     host: *const maruzzella_sdk::ffi::MzHostApi,
     _request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
@@ -9897,7 +10208,7 @@ fn open_path_in_editor(path: &Path, label: &str) {
     }
 }
 
-extern "C" fn create_repo_manifest_editor_view(
+fn create_repo_manifest_editor_view(
     host: *const maruzzella_sdk::ffi::MzHostApi,
     request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
@@ -10735,7 +11046,7 @@ fn schedule_value_from_controls(
     }
 }
 
-extern "C" fn create_text_editor_view(
+fn create_text_editor_view(
     host: *const maruzzella_sdk::ffi::MzHostApi,
     request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
@@ -10907,9 +11218,7 @@ extern "C" fn create_text_editor_view(
     }
 }
 
-extern "C" fn prepare_text_editor_teardown(
-    request: *const MzViewTeardownRequest,
-) -> MzViewTeardownResult {
+fn prepare_text_editor_teardown(request: *const MzViewTeardownRequest) -> MzViewTeardownResult {
     let Some(request) = (unsafe { request.as_ref() }) else {
         return MzViewTeardownResult {
             decision: MzViewTeardownDecision::Blocked,
@@ -11141,7 +11450,7 @@ fn decode_mzstr(value: maruzzella_sdk::ffi::MzStr) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-extern "C" fn create_operations_view(
+fn create_operations_view(
     host: *const maruzzella_sdk::ffi::MzHostApi,
     _request: *const maruzzella_sdk::ffi::MzViewRequest,
 ) -> *mut std::ffi::c_void {
@@ -12234,6 +12543,42 @@ mod tests {
             .logs
             .iter()
             .any(|line| line.ends_with("logged from a worker")));
+    }
+
+    #[test]
+    fn guarded_code_turns_panics_into_fallbacks() {
+        let value = guard_panics("test-panic", 7, || -> i32 { panic!("boom") });
+        assert_eq!(value, 7);
+        let status = guard_command("test-command", || panic!("boom"));
+        assert_eq!(status.code, MzStatusCode::InternalError);
+    }
+
+    #[test]
+    fn panicking_fetch_job_reports_a_failed_fetch() {
+        let job = WorkerJob::RepositoryRemoteFetch {
+            repo_id: "alpha".to_string(),
+            repo_name: "Alpha".to_string(),
+            repo_path: PathBuf::from("alpha"),
+        };
+        let recover = worker_job_panic_recovery(&job);
+        match recover("boom".to_string()) {
+            Some(WorkerResult::RepositoryRemoteFetchCompleted {
+                repo_id, result, ..
+            }) => {
+                assert_eq!(repo_id, "alpha");
+                assert_eq!(result, Err("boom".to_string()));
+            }
+            _ => panic!("expected a failed fetch result"),
+        }
+
+        let (reply, receiver) = mpsc::channel();
+        let job = WorkerJob::EditorLoad {
+            path: PathBuf::from("notes.txt"),
+            reply,
+        };
+        assert!(worker_job_panic_recovery(&job)("boom".to_string()).is_none());
+        let message = receiver.recv().expect("editor gets a reply");
+        assert_eq!(message.result, Err("boom".to_string()));
     }
 
     #[test]
