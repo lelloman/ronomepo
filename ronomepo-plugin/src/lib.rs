@@ -1575,8 +1575,10 @@ fn ensure_config(host: &HostApi<'_>) -> Result<RonomepoPluginConfig, MzStatusCod
 }
 
 fn initialize_state(config: &RonomepoPluginConfig) {
-    glib::MainContext::default().invoke(diag::start_main_thread_watchdog);
-    ensure_background_loops_started();
+    // Both install main-loop timeouts, so run them on the main context.
+    let main_context = glib::MainContext::default();
+    main_context.invoke(diag::start_main_thread_watchdog);
+    main_context.invoke(ensure_background_loops_started);
 
     let workspace_root = env::var_os("RONOMEPO_WORKSPACE_ROOT")
         .map(PathBuf::from)
