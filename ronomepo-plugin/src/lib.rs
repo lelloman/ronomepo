@@ -363,6 +363,9 @@ struct AppState {
     history_report_loading: bool,
     line_stats_report: Vec<String>,
     line_stats_loading: bool,
+    /// Line stats were requested again while a run was in flight; that run's
+    /// result is superseded and the report is recomputed when it finishes.
+    line_stats_rerun: bool,
     line_stats_since: String,
     repo_runtime: HashMap<String, RepoRuntimeState>,
     watch_manager_sync_in_flight: bool,
@@ -434,6 +437,7 @@ impl Default for AppState {
             history_report_loading: false,
             line_stats_report: Vec::new(),
             line_stats_loading: false,
+            line_stats_rerun: false,
             line_stats_since: String::new(),
             repo_runtime: HashMap::new(),
             watch_manager_sync_in_flight: false,
@@ -533,7 +537,7 @@ enum JobKey {
     RepoDetails(String),
     WatchManagerSync,
     HistoryReport,
-    LineStats(Option<String>),
+    LineStats,
     CapabilityChecks,
 }
 
@@ -1892,7 +1896,7 @@ fn queue_line_stats_report_from_state() -> Result<(), String> {
     };
 
     match submit_coalesced_job(
-        JobKey::LineStats(since_date.clone()),
+        JobKey::LineStats,
         WorkerJob::LineStats {
             manifest,
             since_date,
@@ -1903,7 +1907,14 @@ fn queue_line_stats_report_from_state() -> Result<(), String> {
             Ok(())
         }
         Ok(false) => {
-            append_log("Line stats refresh is already running.".to_string());
+            state()
+                .lock()
+                .expect("state mutex poisoned")
+                .line_stats_rerun = true;
+            append_log(
+                "Line stats refresh is already running; it will run again when it finishes."
+                    .to_string(),
+            );
             refresh_views();
             Ok(())
         }
@@ -1913,6 +1924,26 @@ fn queue_line_stats_report_from_state() -> Result<(), String> {
             Err(error)
         }
     }
+}
+
+/// Applies a finished line stats run, unless a newer request superseded it.
+/// Returns the message to log and whether to run the report again.
+fn complete_line_stats(
+    app_state: &mut AppState,
+    result: Result<LineStatsResult, String>,
+) -> (String, bool) {
+    let rerun = std::mem::take(&mut app_state.line_stats_rerun);
+    app_state.line_stats_loading = false;
+    let message = match result {
+        Ok(result) => {
+            if !rerun {
+                app_state.line_stats_report = result.lines;
+            }
+            result.message
+        }
+        Err(message) => message,
+    };
+    (message, rerun)
 }
 
 fn append_log(message: String) {
@@ -2508,20 +2539,16 @@ fn handle_worker_result(result: WorkerResult) {
             refresh_views();
         }
         WorkerResult::LineStatsCompleted { result } => {
-            let message = match result {
-                Ok(result) => {
-                    let mut app_state = state().lock().expect("state mutex poisoned");
-                    app_state.line_stats_report = result.lines;
-                    app_state.line_stats_loading = false;
-                    result.message
-                }
-                Err(message) => {
-                    let mut app_state = state().lock().expect("state mutex poisoned");
-                    app_state.line_stats_loading = false;
-                    message
-                }
+            let (message, rerun) = {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                complete_line_stats(&mut app_state, result)
             };
             append_log(message);
+            if rerun {
+                if let Err(message) = queue_line_stats_report_from_state() {
+                    append_log(message);
+                }
+            }
             refresh_views();
         }
         WorkerResult::CapabilityChecksCompleted { result } => {
@@ -13262,6 +13289,34 @@ mod tests {
         write_plugin_config(&path, vec![Box::new(|_: &mut RonomepoPluginConfig| {})]);
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ truncated");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn superseded_line_stats_result_is_dropped_and_rerun() {
+        let mut app_state = AppState::default();
+        app_state.line_stats_loading = true;
+        app_state.line_stats_rerun = true;
+        let (_, rerun) = complete_line_stats(
+            &mut app_state,
+            Ok(LineStatsResult {
+                lines: vec!["old range".to_string()],
+                message: "done".to_string(),
+            }),
+        );
+        assert!(rerun);
+        assert!(app_state.line_stats_report.is_empty());
+        assert!(!app_state.line_stats_rerun);
+
+        let (_, rerun) = complete_line_stats(
+            &mut app_state,
+            Ok(LineStatsResult {
+                lines: vec!["new range".to_string()],
+                message: "done".to_string(),
+            }),
+        );
+        assert!(!rerun);
+        assert_eq!(app_state.line_stats_report, vec!["new range".to_string()]);
+        assert!(!app_state.line_stats_loading);
     }
 
     #[test]
