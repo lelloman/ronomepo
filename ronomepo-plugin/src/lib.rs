@@ -1632,6 +1632,7 @@ fn initialize_state(config: &RonomepoPluginConfig) {
             "Ronomepo initialized for workspace {}",
             workspace_root.display()
         );
+        diag::log(format!("app-log: {message}"));
         push_log_line(&mut app_state, message);
     }
     drop(app_state);
@@ -1794,6 +1795,7 @@ extern "C" fn command_clear_logs(
     _payload: maruzzella_sdk::ffi::MzBytes,
 ) -> maruzzella_sdk::ffi::MzStatus {
     guard_command("command_clear_logs", || {
+        diag::log("app-log: Operations log cleared.");
         {
             let mut app_state = state().lock().expect("state mutex poisoned");
             app_state.logs.clear();
@@ -1894,6 +1896,7 @@ fn queue_line_stats_report_from_state() -> Result<(), String> {
 }
 
 fn append_log(message: String) {
+    diag::log(format!("app-log: {message}"));
     let mut app_state = state().lock().expect("state mutex poisoned");
     push_log_line(&mut app_state, message);
     drop(app_state);
@@ -1901,8 +1904,8 @@ fn append_log(message: String) {
 }
 
 /// Timestamps `message` and collapses consecutive repeats into the last line.
+/// Callers mirror it to the diagnostics log before taking the state lock.
 fn push_log_line(app_state: &mut AppState, message: String) {
-    diag::log(format!("app-log: {message}"));
     let stamp = log_timestamp();
     let repeated = app_state.last_log_message.as_deref() == Some(message.as_str())
         && !app_state.logs.is_empty();

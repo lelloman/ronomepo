@@ -24,6 +24,8 @@ const SLOW_SECTION_MILLIS: u128 = 100;
 struct LogFile {
     path: PathBuf,
     file: Option<File>,
+    /// Current size, tracked so logging a line needs no fstat.
+    len: u64,
 }
 
 static LOG_FILE: OnceLock<Mutex<LogFile>> = OnceLock::new();
@@ -45,18 +47,28 @@ fn log_path() -> PathBuf {
     path
 }
 
-fn open_log(path: &PathBuf) -> Option<File> {
+/// Opens the log for appending and returns it with its current size.
+fn open_log(path: &PathBuf) -> (Option<File>, u64) {
+    // Unit tests must not write into the user's real diagnostics log.
+    if cfg!(test) {
+        return (None, 0);
+    }
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    OpenOptions::new().create(true).append(true).open(path).ok()
+    let file = OpenOptions::new().create(true).append(true).open(path).ok();
+    let len = file
+        .as_ref()
+        .and_then(|file| file.metadata().ok())
+        .map_or(0, |meta| meta.len());
+    (file, len)
 }
 
 fn log_file() -> &'static Mutex<LogFile> {
     LOG_FILE.get_or_init(|| {
         let path = log_path();
-        let file = open_log(&path);
-        Mutex::new(LogFile { path, file })
+        let (file, len) = open_log(&path);
+        Mutex::new(LogFile { path, file, len })
     })
 }
 
@@ -79,18 +91,15 @@ pub fn log(message: impl AsRef<str>) {
     let Ok(mut log) = log_file().lock() else {
         return;
     };
-    let too_big = log
-        .file
-        .as_ref()
-        .and_then(|file| file.metadata().ok())
-        .is_some_and(|meta| meta.len() > MAX_LOG_BYTES);
-    if too_big {
+    if log.file.is_some() && log.len > MAX_LOG_BYTES {
         let rotated = log.path.with_extension("log.1");
         let _ = fs::rename(&log.path, rotated);
-        log.file = open_log(&log.path);
+        (log.file, log.len) = open_log(&log.path);
     }
     if let Some(file) = log.file.as_mut() {
-        let _ = file.write_all(line.as_bytes());
+        if file.write_all(line.as_bytes()).is_ok() {
+            log.len += line.len() as u64;
+        }
     }
 }
 
