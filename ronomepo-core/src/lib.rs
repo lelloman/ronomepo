@@ -920,15 +920,18 @@ pub fn default_repo_manifest_path(repo_root: &Path) -> PathBuf {
 }
 
 pub fn normalize_workspace_root(path: impl AsRef<Path>) -> PathBuf {
-    let path = path.as_ref();
+    normalize_workspace_root_with_home(path.as_ref(), env_home_dir())
+}
+
+fn normalize_workspace_root_with_home(path: &Path, home: Option<PathBuf>) -> PathBuf {
     let text = path.to_string_lossy();
 
     if text == "~" {
-        return env_home_dir().unwrap_or_else(|| path.to_path_buf());
+        return home.unwrap_or_else(|| path.to_path_buf());
     }
 
     if let Some(stripped) = text.strip_prefix("~/") {
-        if let Some(home) = env_home_dir() {
+        if let Some(home) = home {
             return home.join(stripped);
         }
     }
@@ -4122,27 +4125,37 @@ fn git_success<const N: usize>(repo_path: &Path, args: [&str; N]) -> Option<bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
+    /// Test scratch path (file or directory) that is removed when dropped.
+    struct TempPath(PathBuf);
 
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, previous }
+    impl TempPath {
+        fn as_path(&self) -> &Path {
+            &self.0
         }
     }
 
-    impl Drop for EnvVarGuard {
+    impl std::ops::Deref for TempPath {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempPath {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempPath {
         fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
+            if self.0.is_dir() {
+                let _ = fs::remove_dir_all(&self.0);
+            } else {
+                let _ = fs::remove_file(&self.0);
             }
         }
     }
@@ -4818,18 +4831,18 @@ mod tests {
 
     #[test]
     fn normalize_workspace_root_expands_tilde_prefix() {
-        let _home = EnvVarGuard::set("HOME", "/tmp/ronomepo-home");
+        let home = Some(PathBuf::from("/tmp/ronomepo-home"));
 
         assert_eq!(
-            normalize_workspace_root("~"),
+            normalize_workspace_root_with_home(Path::new("~"), home.clone()),
             PathBuf::from("/tmp/ronomepo-home")
         );
         assert_eq!(
-            normalize_workspace_root("~/lelloprojects"),
+            normalize_workspace_root_with_home(Path::new("~/lelloprojects"), home.clone()),
             PathBuf::from("/tmp/ronomepo-home/lelloprojects")
         );
         assert_eq!(
-            normalize_workspace_root("/tmp/already-absolute"),
+            normalize_workspace_root_with_home(Path::new("/tmp/already-absolute"), home),
             PathBuf::from("/tmp/already-absolute")
         );
     }
@@ -4865,7 +4878,7 @@ mod tests {
 
         let manifest = WorkspaceManifest {
             name: "Example".to_string(),
-            root: workspace,
+            root: workspace.to_path_buf(),
             repos: vec![RepositoryEntry {
                 id: "alpha".to_string(),
                 name: "Alpha".to_string(),
@@ -4957,7 +4970,7 @@ mod tests {
 
         let manifest = WorkspaceManifest {
             name: "Example".to_string(),
-            root: workspace,
+            root: workspace.to_path_buf(),
             repos: vec![],
             shared_hooks_path: None,
             commit_check_rules: Some(default_commit_check_rules()),
@@ -4979,7 +4992,7 @@ mod tests {
 
         let manifest = WorkspaceManifest {
             name: "Example".to_string(),
-            root: workspace,
+            root: workspace.to_path_buf(),
             repos: vec![RepositoryEntry {
                 id: "alpha".to_string(),
                 name: "alpha".to_string(),
@@ -5068,7 +5081,7 @@ mod tests {
 
         let manifest = WorkspaceManifest {
             name: "Example".to_string(),
-            root: repo_path,
+            root: repo_path.to_path_buf(),
             repos: vec![],
             shared_hooks_path: None,
             commit_check_rules: Some(vec![
@@ -5118,7 +5131,7 @@ mod tests {
 
         let manifest = WorkspaceManifest {
             name: "Example".to_string(),
-            root: repo_path,
+            root: repo_path.to_path_buf(),
             repos: vec![],
             shared_hooks_path: None,
             commit_check_rules: Some(vec![CommitCheckRule {
@@ -5166,7 +5179,7 @@ mod tests {
 
         let manifest = WorkspaceManifest {
             name: "Example".to_string(),
-            root: workspace,
+            root: workspace.to_path_buf(),
             repos: vec![],
             shared_hooks_path: None,
             commit_check_rules: Some(default_commit_check_rules()),
@@ -5194,7 +5207,7 @@ mod tests {
 
         let manifest = WorkspaceManifest {
             name: "Example".to_string(),
-            root: workspace.clone(),
+            root: workspace.to_path_buf(),
             repos: vec![RepositoryEntry {
                 id: "alpha".to_string(),
                 name: "alpha".to_string(),
@@ -5708,7 +5721,9 @@ backup_required = false
     }
 
     fn run_git<const N: usize>(path: &Path, args: [&str; N]) {
+        // Keep the user's global hooks and signing setup out of test commits.
         let status = Command::new("git")
+            .args(["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"])
             .arg("-C")
             .arg(path)
             .args(args)
@@ -5717,19 +5732,21 @@ backup_required = false
         assert!(status.success());
     }
 
-    fn temp_file_path(prefix: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("ronomepo-{prefix}-{stamp}.json"))
+    fn temp_file_path(prefix: &str) -> TempPath {
+        TempPath(std::env::temp_dir().join(format!("{}.json", unique_temp_name(prefix))))
     }
 
-    fn temp_dir_path(prefix: &str) -> PathBuf {
+    fn temp_dir_path(prefix: &str) -> TempPath {
+        TempPath(std::env::temp_dir().join(unique_temp_name(prefix)))
+    }
+
+    fn unique_temp_name(prefix: &str) -> String {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("ronomepo-{prefix}-{stamp}"))
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("ronomepo-{prefix}-{}-{stamp}-{seq}", std::process::id())
     }
 }
