@@ -2409,28 +2409,23 @@ fn handle_worker_result(result: WorkerResult) {
             repo_name,
             result,
         } => {
-            let mut refresh_path = None;
-            let message = match result {
-                Ok(()) => {
-                    let mut app_state = state().lock().expect("state mutex poisoned");
-                    mark_remote_fetch_completed(&mut app_state, &repo_id, true);
-                    refresh_path = app_state
+            let refresh_item = {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                mark_remote_fetch_completed(&mut app_state, &repo_id, result.is_ok());
+                result.is_ok().then(|| {
+                    app_state
                         .repository_items
                         .iter()
                         .find(|item| item.id == repo_id)
-                        .map(|item| item.status.repo_path.clone());
-                    format!("Remote sync refreshed for {repo_name}.")
-                }
-                Err(error) => {
-                    let mut app_state = state().lock().expect("state mutex poisoned");
-                    mark_remote_fetch_completed(&mut app_state, &repo_id, false);
-                    format!("Remote sync refresh failed for {repo_name}: {error}")
-                }
+                        .cloned()
+                })
             };
-            if refresh_path.is_some() {
-                if let Some(item) = repository_item_from_state(&repo_id) {
-                    request_repository_status_refresh(&item);
-                }
+            let message = match result {
+                Ok(()) => format!("Remote sync refreshed for {repo_name}."),
+                Err(error) => format!("Remote sync refresh failed for {repo_name}: {error}"),
+            };
+            if let Some(item) = refresh_item.flatten() {
+                request_repository_status_refresh(&item);
             }
             append_log(message);
             refresh_views();
@@ -3884,9 +3879,15 @@ fn update_monitor_view_mode(mode: MonitorViewMode) {
 }
 
 fn prefetch_monitor_sort_details() {
-    let snapshot = snapshot();
-    for item in snapshot.repository_items {
-        schedule_repo_details_load(&item.id, &item.status.repo_path);
+    let repos = state()
+        .lock()
+        .expect("state mutex poisoned")
+        .repository_items
+        .iter()
+        .map(|item| (item.id.clone(), item.status.repo_path.clone()))
+        .collect::<Vec<_>>();
+    for (repo_id, repo_path) in repos {
+        schedule_repo_details_load(&repo_id, &repo_path);
     }
 }
 
@@ -4089,40 +4090,30 @@ fn request_repository_status_refresh(item: &RepositoryListItem) {
     }
 }
 
-fn mark_repos_stale(app_state: &mut AppState, repo_ids: &HashSet<String>) -> bool {
-    let mut any_marked = false;
+fn mark_repos_stale(app_state: &mut AppState, repo_ids: &HashSet<String>) {
     for repo_id in repo_ids {
-        // Every repository must be invalidated, even after one needs a rescan.
-        any_marked |= mark_repo_stale(app_state, repo_id);
+        mark_repo_stale(app_state, repo_id);
     }
-    any_marked
 }
 
 fn schedule_pending_local_rescans() {
     let scheduled = {
-        let app_state = state().lock().expect("state mutex poisoned");
-        app_state
-            .repository_items
-            .iter()
-            .filter_map(|item| {
-                let runtime = app_state.repo_runtime.get(&item.id)?;
-                if runtime.local_refresh_in_flight || !runtime.needs_rescan() {
-                    return None;
-                }
-                Some(item.clone())
-            })
-            .collect::<Vec<_>>()
-    };
-
-    if !scheduled.is_empty() {
         let mut app_state = state().lock().expect("state mutex poisoned");
-        for item in &scheduled {
-            if let Some(runtime) = app_state.repo_runtime.get_mut(&item.id) {
-                runtime.local_refresh_in_flight = true;
-                runtime.scheduled_scan_seq = runtime.invalidation_seq;
+        let app_state = &mut *app_state;
+        let mut scheduled = Vec::new();
+        for item in &app_state.repository_items {
+            let Some(runtime) = app_state.repo_runtime.get_mut(&item.id) else {
+                continue;
+            };
+            if runtime.local_refresh_in_flight || !runtime.needs_rescan() {
+                continue;
             }
+            runtime.local_refresh_in_flight = true;
+            runtime.scheduled_scan_seq = runtime.invalidation_seq;
+            scheduled.push(item.clone());
         }
-    }
+        scheduled
+    };
 
     for item in scheduled {
         schedule_repository_status_refresh(&item);
@@ -12843,14 +12834,14 @@ mod tests {
             .map(str::to_string)
             .collect::<HashSet<_>>();
 
-        assert!(mark_repos_stale(&mut app_state, &touched));
+        mark_repos_stale(&mut app_state, &touched);
         for repo_id in &touched {
             assert!(app_state.repo_runtime[repo_id].needs_rescan());
             assert_eq!(app_state.repo_runtime[repo_id].invalidation_seq, 1);
         }
 
         // Further events still invalidate every repo while scans are pending.
-        assert!(!mark_repos_stale(&mut app_state, &touched));
+        mark_repos_stale(&mut app_state, &touched);
         for repo_id in &touched {
             assert_eq!(app_state.repo_runtime[repo_id].invalidation_seq, 2);
         }
