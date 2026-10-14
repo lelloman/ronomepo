@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
@@ -3072,7 +3072,7 @@ fn env_home_dir() -> Option<PathBuf> {
 }
 
 pub fn collect_repository_status(repo_path: &Path) -> RepositoryStatus {
-    if !repo_path.exists() {
+    if !is_git_repository(repo_path) {
         return RepositoryStatus {
             state: RepositoryState::Missing,
             branch: None,
@@ -3108,7 +3108,7 @@ pub fn format_sync_label(sync: &RepositorySync) -> String {
 }
 
 pub fn collect_repository_details(repo_path: &Path) -> RepositoryDetails {
-    if !repo_path.exists() {
+    if !is_git_repository(repo_path) {
         return RepositoryDetails {
             remotes: Vec::new(),
             last_commit: None,
@@ -3452,6 +3452,9 @@ impl OperationTarget {
         if !self.path.exists() {
             return Some(self.failed(format!("{} is missing locally.", self.label)));
         }
+        if !is_git_repository(&self.path) {
+            return Some(self.failed(format!("{} is not a git repository.", self.label)));
+        }
         None
     }
 }
@@ -3467,13 +3470,7 @@ fn pull_target(target: &OperationTarget) -> OperationEvent {
     }
 
     let has_untracked = matches!(state, RepositoryState::Untracked);
-    match Command::new("git")
-        .arg("-C")
-        .arg(&target.path)
-        .arg("pull")
-        .arg("--quiet")
-        .output()
-    {
+    match repo_git(&target.path).arg("pull").arg("--quiet").output() {
         Ok(output) if output.status.success() => {
             let suffix = if has_untracked {
                 " Untracked files were present."
@@ -3512,12 +3509,7 @@ fn push_target(target: &OperationTarget) -> OperationEvent {
         return target.skipped("it has nothing to push");
     }
 
-    match Command::new("git")
-        .arg("-C")
-        .arg(&target.path)
-        .arg("push")
-        .output()
-    {
+    match repo_git(&target.path).arg("push").output() {
         Ok(output) if output.status.success() => target.event(
             OperationEventKind::Success,
             format!("Pushed {} ({} commits).", target.label, ahead),
@@ -3535,6 +3527,9 @@ fn apply_hooks_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> Ope
     let repo_path = manifest.root.join(&repo.dir_name);
     if !repo_path.exists() {
         return failed_event(repo, format!("{} is missing locally.", repo.dir_name));
+    }
+    if !is_git_repository(&repo_path) {
+        return failed_event(repo, format!("{} is not a git repository.", repo.dir_name));
     }
 
     let Some(hooks_path) = resolved_shared_hooks_path(manifest) else {
@@ -3587,9 +3582,7 @@ fn apply_hooks_to_workspace_root(manifest: &WorkspaceManifest) -> OperationEvent
 }
 
 fn configure_hooks_path(repo_path: &Path, hooks_path: &Path) -> io::Result<()> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
+    let status = repo_git(repo_path)
         .arg("config")
         .arg("--local")
         .arg("core.hooksPath")
@@ -4032,12 +4025,33 @@ fn repository_sync(repo_path: &Path) -> RepositorySync {
     }
 }
 
+/// A repository directory only counts when it has its own `.git`; otherwise a
+/// plain directory inside another checkout would resolve to that checkout.
+fn is_git_repository(repo_path: &Path) -> bool {
+    repo_path.join(".git").exists()
+}
+
+/// `git -C <repo_path>` that never discovers a repository above `repo_path`,
+/// so a directory that is not itself a repository fails instead of operating
+/// on an enclosing checkout.
+fn repo_git(repo_path: &Path) -> Command {
+    let mut command = Command::new("git");
+    if let Some(parent) = std::path::absolute(repo_path)
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    {
+        command.env("GIT_CEILING_DIRECTORIES", parent);
+    }
+    command.arg("-C").arg(repo_path);
+    command
+}
+
 /// Status scans must not write: `git status` otherwise takes `.git/index.lock`
 /// and may rewrite the index, which the repository watcher reports as a change
 /// and answers with another scan.
 fn read_only_git(repo_path: &Path) -> Command {
-    let mut command = Command::new("git");
-    command.arg("--no-optional-locks").arg("-C").arg(repo_path);
+    let mut command = repo_git(repo_path);
+    command.arg("--no-optional-locks");
     command
 }
 
@@ -4052,6 +4066,8 @@ fn git_stdout<const N: usize>(repo_path: &Path, args: [&str; N]) -> Option<Strin
 fn git_success<const N: usize>(repo_path: &Path, args: [&str; N]) -> Option<bool> {
     read_only_git(repo_path)
         .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .ok()
         .map(|status| status.success())
@@ -4843,6 +4859,52 @@ mod tests {
         assert_eq!(status.state, RepositoryState::Missing);
         assert_eq!(status.branch, None);
         assert_eq!(status.head_commit, None);
+    }
+
+    #[test]
+    fn plain_directory_inside_a_repository_is_not_treated_as_one() {
+        let workspace = temp_dir_path("plain-dir");
+        init_git_repo(&workspace);
+        let parent_head = git_stdout(&workspace, ["rev-parse", "HEAD"]).unwrap();
+        let plain = workspace.join("alpha");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("notes.txt"), "not a repo").unwrap();
+
+        let status = collect_repository_status(&plain);
+        assert_eq!(status.state, RepositoryState::Missing);
+        assert_eq!(status.head_commit, None);
+        assert!(collect_repository_details(&plain).last_commit.is_none());
+        assert_eq!(git_stdout(&plain, ["rev-parse", "HEAD"]), None);
+
+        let manifest = WorkspaceManifest {
+            name: "Example".to_string(),
+            root: workspace.to_path_buf(),
+            repos: vec![RepositoryEntry {
+                id: "alpha".to_string(),
+                name: "alpha".to_string(),
+                dir_name: "alpha".to_string(),
+                remote_url: "git@example.com:alpha.git".to_string(),
+                enabled: true,
+            }],
+            shared_hooks_path: None,
+            commit_check_rules: Some(Vec::new()),
+        };
+        for kind in [OperationKind::Pull, OperationKind::Push] {
+            let mut events = Vec::new();
+            run_workspace_operation(&manifest, &["alpha".to_string()], kind, |event| {
+                events.push(event);
+            });
+            let repo_event = events
+                .iter()
+                .find(|event| event.repository_id.as_deref() == Some("alpha"))
+                .unwrap();
+            assert_eq!(repo_event.kind, OperationEventKind::Failed);
+            assert!(repo_event.message.contains("not a git repository"));
+        }
+        assert_eq!(
+            git_stdout(&workspace, ["rev-parse", "HEAD"]).as_deref(),
+            Some(parent_head.as_str())
+        );
     }
 
     #[test]
