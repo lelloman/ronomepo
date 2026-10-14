@@ -681,12 +681,6 @@ struct RepositoryViewHandle {
     placeholder_for_manifest: Cell<Option<bool>>,
 }
 
-#[derive(Default)]
-struct ContainerViewHandle {
-    root: glib::WeakRef<GtkBox>,
-    host_ptr: usize,
-}
-
 /// A Fucina Policy view. The policy part is rebuilt only when repos.toml
 /// changes; the action status label lives outside it so running actions keep
 /// reporting into a live label.
@@ -703,6 +697,29 @@ struct FucinaPolicyViewHandle {
 struct FucinaPolicySource {
     policy_root: PathBuf,
     modified: Option<SystemTime>,
+}
+
+/// A Monorepo Overview view. Its chrome and the report controls (including
+/// the line-stats date entry) are built once; refreshes re-render only the
+/// slots, and only while the view is on screen.
+struct MonorepoOverview {
+    root: glib::WeakRef<GtkBox>,
+    top: GtkBox,
+    selection_slot: GtkBox,
+    files_slot: GtkBox,
+    sections: GtkBox,
+    reports: MonorepoReportControls,
+    host_ptr: usize,
+    /// Set when a refresh was skipped because the view was not mapped.
+    stale: Cell<bool>,
+}
+
+struct MonorepoReportControls {
+    row: GtkBox,
+    check_history: Button,
+    since_entry: Entry,
+    line_stats: Button,
+    all_time: Button,
 }
 
 struct CommitCheckViewHandle {
@@ -777,7 +794,7 @@ struct OperationFollowHandle {
 
 thread_local! {
     static REPOSITORY_VIEWS: RefCell<Vec<RepositoryViewHandle>> = const { RefCell::new(Vec::new()) };
-    static MONOREPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
+    static MONOREPO_OVERVIEWS: RefCell<Vec<Rc<MonorepoOverview>>> = const { RefCell::new(Vec::new()) };
     static REPO_OVERVIEWS: RefCell<Vec<RepoOverviewViewHandle>> = const { RefCell::new(Vec::new()) };
     static COMMIT_CHECK_VIEWS: RefCell<Vec<CommitCheckViewHandle>> = const { RefCell::new(Vec::new()) };
     static FUCINA_POLICY_VIEWS: RefCell<Vec<FucinaPolicyViewHandle>> = const { RefCell::new(Vec::new()) };
@@ -2292,12 +2309,16 @@ fn refresh_repository_views(snapshot: &StateSnapshot) {
 fn refresh_overview_views(snapshot: &StateSnapshot) {
     MONOREPO_OVERVIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|handle| match handle.root.upgrade() {
-            Some(root) => {
-                render_monorepo_overview_into(&root, &snapshot, handle.host_ptr as *const _);
-                true
+        views.retain(|view| {
+            let Some(root) = view.root.upgrade() else {
+                return false;
+            };
+            if root.is_mapped() {
+                render_monorepo_overview(view, snapshot);
+            } else {
+                view.stale.set(true);
             }
-            None => false,
+            true
         });
     });
 
@@ -6813,16 +6834,51 @@ extern "C" fn create_monorepo_overview_view(
     scroller.set_valign(Align::Fill);
     scroller.set_propagate_natural_height(false);
 
-    let snapshot = snapshot();
-    render_monorepo_overview_into(&root, &snapshot, host);
-
     let root_ref = glib::WeakRef::new();
     root_ref.set(Some(&root));
+    let view = Rc::new(MonorepoOverview {
+        root: root_ref,
+        top: GtkBox::new(Orientation::Vertical, 18),
+        selection_slot: GtkBox::new(Orientation::Vertical, 0),
+        files_slot: GtkBox::new(Orientation::Vertical, 0),
+        sections: GtkBox::new(Orientation::Vertical, 12),
+        reports: monorepo_report_controls(),
+        host_ptr: host as usize,
+        stale: Cell::new(false),
+    });
+
+    let command_area = GtkBox::new(Orientation::Vertical, 8);
+    command_area.append(&overview_command_group(
+        "Workspace",
+        overview_actions(false),
+    ));
+    command_area.append(&overview_command_group(
+        "Selection",
+        view.selection_slot.clone(),
+    ));
+    command_area.append(&overview_command_group("Reports", view.reports.row.clone()));
+    command_area.append(&overview_command_group("Files", view.files_slot.clone()));
+    root.append(&view.top);
+    root.append(&command_area);
+    root.append(&view.sections);
+
+    render_monorepo_overview(&view, &snapshot());
+    // Refreshes skip the view while it is hidden; catch up when it shows.
+    root.connect_map({
+        let view = Rc::downgrade(&view);
+        move |_| {
+            let view = view.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(view) = view.upgrade() {
+                    if view.stale.get() {
+                        render_monorepo_overview(&view, &snapshot());
+                    }
+                }
+            });
+        }
+    });
     MONOREPO_OVERVIEWS.with(|views| {
-        views.borrow_mut().push(ContainerViewHandle {
-            root: root_ref,
-            host_ptr: host as usize,
-        });
+        views.borrow_mut().push(view);
     });
 
     unsafe {
@@ -6875,12 +6931,17 @@ extern "C" fn create_commit_check_view(
     }
 }
 
-fn render_monorepo_overview_into(
-    root: &GtkBox,
-    snapshot: &StateSnapshot,
-    host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-) {
-    clear_box(root);
+fn render_monorepo_overview(view: &MonorepoOverview, snapshot: &StateSnapshot) {
+    view.stale.set(false);
+    let host_ptr = view.host_ptr as *const maruzzella_sdk::ffi::MzHostApi;
+    for slot in [
+        &view.top,
+        &view.selection_slot,
+        &view.files_slot,
+        &view.sections,
+    ] {
+        clear_box(slot);
+    }
 
     let summary = workspace_summary(
         snapshot.manifest.as_ref(),
@@ -6966,17 +7027,13 @@ fn render_monorepo_overview_into(
         stats.append(&stat_card(label, &value.to_string()));
     }
 
-    let actions = overview_actions(false);
-    let selection_actions = monorepo_selection_actions(snapshot, host_ptr, &items);
-    let report_actions = monorepo_report_actions(snapshot);
-    let file_actions = overview_file_actions(snapshot, host_ptr);
-    let command_area = GtkBox::new(Orientation::Vertical, 8);
-    command_area.append(&overview_command_group("Workspace", actions));
-    command_area.append(&overview_command_group("Selection", selection_actions));
-    command_area.append(&overview_command_group("Reports", report_actions));
-    command_area.append(&overview_command_group("Files", file_actions));
+    view.selection_slot
+        .append(&monorepo_selection_actions(snapshot, host_ptr, &items));
+    update_monorepo_report_controls(&view.reports, snapshot);
+    view.files_slot
+        .append(&overview_file_actions(snapshot, host_ptr));
 
-    let sections = GtkBox::new(Orientation::Vertical, 12);
+    let sections = &view.sections;
     let selection_scope = if selected.is_empty() {
         "No repos selected. Toolbar and overview actions apply to the whole workspace.".to_string()
     } else {
@@ -7049,12 +7106,10 @@ fn render_monorepo_overview_into(
         },
         "Run Line Stats to inspect additions and deletions across the workspace.",
     );
-    append_log_section(&sections, "Recent Operations", &snapshot.logs, 8);
+    append_log_section(sections, "Recent Operations", &snapshot.logs, 8);
 
-    root.append(&hero);
-    root.append(&stats);
-    root.append(&command_area);
-    root.append(&sections);
+    view.top.append(&hero);
+    view.top.append(&stats);
 }
 
 fn build_commit_check_view(root: &GtkBox, initial: &StateSnapshot) -> Rc<CommitCheckEditor> {
@@ -9698,15 +9753,21 @@ fn clear_selection_button(selected_count: usize) -> Button {
 
 fn report_button(
     label: &str,
-    loading: bool,
     handler: extern "C" fn(maruzzella_sdk::ffi::MzBytes) -> maruzzella_sdk::ffi::MzStatus,
 ) -> Button {
-    let button = clickable_button_with_label(if loading { "Running..." } else { label });
-    button.set_sensitive(!loading);
+    let button = clickable_button_with_label(label);
     button.connect_clicked(move |_| {
         let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
     });
     button
+}
+
+fn set_report_button_loading(button: &Button, label: &str, loading: bool) {
+    let text = if loading { "Running..." } else { label };
+    if button.label().as_deref() != Some(text) {
+        button.set_label(text);
+    }
+    button.set_sensitive(!loading);
 }
 
 fn repo_target_button(item: &RepositoryListItem) -> Button {
@@ -9993,14 +10054,11 @@ fn monorepo_selection_actions(
     actions
 }
 
-fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
+fn monorepo_report_controls() -> MonorepoReportControls {
     let actions = GtkBox::new(Orientation::Horizontal, 8);
 
-    actions.append(&report_button(
-        "Check History",
-        snapshot.history_report_loading,
-        command_check_history,
-    ));
+    let check_history = report_button("Check History", command_check_history);
+    actions.append(&check_history);
 
     let open_commit_check = clickable_button_with_label("Open Commit Check");
     open_commit_check.connect_clicked(|_| {
@@ -10010,7 +10068,6 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
 
     let since_entry = Entry::new();
     since_entry.set_placeholder_text(Some("Since date YYYY-MM-DD"));
-    since_entry.set_text(&snapshot.line_stats_since);
     since_entry.set_hexpand(true);
     since_entry.connect_changed(|entry| {
         update_line_stats_since(entry.text().to_string());
@@ -10020,11 +10077,8 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
     });
     actions.append(&since_entry);
 
-    actions.append(&report_button(
-        "Line Stats",
-        snapshot.line_stats_loading,
-        command_line_stats,
-    ));
+    let line_stats = report_button("Line Stats", command_line_stats);
+    actions.append(&line_stats);
 
     let capability_checks = clickable_button_with_label("Capability Checks");
     capability_checks.connect_clicked(|_| {
@@ -10045,14 +10099,42 @@ fn monorepo_report_actions(snapshot: &StateSnapshot) -> GtkBox {
     actions.append(&due_capability_checks);
 
     let all_time = clickable_button_with_label("All Time");
-    all_time.set_sensitive(!snapshot.line_stats_loading);
     all_time.connect_clicked(|_| {
         update_line_stats_since(String::new());
         let _ = command_line_stats(maruzzella_sdk::ffi::MzBytes::empty());
     });
     actions.append(&all_time);
 
-    actions
+    MonorepoReportControls {
+        row: actions,
+        check_history,
+        since_entry,
+        line_stats,
+        all_time,
+    }
+}
+
+/// Updates the persistent report controls in place, so typing in the date
+/// entry survives refreshes.
+fn update_monorepo_report_controls(controls: &MonorepoReportControls, snapshot: &StateSnapshot) {
+    set_report_button_loading(
+        &controls.check_history,
+        "Check History",
+        snapshot.history_report_loading,
+    );
+    set_report_button_loading(
+        &controls.line_stats,
+        "Line Stats",
+        snapshot.line_stats_loading,
+    );
+    controls
+        .all_time
+        .set_sensitive(!snapshot.line_stats_loading);
+    // The entry writes every edit to the state, so they only differ when the
+    // date was changed elsewhere (e.g. by All Time).
+    if controls.since_entry.text().as_str() != snapshot.line_stats_since {
+        controls.since_entry.set_text(&snapshot.line_stats_since);
+    }
 }
 
 fn collect_repo_ids<F>(items: &[RepositoryListItem], predicate: F) -> Vec<String>
