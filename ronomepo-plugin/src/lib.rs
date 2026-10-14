@@ -697,6 +697,21 @@ struct ContainerViewHandle {
     host_ptr: usize,
 }
 
+struct CommitCheckViewHandle {
+    root: glib::WeakRef<GtkBox>,
+    editor: Rc<CommitCheckEditor>,
+}
+
+/// The rule editor of a Commit Check view. It is built once; refreshes only
+/// touch the rows when the manifest's rules change, and never discard edits.
+struct CommitCheckEditor {
+    rules_box: GtkBox,
+    rule_rows: Rc<RefCell<Vec<CommitCheckRuleRowHandle>>>,
+    status: Label,
+    /// Manifest rules the rows were last synced with.
+    baseline: RefCell<Vec<CommitCheckRule>>,
+}
+
 #[derive(Default)]
 struct RepoOverviewViewHandle {
     summary_root: glib::WeakRef<GtkBox>,
@@ -719,7 +734,7 @@ thread_local! {
     static REPOSITORY_VIEWS: RefCell<Vec<RepositoryViewHandle>> = const { RefCell::new(Vec::new()) };
     static MONOREPO_OVERVIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static REPO_OVERVIEWS: RefCell<Vec<RepoOverviewViewHandle>> = const { RefCell::new(Vec::new()) };
-    static COMMIT_CHECK_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
+    static COMMIT_CHECK_VIEWS: RefCell<Vec<CommitCheckViewHandle>> = const { RefCell::new(Vec::new()) };
     static FUCINA_POLICY_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_BUFFERS: RefCell<Vec<glib::WeakRef<TextBuffer>>> = const { RefCell::new(Vec::new()) };
     static OPERATION_SUMMARIES: RefCell<Vec<glib::WeakRef<Label>>> = const { RefCell::new(Vec::new()) };
@@ -2247,16 +2262,7 @@ fn refresh_overview_views(snapshot: &StateSnapshot) {
         });
     });
 
-    COMMIT_CHECK_VIEWS.with(|views| {
-        let mut views = views.borrow_mut();
-        views.retain(|handle| match handle.root.upgrade() {
-            Some(root) => {
-                render_commit_check_into(&root, &snapshot);
-                true
-            }
-            None => false,
-        });
-    });
+    sync_commit_check_views(snapshot);
 
     REPO_OVERVIEWS.with(|views| {
         let mut views = views.borrow_mut();
@@ -2292,15 +2298,18 @@ fn refresh_overview_views(snapshot: &StateSnapshot) {
 }
 
 fn refresh_commit_check_views_now() {
-    let snapshot = snapshot();
+    sync_commit_check_views(&snapshot());
+}
+
+fn sync_commit_check_views(snapshot: &StateSnapshot) {
     COMMIT_CHECK_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|handle| match handle.root.upgrade() {
-            Some(root) => {
-                render_commit_check_into(&root, &snapshot);
-                true
+        views.retain(|handle| {
+            if handle.root.upgrade().is_none() {
+                return false;
             }
-            None => false,
+            sync_commit_check_editor(&handle.editor, snapshot, false);
+            true
         });
     });
 }
@@ -6673,15 +6682,14 @@ extern "C" fn create_commit_check_view(
     scroller.set_valign(Align::Fill);
     scroller.set_propagate_natural_height(false);
 
-    let snapshot = snapshot();
-    render_commit_check_into(&root, &snapshot);
+    let editor = build_commit_check_view(&root, &snapshot());
 
     let root_ref = glib::WeakRef::new();
     root_ref.set(Some(&root));
     COMMIT_CHECK_VIEWS.with(|views| {
-        views.borrow_mut().push(ContainerViewHandle {
+        views.borrow_mut().push(CommitCheckViewHandle {
             root: root_ref,
-            host_ptr: host as usize,
+            editor,
         });
     });
 
@@ -6873,9 +6881,7 @@ fn render_monorepo_overview_into(
     root.append(&sections);
 }
 
-fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
-    clear_box(root);
-
+fn build_commit_check_view(root: &GtkBox, initial: &StateSnapshot) -> Rc<CommitCheckEditor> {
     let hero = GtkBox::new(Orientation::Vertical, 4);
     let title = Label::new(Some("Commit Check"));
     title.set_xalign(0.0);
@@ -6913,81 +6919,63 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
     rules_help.set_wrap(true);
     rules_help.add_css_class("muted");
 
-    let rules_box = GtkBox::new(Orientation::Vertical, 8);
-    let rule_rows = Rc::new(RefCell::new(Vec::<CommitCheckRuleRowHandle>::new()));
-    let manifest_rules = snapshot
-        .manifest
-        .as_ref()
-        .and_then(|manifest| manifest.commit_check_rules.clone())
-        .unwrap_or_default();
-    for rule in &manifest_rules {
-        append_commit_check_rule_row(&rules_box, &rule_rows, Some(rule));
-    }
-
-    let rule_status_text = snapshot
-        .manifest_path
-        .as_ref()
-        .map(|path| {
-            format!(
-                "Loaded {} commit check rules from {}. Use Save Rules to persist edits.",
-                manifest_rules.len(),
-                path.display()
-            )
-        })
-        .unwrap_or_else(|| {
-            format!(
-                "Loaded {} commit check rules. No workspace manifest is loaded.",
-                manifest_rules.len()
-            )
-        });
-    let rule_status = Label::new(Some(&rule_status_text));
+    let rule_status = Label::new(None);
     rule_status.set_xalign(0.0);
     rule_status.set_wrap(true);
     rule_status.add_css_class("muted");
 
+    let editor = Rc::new(CommitCheckEditor {
+        rules_box: GtkBox::new(Orientation::Vertical, 8),
+        rule_rows: Rc::new(RefCell::new(Vec::new())),
+        status: rule_status,
+        baseline: RefCell::new(Vec::new()),
+    });
+    sync_commit_check_editor(&editor, initial, true);
+
     let rule_actions = GtkBox::new(Orientation::Horizontal, 8);
     let add_rule = clickable_button_with_label("Add Rule");
     add_rule.connect_clicked({
-        let rules_box = rules_box.clone();
-        let rule_rows = rule_rows.clone();
-        let rule_status = rule_status.clone();
+        let editor = Rc::clone(&editor);
         move |_| {
-            open_add_commit_check_rule_dialog(
-                active_window(),
-                rules_box.clone(),
-                rule_rows.clone(),
-                rule_status.clone(),
-            );
+            open_add_commit_check_rule_dialog(active_window(), Rc::clone(&editor));
         }
     });
     let save_rules = clickable_button_with_label("Save Rules");
     save_rules.connect_clicked({
-        let rule_rows = rule_rows.clone();
-        let rule_status = rule_status.clone();
-        move |_| match build_commit_check_rules_from_rows(&rule_rows.borrow()) {
-            Ok(rules) => {
-                rule_status.set_text("Saving commit check rules...");
-                match save_commit_check_rules(rules) {
-                    Ok(message) => {
-                        rule_status.set_text(&message);
-                        append_log(message);
-                        refresh_views();
-                    }
-                    Err(message) => {
-                        rule_status.set_text(&message);
-                        append_log(message);
-                        refresh_views();
+        let editor = Rc::clone(&editor);
+        move |_| {
+            let rules = build_commit_check_rules_from_rows(&editor.rule_rows.borrow());
+            match rules {
+                Ok(rules) => {
+                    editor.status.set_text("Saving commit check rules...");
+                    match save_commit_check_rules(rules.clone()) {
+                        Ok(message) => {
+                            // The rows are what was saved, so the next refresh
+                            // has nothing to sync.
+                            *editor.baseline.borrow_mut() = rules;
+                            editor.status.set_text(&message);
+                            append_log(message);
+                            refresh_views();
+                        }
+                        Err(message) => {
+                            editor.status.set_text(&message);
+                            append_log(message);
+                            refresh_views();
+                        }
                     }
                 }
-            }
-            Err(message) => {
-                rule_status.set_text(&message);
+                Err(message) => {
+                    editor.status.set_text(&message);
+                }
             }
         }
     });
     let discard_changes = clickable_button_with_label("Discard Changes");
-    discard_changes.connect_clicked(|_| {
-        refresh_views();
+    discard_changes.connect_clicked({
+        let editor = Rc::clone(&editor);
+        move |_| {
+            sync_commit_check_editor(&editor, &snapshot(), true);
+        }
     });
     for button in [add_rule, save_rules, discard_changes] {
         rule_actions.append(&button);
@@ -6998,8 +6986,92 @@ fn render_commit_check_into(root: &GtkBox, snapshot: &StateSnapshot) {
     root.append(&rules_header);
     root.append(&rules_help);
     root.append(&rule_actions);
-    root.append(&rule_status);
-    root.append(&rules_box);
+    root.append(&editor.status);
+    root.append(&editor.rules_box);
+    editor
+}
+
+/// Brings the editor rows in line with the manifest's rules. Rows are rebuilt
+/// only when the rules changed (or `force`), and only while the rows hold no
+/// unsaved edits; otherwise just the newly added rules are appended.
+fn sync_commit_check_editor(editor: &CommitCheckEditor, snapshot: &StateSnapshot, force: bool) {
+    let manifest_rules = snapshot
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.commit_check_rules.clone())
+        .unwrap_or_default();
+    if !force && *editor.baseline.borrow() == manifest_rules {
+        return;
+    }
+
+    let row_rules = build_commit_check_rules_from_rows(&editor.rule_rows.borrow());
+    if !force && commit_check_rows_dirty(&row_rules, &editor.baseline.borrow()) {
+        let row_ids = editor
+            .rule_rows
+            .borrow()
+            .iter()
+            .map(|row| row.rule_id.clone())
+            .collect::<Vec<_>>();
+        let added = commit_check_rules_added(&editor.baseline.borrow(), &row_ids, &manifest_rules);
+        for rule in &added {
+            append_commit_check_rule_row(&editor.rules_box, &editor.rule_rows, Some(rule));
+        }
+        if !added.is_empty() {
+            editor.status.set_text(&format!(
+                "Added {} rule(s) saved elsewhere. Your unsaved edits were kept.",
+                added.len()
+            ));
+        }
+    } else {
+        clear_box(&editor.rules_box);
+        editor.rule_rows.borrow_mut().clear();
+        for rule in &manifest_rules {
+            append_commit_check_rule_row(&editor.rules_box, &editor.rule_rows, Some(rule));
+        }
+        editor.status.set_text(&commit_check_rule_status_text(
+            snapshot,
+            manifest_rules.len(),
+        ));
+    }
+    *editor.baseline.borrow_mut() = manifest_rules;
+}
+
+fn commit_check_rule_status_text(snapshot: &StateSnapshot, rule_count: usize) -> String {
+    snapshot
+        .manifest_path
+        .as_ref()
+        .map(|path| {
+            format!(
+                "Loaded {rule_count} commit check rules from {}. Use Save Rules to persist edits.",
+                path.display()
+            )
+        })
+        .unwrap_or_else(|| {
+            format!("Loaded {rule_count} commit check rules. No workspace manifest is loaded.")
+        })
+}
+
+/// Whether the editor rows differ from the rules they were loaded from. Rows
+/// that do not even form valid rules are being edited.
+fn commit_check_rows_dirty(
+    row_rules: &Result<Vec<CommitCheckRule>, String>,
+    baseline: &[CommitCheckRule],
+) -> bool {
+    !matches!(row_rules, Ok(rules) if rules == baseline)
+}
+
+/// Manifest rules that are neither in `baseline` nor already shown as a row.
+fn commit_check_rules_added(
+    baseline: &[CommitCheckRule],
+    row_ids: &[String],
+    manifest_rules: &[CommitCheckRule],
+) -> Vec<CommitCheckRule> {
+    manifest_rules
+        .iter()
+        .filter(|rule| !baseline.iter().any(|known| known.id == rule.id))
+        .filter(|rule| !row_ids.iter().any(|id| *id == rule.id))
+        .cloned()
+        .collect()
 }
 
 fn append_commit_check_rule_row(
@@ -7102,12 +7174,7 @@ fn append_commit_check_rule_row(
     });
 }
 
-fn open_add_commit_check_rule_dialog(
-    parent: Option<Window>,
-    rules_box: GtkBox,
-    rule_rows: Rc<RefCell<Vec<CommitCheckRuleRowHandle>>>,
-    status: Label,
-) {
+fn open_add_commit_check_rule_dialog(parent: Option<Window>, editor: Rc<CommitCheckEditor>) {
     let dialog = Dialog::builder()
         .modal(true)
         .title("Add Commit Check Rule")
@@ -7251,28 +7318,25 @@ fn open_add_commit_check_rule_dialog(
                 },
             };
 
-            let mut rules = match build_commit_check_rules_from_rows(&rule_rows.borrow()) {
-                Ok(rules) => rules,
-                Err(message) => {
-                    error.set_text(&message);
-                    return;
-                }
-            };
+            // Persist only the new rule on top of the saved rules; unsaved
+            // edits in the editor rows stay unsaved.
+            let mut rules = current_commit_check_rules();
             rules.push(rule.clone());
 
-            status.set_text("Saving commit check rule...");
+            editor.status.set_text("Saving commit check rule...");
             match save_commit_check_rules(rules) {
                 Ok(message) => {
-                    append_commit_check_rule_row(&rules_box, &rule_rows, Some(&rule));
-                    status.set_text(&format!("Saved rule \"{}\". {}", rule.name, message));
-                    append_log(message);
                     dialog.close();
                     refresh_commit_check_views_now();
+                    editor
+                        .status
+                        .set_text(&format!("Saved rule \"{}\". {}", rule.name, message));
+                    append_log(message);
                     refresh_log_surfaces();
                 }
                 Err(message) => {
                     error.set_text(&message);
-                    status.set_text(&message);
+                    editor.status.set_text(&message);
                     append_log(message);
                     refresh_log_surfaces();
                 }
@@ -7359,11 +7423,24 @@ fn build_commit_check_rules_from_rows(
 }
 
 fn new_commit_check_rule_id() -> String {
+    // Rows created in the same millisecond (e.g. several Add Rule clicks)
+    // would otherwise share an id and be removed together.
+    static RULE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
     let millis = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
-    format!("rule-{millis}")
+    let sequence = RULE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("rule-{millis}-{sequence}")
+}
+
+fn current_commit_check_rules() -> Vec<CommitCheckRule> {
+    let app_state = state().lock().expect("state mutex poisoned");
+    app_state
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.commit_check_rules.clone())
+        .unwrap_or_default()
 }
 
 fn save_commit_check_rules(rules: Vec<CommitCheckRule>) -> Result<String, String> {
@@ -12469,6 +12546,37 @@ mod tests {
         assert_eq!(sorted_names(&query), vec!["Alpha", "beta", "(monorepo)"]);
         query.descending = true;
         assert_eq!(sorted_names(&query), vec!["beta", "Alpha", "(monorepo)"]);
+    }
+
+    #[test]
+    fn commit_check_rule_ids_are_unique_within_a_millisecond() {
+        let ids = (0..64)
+            .map(|_| new_commit_check_rule_id())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 64);
+    }
+
+    #[test]
+    fn commit_check_editor_dirty_tracking_and_added_rules() {
+        let rules = default_commit_check_rules();
+        assert!(rules.len() >= 2);
+        let baseline = rules[..1].to_vec();
+
+        assert!(!commit_check_rows_dirty(&Ok(baseline.clone()), &baseline));
+        assert!(commit_check_rows_dirty(&Ok(Vec::new()), &baseline));
+        assert!(commit_check_rows_dirty(
+            &Err("Rule 1 needs a name.".to_string()),
+            &baseline
+        ));
+        let mut edited = baseline.clone();
+        edited[0].priority += 1;
+        assert!(commit_check_rows_dirty(&Ok(edited), &baseline));
+
+        let added = commit_check_rules_added(&baseline, &[], &rules);
+        assert_eq!(added, rules[1..].to_vec());
+        let shown = vec![rules[1].id.clone()];
+        let added = commit_check_rules_added(&baseline, &shown, &rules);
+        assert_eq!(added, rules[2..].to_vec());
     }
 
     #[test]
