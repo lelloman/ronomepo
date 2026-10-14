@@ -59,9 +59,9 @@ use ronomepo_core::{
     CapabilityRegistry, CapabilityResult, CapabilityResultStatus, CapabilityState, CommitCheckRule,
     CommitCheckRuleEffect, CommitCheckRuleMatcher, CommitCheckRuleScope, FucinaPolicyAction,
     FucinaPolicyCommandResult, FucinaRepositoryPolicy, OperationEvent, OperationEventKind,
-    OperationKind, PlannedCommand, RepoActionExecutor, RepoManifest, RepoManifestScan,
-    RepoManifestScanState, RepositoryDetails, RepositoryListItem, RepositoryStatus,
-    StandardActionName, WorkspaceManifest, MANIFEST_FILE_NAME,
+    OperationKind, PlannedCommand, RepoActionExecutor, RepoCapabilityDeclaration, RepoManifest,
+    RepoManifestScan, RepoManifestScanState, RepositoryDetails, RepositoryListItem,
+    RepositoryStatus, StandardActionName, WorkspaceManifest, MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -5380,13 +5380,6 @@ fn selected_repo_manifest_targets(
         .collect()
 }
 
-fn repo_capability_targets_from_items(items: Vec<RepositoryListItem>) -> Vec<CapabilityRunTarget> {
-    items
-        .into_iter()
-        .filter_map(|item| repo_capability_target_from_item(item, None))
-        .collect()
-}
-
 fn repo_capability_target_from_item(
     item: RepositoryListItem,
     capability_ids: Option<Vec<String>>,
@@ -5409,51 +5402,72 @@ fn repo_capability_target_from_item(
     })
 }
 
-fn capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'static str) {
+/// Capability run targets for the selected repos, or the whole workspace when
+/// none is selected, together with that scope's name. `include` picks the
+/// implemented capabilities to run; `None` runs all of them.
+fn capability_check_targets_from_state(
+    include: Option<
+        &dyn Fn(&StateSnapshot, &RepositoryListItem, &RepoCapabilityDeclaration) -> bool,
+    >,
+) -> (Vec<CapabilityRunTarget>, &'static str) {
     let snapshot = snapshot();
     let items = repository_items(&snapshot);
     let selected = selected_repository_items(&snapshot, &items);
-    if selected.is_empty() {
-        (repo_capability_targets_from_items(items), "workspace")
+    let (source_items, scope) = if selected.is_empty() {
+        (items, "workspace")
     } else {
-        (repo_capability_targets_from_items(selected), "selected")
-    }
-}
-
-fn stale_capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'static str) {
-    let snapshot = snapshot();
-    let items = repository_items(&snapshot);
-    let selected = selected_repository_items(&snapshot, &items);
-    let scope = if selected.is_empty() {
-        "workspace"
-    } else {
-        "selected"
+        (selected, "selected")
     };
-    let source_items = if selected.is_empty() { items } else { selected };
     let targets = source_items
         .into_iter()
         .filter_map(|item| {
+            let Some(include) = include else {
+                return repo_capability_target_from_item(item, None);
+            };
             let manifest = Arc::clone(scanned_repo_manifest(&item)?);
-            let dirty_now = matches!(
-                item.status.state,
-                ronomepo_core::RepositoryState::Dirty | ronomepo_core::RepositoryState::Untracked
-            );
-            let capability_ids = manifest
-                .capabilities
-                .iter()
-                .filter(|capability| {
-                    capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
-                })
-                .filter(|capability| {
-                    capability_registry_state(&snapshot, &item.id, &capability.id)
-                        .is_none_or(|state| capability_state_is_stale(&item, state, dirty_now))
-                })
+            let capability_ids = implemented_capabilities(&manifest)
+                .filter(|capability| include(&snapshot, &item, capability))
                 .map(|capability| capability.id.clone())
                 .collect::<Vec<_>>();
             repo_capability_target_from_item(item, Some(capability_ids))
         })
         .collect();
     (targets, scope)
+}
+
+fn implemented_capabilities(
+    manifest: &RepoManifest,
+) -> impl Iterator<Item = &RepoCapabilityDeclaration> {
+    manifest.capabilities.iter().filter(|capability| {
+        capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
+    })
+}
+
+/// Whether the capability has no recorded result or its result is stale.
+fn capability_needs_rerun(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+    capability: &RepoCapabilityDeclaration,
+) -> bool {
+    let dirty_now = matches!(
+        item.status.state,
+        ronomepo_core::RepositoryState::Dirty | ronomepo_core::RepositoryState::Untracked
+    );
+    capability_registry_state(snapshot, &item.id, &capability.id)
+        .is_none_or(|state| capability_state_is_stale(item, state, dirty_now))
+}
+
+fn capability_is_due(
+    snapshot: &StateSnapshot,
+    item: &RepositoryListItem,
+    capability: &RepoCapabilityDeclaration,
+    now_epoch_secs: u64,
+) -> bool {
+    let state = capability_registry_state(snapshot, &item.id, &capability.id);
+    capability_due_reason(item, capability, state, now_epoch_secs)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn repo_due_capability_count(
@@ -5464,57 +5478,9 @@ fn repo_due_capability_count(
     let Some(manifest) = scanned_repo_manifest(item) else {
         return 0;
     };
-
-    manifest
-        .capabilities
-        .iter()
-        .filter(|capability| {
-            capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
-        })
-        .filter(|capability| {
-            let state = capability_registry_state(snapshot, &item.id, &capability.id);
-            capability_due_reason(item, capability, state, now_epoch_secs)
-                .ok()
-                .flatten()
-                .is_some()
-        })
+    implemented_capabilities(manifest)
+        .filter(|capability| capability_is_due(snapshot, item, capability, now_epoch_secs))
         .count()
-}
-
-fn due_capability_check_targets_from_state() -> (Vec<CapabilityRunTarget>, &'static str) {
-    let snapshot = snapshot();
-    let items = repository_items(&snapshot);
-    let selected = selected_repository_items(&snapshot, &items);
-    let scope = if selected.is_empty() {
-        "workspace"
-    } else {
-        "selected"
-    };
-    let source_items = if selected.is_empty() { items } else { selected };
-    let now = current_epoch_secs();
-    let targets = source_items
-        .into_iter()
-        .filter_map(|item| {
-            let manifest = Arc::clone(scanned_repo_manifest(&item)?);
-            let capability_ids = manifest
-                .capabilities
-                .iter()
-                .filter(|capability| {
-                    capability.status == ronomepo_core::CapabilityDeclarationStatus::Implemented
-                })
-                .filter(|capability| {
-                    let state = capability_registry_state(&snapshot, &item.id, &capability.id);
-                    capability_due_reason(&item, capability, state, now)
-                        .ok()
-                        .flatten()
-                        .is_some()
-                })
-                .map(|capability| capability.id.clone())
-                .collect::<Vec<_>>();
-            repo_capability_target_from_item(item, Some(capability_ids))
-        })
-        .collect();
-    (targets, scope)
 }
 
 fn submit_capability_check_targets(targets: Vec<CapabilityRunTarget>, scope: &str, mode: &str) {
@@ -5547,17 +5513,21 @@ fn submit_capability_check_targets(targets: Vec<CapabilityRunTarget>, scope: &st
 }
 
 fn run_selected_repo_capability_checks() {
-    let (targets, scope) = capability_check_targets_from_state();
+    let (targets, scope) = capability_check_targets_from_state(None);
     submit_capability_check_targets(targets, scope, "all");
 }
 
 fn run_stale_repo_capability_checks() {
-    let (targets, scope) = stale_capability_check_targets_from_state();
+    let (targets, scope) = capability_check_targets_from_state(Some(&capability_needs_rerun));
     submit_capability_check_targets(targets, scope, "stale");
 }
 
 fn run_due_repo_capability_checks() {
-    let (targets, scope) = due_capability_check_targets_from_state();
+    let now = current_epoch_secs();
+    let (targets, scope) =
+        capability_check_targets_from_state(Some(&|snapshot, item, capability| {
+            capability_is_due(snapshot, item, capability, now)
+        }));
     submit_capability_check_targets(targets, scope, "due");
 }
 
@@ -6057,16 +6027,7 @@ extern "C" fn create_repo_monitor_view(
         open_repo_overviews(host, std::slice::from_ref(&repo_id));
     });
 
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(0)
-        .child(&list)
-        .build();
-    scroller.set_valign(Align::Fill);
-    scroller.set_propagate_natural_height(false);
+    let scroller = vertical_view_scroller(&list);
 
     content.append(&controls);
     content.append(&header_stack);
@@ -6098,10 +6059,7 @@ extern "C" fn create_repo_monitor_view(
         views.borrow_mut().push(handle);
     });
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(content.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(content)
 }
 
 fn repo_monitor_header_for_view(view: MonitorViewMode) -> GtkBox {
@@ -6469,20 +6427,13 @@ fn attention_monitor_search_text(signals: &[AttentionSignal]) -> String {
 }
 
 fn monitor_attention_cell(signals: &[AttentionSignal]) -> Label {
-    let text = attention_monitor_label(signals);
-    let label = monitor_text_cell(
-        text,
+    monitor_colored_cell(
+        attention_monitor_label(signals),
+        attention_monitor_color(signals),
         MONITOR_ATTENTION_COL_CHARS,
         MONITOR_ATTENTION_COL_WIDTH,
-        false,
-    );
-    attach_text_tooltip(&label, attention_monitor_tooltip(signals));
-    let escaped = glib::markup_escape_text(text);
-    label.set_markup(&format!(
-        "<span foreground=\"{}\">{escaped}</span>",
-        attention_monitor_color(signals)
-    ));
-    label
+        Some(attention_monitor_tooltip(signals)),
+    )
 }
 
 fn workspace_attention_lines(
@@ -6742,38 +6693,44 @@ fn capability_summary_needs_attention(summary: &CapabilityMonitorSummary) -> boo
 }
 
 fn monitor_capability_cell(summary: &CapabilityMonitorSummary) -> Label {
-    let text = capability_monitor_label(summary);
-    let label = monitor_text_cell(
-        text,
+    monitor_colored_cell(
+        capability_monitor_label(summary),
+        capability_monitor_color(summary),
         MONITOR_CAPABILITY_COL_CHARS,
         MONITOR_CAPABILITY_COL_WIDTH,
-        false,
-    );
-    attach_text_tooltip(&label, capability_monitor_tooltip(summary));
-    let escaped = glib::markup_escape_text(text);
-    label.set_markup(&format!(
-        "<span foreground=\"{}\">{escaped}</span>",
-        capability_monitor_color(summary)
-    ));
+        Some(capability_monitor_tooltip(summary)),
+    )
+}
+
+/// A fixed-width monitor cell showing `text` in `color`.
+fn monitor_colored_cell(
+    text: &str,
+    color: &str,
+    width_chars: i32,
+    width_px: i32,
+    tooltip: Option<String>,
+) -> Label {
+    let label = monitor_text_cell(text, width_chars, width_px, false);
+    if let Some(tooltip) = tooltip {
+        attach_text_tooltip(&label, tooltip);
+    }
+    set_colored_markup(&label, text, color);
     label
 }
 
+fn set_colored_markup(label: &Label, text: &str, color: &str) {
+    let escaped = glib::markup_escape_text(text);
+    label.set_markup(&format!("<span foreground=\"{color}\">{escaped}</span>"));
+}
+
 fn monitor_manifest_cell(scan: Option<&RepoManifestScan>) -> Label {
-    let label = monitor_text_cell(
+    monitor_colored_cell(
         manifest_presence_label(scan),
+        manifest_presence_color(scan),
         MONITOR_MANIFEST_COL_CHARS,
         MONITOR_MANIFEST_COL_WIDTH,
-        false,
-    );
-    if let Some(tooltip) = manifest_presence_tooltip(scan) {
-        attach_text_tooltip(&label, tooltip);
-    }
-    let escaped = glib::markup_escape_text(manifest_presence_label(scan));
-    label.set_markup(&format!(
-        "<span foreground=\"{}\">{escaped}</span>",
-        manifest_presence_color(scan)
-    ));
-    label
+        manifest_presence_tooltip(scan),
+    )
 }
 
 fn monitor_manifest_actions_cell(item: &RepositoryListItem) -> Label {
@@ -6799,20 +6756,18 @@ fn monitor_enabled_cell(enabled: Option<bool>) -> Label {
         Some(false) => "Disabled",
         None => "-",
     };
-    let label = monitor_text_cell(
-        text,
-        MONITOR_STATE_COL_CHARS,
-        MONITOR_STATE_COL_WIDTH,
-        false,
-    );
-    let escaped = glib::markup_escape_text(text);
     let color = if enabled == Some(true) {
         "#7fdc8a"
     } else {
         "#8f96a3"
     };
-    label.set_markup(&format!("<span foreground=\"{color}\">{escaped}</span>"));
-    label
+    monitor_colored_cell(
+        text,
+        color,
+        MONITOR_STATE_COL_CHARS,
+        MONITOR_STATE_COL_WIDTH,
+        None,
+    )
 }
 
 fn manifest_presence_color(scan: Option<&RepoManifestScan>) -> &'static str {
@@ -6830,18 +6785,13 @@ fn manifest_presence_color(scan: Option<&RepoManifestScan>) -> &'static str {
 }
 
 fn monitor_state_cell(state: &ronomepo_core::RepositoryState) -> Label {
-    let label = monitor_text_cell(
+    monitor_colored_cell(
         status_label(state),
+        state_color(state),
         MONITOR_STATE_COL_CHARS,
         MONITOR_STATE_COL_WIDTH,
-        false,
-    );
-    let escaped = glib::markup_escape_text(status_label(state));
-    label.set_markup(&format!(
-        "<span foreground=\"{}\">{escaped}</span>",
-        state_color(state)
-    ));
-    label
+        None,
+    )
 }
 
 fn state_color(state: &ronomepo_core::RepositoryState) -> &'static str {
@@ -6856,16 +6806,9 @@ fn state_color(state: &ronomepo_core::RepositoryState) -> &'static str {
 
 fn monitor_sync_cell(sync: &ronomepo_core::RepositorySync) -> Label {
     let text = format_sync_label(sync);
-    let label = Label::new(Some(&text));
-    label.set_xalign(0.0);
+    let label = monitor_expand_cell(&text);
     label.add_css_class("mono");
-    label.set_hexpand(true);
-    label.set_ellipsize(EllipsizeMode::End);
-    let escaped = glib::markup_escape_text(&text);
-    label.set_markup(&format!(
-        "<span foreground=\"{}\">{escaped}</span>",
-        sync_color(sync)
-    ));
+    set_colored_markup(&label, &text, sync_color(sync));
     label
 }
 
@@ -6891,23 +6834,10 @@ extern "C" fn create_monorepo_overview_view(
 
     remember_host_ptr(host);
 
-    let root = GtkBox::new(Orientation::Vertical, 18);
+    let root = padded_view_root(18, 24);
     root.set_vexpand(true);
-    root.set_margin_top(24);
-    root.set_margin_bottom(24);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
 
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(0)
-        .child(&root)
-        .build();
-    scroller.set_valign(Align::Fill);
-    scroller.set_propagate_natural_height(false);
+    let scroller = vertical_view_scroller(&root);
 
     let root_ref = glib::WeakRef::new();
     root_ref.set(Some(&root));
@@ -6956,10 +6886,7 @@ extern "C" fn create_monorepo_overview_view(
         views.borrow_mut().push(view);
     });
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(scroller)
 }
 
 extern "C" fn create_commit_check_view(
@@ -6972,22 +6899,9 @@ extern "C" fn create_commit_check_view(
 
     remember_host_ptr(host);
 
-    let root = GtkBox::new(Orientation::Vertical, 18);
-    root.set_margin_top(24);
-    root.set_margin_bottom(24);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
+    let root = padded_view_root(18, 24);
 
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(0)
-        .child(&root)
-        .build();
-    scroller.set_valign(Align::Fill);
-    scroller.set_propagate_natural_height(false);
+    let scroller = vertical_view_scroller(&root);
 
     let editor = build_commit_check_view(&root, &snapshot());
 
@@ -7000,10 +6914,7 @@ extern "C" fn create_commit_check_view(
         });
     });
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(scroller)
 }
 
 fn render_monorepo_overview(view: &MonorepoOverview, snapshot: &StateSnapshot) {
@@ -7858,7 +7769,7 @@ extern "C" fn create_repo_overview_view(
     for page in RepoOverviewPage::ALL {
         let page_root = repo_overview_page_root();
         stack.add_titled(
-            &repo_overview_scroll_page(&page_root),
+            &vertical_view_scroller(&page_root),
             Some(page.name()),
             page.title(),
         );
@@ -7935,10 +7846,7 @@ extern "C" fn create_repo_overview_view(
         views.borrow_mut().push(view);
     });
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(root)
 }
 
 extern "C" fn create_workspace_settings_view(
@@ -7951,11 +7859,7 @@ extern "C" fn create_workspace_settings_view(
 
     remember_host_ptr(host);
 
-    let root = GtkBox::new(Orientation::Vertical, 18);
-    root.set_margin_top(24);
-    root.set_margin_bottom(24);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
+    let root = padded_view_root(18, 24);
 
     let heading = Label::new(Some("Fucina repository policy"));
     heading.set_xalign(0.0);
@@ -7993,10 +7897,7 @@ extern "C" fn create_workspace_settings_view(
         views.borrow_mut().push(handle);
     });
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(root)
 }
 
 /// Re-renders the policy part of a Fucina view when repos.toml was replaced,
@@ -8894,6 +8795,40 @@ fn reload_capability_registry() {
     }
 }
 
+/// A vertical view root with the same padding on every side.
+fn padded_view_root(spacing: i32, padding: i32) -> GtkBox {
+    let root = GtkBox::new(Orientation::Vertical, spacing);
+    root.set_margin_top(padding);
+    root.set_margin_bottom(padding);
+    root.set_margin_start(padding);
+    root.set_margin_end(padding);
+    root
+}
+
+/// Wraps `child` in a vertically scrolling window that fills its view.
+fn vertical_view_scroller(child: &impl IsA<gtk::Widget>) -> ScrolledWindow {
+    let scroller = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(0)
+        .child(child)
+        .build();
+    scroller.set_valign(Align::Fill);
+    scroller.set_propagate_natural_height(false);
+    scroller
+}
+
+/// Hands a view factory's top-level widget to the host, which takes the
+/// reference.
+fn into_view_ptr(widget: impl IsA<gtk::Widget>) -> *mut std::ffi::c_void {
+    unsafe {
+        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(widget.upcast())
+            as *mut std::ffi::c_void
+    }
+}
+
 fn repo_overview_page_root() -> GtkBox {
     let root = GtkBox::new(Orientation::Vertical, 18);
     root.set_margin_top(18);
@@ -8903,20 +8838,6 @@ fn repo_overview_page_root() -> GtkBox {
     root.set_hexpand(true);
     root.set_vexpand(true);
     root
-}
-
-fn repo_overview_scroll_page(root: &GtkBox) -> ScrolledWindow {
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(0)
-        .child(root)
-        .build();
-    scroller.set_valign(Align::Fill);
-    scroller.set_propagate_natural_height(false);
-    scroller
 }
 
 fn visible_repo_overview_page(view: &RepoOverviewView) -> Option<(RepoOverviewPage, &GtkBox)> {
@@ -9438,6 +9359,11 @@ fn repo_overview_lines_body(lines: &[String], empty_message: &str, mono: bool) -
 }
 
 fn repo_overview_facts_body(facts: &[(&str, String)]) -> GtkBox {
+    facts_body(facts, 9)
+}
+
+/// Rows of dimmed keys (`key_width_chars` wide) and wrapping values.
+fn facts_body(facts: &[(&str, String)], key_width_chars: i32) -> GtkBox {
     let block = GtkBox::new(Orientation::Vertical, 6);
     for (label, value) in facts {
         let row = GtkBox::new(Orientation::Horizontal, 10);
@@ -9445,7 +9371,7 @@ fn repo_overview_facts_body(facts: &[(&str, String)]) -> GtkBox {
 
         let key = Label::new(Some(label));
         key.set_xalign(0.0);
-        key.set_width_chars(9);
+        key.set_width_chars(key_width_chars);
         key.add_css_class("dim-label");
 
         let value_label = Label::new(Some(value));
@@ -9950,25 +9876,7 @@ fn append_facts_section(container: &GtkBox, heading: &str, facts: &[(&str, Strin
     heading_label.set_xalign(0.0);
     heading_label.add_css_class("title-4");
     block.append(&heading_label);
-
-    for (label, value) in facts {
-        let row = GtkBox::new(Orientation::Horizontal, 10);
-        row.set_hexpand(true);
-
-        let key = Label::new(Some(label));
-        key.set_xalign(0.0);
-        key.set_width_chars(12);
-        key.add_css_class("dim-label");
-
-        let value_label = Label::new(Some(value));
-        value_label.set_xalign(0.0);
-        value_label.set_hexpand(true);
-        value_label.set_wrap(true);
-
-        row.append(&key);
-        row.append(&value_label);
-        block.append(&row);
-    }
+    block.append(&facts_body(facts, 12));
 
     container.append(&block);
     container.append(&Separator::new(Orientation::Horizontal));
@@ -10598,11 +10506,7 @@ extern "C" fn create_repo_manifest_editor_view(
             })
         });
 
-    let root = GtkBox::new(Orientation::Vertical, 14);
-    root.set_margin_top(18);
-    root.set_margin_bottom(18);
-    root.set_margin_start(18);
-    root.set_margin_end(18);
+    let root = padded_view_root(14, 18);
 
     let snapshot = snapshot();
     let Some(repo_id) = repo_id else {
@@ -10615,29 +10519,14 @@ extern "C" fn create_repo_manifest_editor_view(
         body.add_css_class("muted");
         root.append(&title);
         root.append(&body);
-        return unsafe {
-            <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-                as *mut std::ffi::c_void
-        };
+        return into_view_ptr(root);
     };
 
     render_repo_manifest_editor_into(&root, &snapshot, &repo_id, host);
 
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(0)
-        .child(&root)
-        .build();
-    scroller.set_valign(Align::Fill);
-    scroller.set_propagate_natural_height(false);
+    let scroller = vertical_view_scroller(&root);
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(scroller.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(scroller)
 }
 
 fn render_repo_manifest_editor_into(
@@ -11420,11 +11309,7 @@ extern "C" fn create_text_editor_view(
 
     remember_host_ptr(host);
 
-    let root = GtkBox::new(Orientation::Vertical, 12);
-    root.set_margin_top(18);
-    root.set_margin_bottom(18);
-    root.set_margin_start(18);
-    root.set_margin_end(18);
+    let root = padded_view_root(12, 18);
 
     let instance_key =
         unsafe { request.as_ref() }.and_then(|request| decode_mzstr(request.instance_key));
@@ -11558,10 +11443,7 @@ extern "C" fn create_text_editor_view(
     root.append(&status);
     root.append(&scroller);
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(root)
 }
 
 /// Widgets of one text editor view that its load and save completions touch.
@@ -11789,11 +11671,7 @@ extern "C" fn create_operations_view(
 
     remember_host_ptr(host);
 
-    let root = GtkBox::new(Orientation::Vertical, 12);
-    root.set_margin_top(18);
-    root.set_margin_bottom(18);
-    root.set_margin_start(18);
-    root.set_margin_end(18);
+    let root = padded_view_root(12, 18);
 
     let (cursor, logs) = {
         let app_state = state().lock().expect("state mutex poisoned");
@@ -11922,10 +11800,7 @@ extern "C" fn create_operations_view(
     suppress_scroll_events.set(true);
     schedule_scroll_to_bottom(&scroller, suppress_scroll_events);
 
-    unsafe {
-        <gtk::Widget as IntoGlibPtr<*mut gtk::ffi::GtkWidget>>::into_glib_ptr(root.upcast())
-            as *mut std::ffi::c_void
-    }
+    into_view_ptr(root)
 }
 
 fn operation_summary_text(logs: &[String]) -> String {
