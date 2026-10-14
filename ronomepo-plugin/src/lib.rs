@@ -4563,41 +4563,106 @@ fn open_repo_overview_for_item(
 }
 
 fn attach_repo_monitor_context_menu(
-    relative_to: &impl IsA<gtk::Widget>,
+    anchor: &impl IsA<gtk::Widget>,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    let popover = build_repo_context_menu(relative_to, host_ptr);
+    // The menu is built when it opens and unparented once it closes: rows are
+    // replaced on refresh, and a popover parented to each of them would leak.
+    let open_menu: Rc<RefCell<Option<Popover>>> = Rc::default();
+    anchor.connect_unrealize({
+        let open_menu = Rc::clone(&open_menu);
+        move |_| close_repo_context_menu(&open_menu, None)
+    });
     let gesture = GestureClick::new();
     gesture.set_button(3);
-    gesture.connect_pressed({
-        let relative_to = relative_to.clone();
-        let popover = popover.clone();
-        move |_, _, x, y| {
-            if let Some(row) = relative_to.parent().and_downcast::<ListBoxRow>() {
-                if let Some(list) = row.parent().and_downcast::<ListBox>() {
-                    update_repo_context_selection(&list, &row);
-                    refresh_repo_context_menu(&popover, host_ptr);
-                }
+    gesture.connect_pressed(move |gesture, _, x, y| {
+        let Some(anchor) = gesture.widget() else {
+            return;
+        };
+        if let Some(row) = anchor.parent().and_downcast::<ListBoxRow>() {
+            if let Some(list) = row.parent().and_downcast::<ListBox>() {
+                update_repo_context_selection(&list, &row);
             }
-            popover.set_pointing_to(Some(&Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.popup();
         }
+        close_repo_context_menu(&open_menu, None);
+        let popover = build_repo_context_menu(&anchor, host_ptr);
+        popover.connect_closed({
+            let open_menu = Rc::clone(&open_menu);
+            move |popover| {
+                // Let the click that closed the menu finish dispatching first.
+                let open_menu = Rc::clone(&open_menu);
+                let popover = popover.clone();
+                glib::idle_add_local_once(move || {
+                    close_repo_context_menu(&open_menu, Some(&popover));
+                });
+            }
+        });
+        *open_menu.borrow_mut() = Some(popover.clone());
+        popover.set_pointing_to(Some(&Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.popup();
     });
-    relative_to.add_controller(gesture);
+    anchor.add_controller(gesture);
+}
+
+/// Pops down and unparents the open context menu; with `only`, only when that
+/// popover is still the open one.
+fn close_repo_context_menu(open_menu: &RefCell<Option<Popover>>, only: Option<&Popover>) {
+    let popover = {
+        let mut open_menu = open_menu.borrow_mut();
+        if only.is_some_and(|only| open_menu.as_ref() != Some(only)) {
+            return;
+        }
+        open_menu.take()
+    };
+    if let Some(popover) = popover {
+        popover.popdown();
+        if popover.parent().is_some() {
+            popover.unparent();
+        }
+    }
 }
 
 fn build_repo_context_menu(
-    relative_to: &impl IsA<gtk::Widget>,
+    anchor: &gtk::Widget,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> Popover {
     let popover = Popover::new();
     popover.set_autohide(true);
     popover.set_has_arrow(false);
     popover.set_position(PositionType::Bottom);
-    popover.set_parent(relative_to);
+    popover.set_parent(anchor);
 
-    refresh_repo_context_menu(&popover, host_ptr);
+    populate_repo_context_menu(&popover, host_ptr);
     popover
+}
+
+/// Returns a closure that pops `popover` down `delay` after the last call
+/// unless one of `hovered` is set by then. Calls restart one shared timeout
+/// instead of stacking a new one per pointer movement.
+fn hover_close_scheduler(
+    popover: &Popover,
+    delay: Duration,
+    hovered: [Rc<Cell<bool>>; 2],
+) -> Rc<dyn Fn()> {
+    let popover = popover.downgrade();
+    let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+    Rc::new(move || {
+        if let Some(source) = pending.borrow_mut().take() {
+            source.remove();
+        }
+        let popover = popover.clone();
+        let hovered = hovered.clone();
+        let pending_for_timeout = Rc::clone(&pending);
+        let source = glib::timeout_add_local_once(delay, move || {
+            pending_for_timeout.borrow_mut().take();
+            if hovered.iter().all(|hovered| !hovered.get()) {
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
+            }
+        });
+        *pending.borrow_mut() = Some(source);
+    })
 }
 
 fn attach_root_context_menu_close(
@@ -4637,7 +4702,7 @@ fn update_repo_context_selection(list: &ListBox, row: &ListBoxRow) {
     update_selected_repo_ids(selection_ids_from_list(list));
 }
 
-fn refresh_repo_context_menu(popover: &Popover, host_ptr: *const maruzzella_sdk::ffi::MzHostApi) {
+fn populate_repo_context_menu(popover: &Popover, host_ptr: *const maruzzella_sdk::ffi::MzHostApi) {
     let menu = GtkBox::new(Orientation::Vertical, 0);
     menu.set_margin_top(4);
     menu.set_margin_bottom(4);
@@ -4647,22 +4712,11 @@ fn refresh_repo_context_menu(popover: &Popover, host_ptr: *const maruzzella_sdk:
     let selection = selected_repository_items_from_state();
     let root_hovered = Rc::new(Cell::new(false));
     let child_hovered = Rc::new(Cell::new(false));
-    let schedule_close: Rc<dyn Fn()> = Rc::new({
-        let popover = popover.clone();
-        let root_hovered = Rc::clone(&root_hovered);
-        let child_hovered = Rc::clone(&child_hovered);
-        move || {
-            let popover = popover.clone();
-            let root_hovered = Rc::clone(&root_hovered);
-            let child_hovered = Rc::clone(&child_hovered);
-            glib::timeout_add_local(Duration::from_millis(140), move || {
-                if !root_hovered.get() && !child_hovered.get() {
-                    popover.popdown();
-                }
-                glib::ControlFlow::Break
-            });
-        }
-    });
+    let schedule_close = hover_close_scheduler(
+        popover,
+        Duration::from_millis(140),
+        [Rc::clone(&root_hovered), Rc::clone(&child_hovered)],
+    );
 
     let mut has_section = false;
     if append_repo_context_open_section(
@@ -4900,29 +4954,22 @@ fn append_context_submenu(
     let header_hovered = Rc::new(Cell::new(false));
     let submenu_hovered = Rc::new(Cell::new(false));
 
-    let schedule_close: Rc<dyn Fn()> = Rc::new({
-        let submenu_popover = submenu_popover.clone();
-        let header_hovered = Rc::clone(&header_hovered);
-        let submenu_hovered = Rc::clone(&submenu_hovered);
-        move || {
-            let submenu_popover = submenu_popover.clone();
-            let header_hovered = Rc::clone(&header_hovered);
-            let submenu_hovered = Rc::clone(&submenu_hovered);
-            glib::timeout_add_local(Duration::from_millis(120), move || {
-                if !header_hovered.get() && !submenu_hovered.get() {
-                    submenu_popover.popdown();
-                }
-                glib::ControlFlow::Break
-            });
-        }
-    });
+    let schedule_close = hover_close_scheduler(
+        &submenu_popover,
+        Duration::from_millis(120),
+        [Rc::clone(&header_hovered), Rc::clone(&submenu_hovered)],
+    );
 
-    let popup = submenu_popover.clone();
+    // Closures attached inside the popovers hold them weakly so the menus do
+    // not keep themselves alive after being unparented.
+    let popup = submenu_popover.downgrade();
     let header_hovered_for_enter = Rc::clone(&header_hovered);
     let motion = EventControllerMotion::new();
     motion.connect_enter(move |_, _, _| {
         header_hovered_for_enter.set(true);
-        popup.popup();
+        if let Some(popup) = popup.upgrade() {
+            popup.popup();
+        }
     });
     let header_hovered_for_leave = Rc::clone(&header_hovered);
     let schedule_close_for_header = Rc::clone(&schedule_close);
@@ -4934,12 +4981,14 @@ fn append_context_submenu(
 
     let submenu_hovered_for_enter = Rc::clone(&submenu_hovered);
     let root_child_hovered_for_enter = Rc::clone(root_child_hovered);
-    let popup = submenu_popover.clone();
+    let popup = submenu_popover.downgrade();
     let motion = EventControllerMotion::new();
     motion.connect_enter(move |_, _, _| {
         submenu_hovered_for_enter.set(true);
         root_child_hovered_for_enter.set(true);
-        popup.popup();
+        if let Some(popup) = popup.upgrade() {
+            popup.popup();
+        }
     });
     let submenu_hovered_for_leave = Rc::clone(&submenu_hovered);
     let root_child_hovered_for_leave = Rc::clone(root_child_hovered);
@@ -4954,8 +5003,11 @@ fn append_context_submenu(
     submenu.add_controller(motion);
 
     header.connect_clicked({
-        let submenu_popover = submenu_popover.clone();
+        let submenu_popover = submenu_popover.downgrade();
         move |_| {
+            let Some(submenu_popover) = submenu_popover.upgrade() else {
+                return;
+            };
             if submenu_popover.is_visible() {
                 submenu_popover.popdown();
             } else {
@@ -4965,10 +5017,13 @@ fn append_context_submenu(
     });
 
     header.connect_unrealize({
-        let submenu_popover = submenu_popover.clone();
+        let submenu_popover = submenu_popover.downgrade();
         let root_child_hovered = Rc::clone(root_child_hovered);
         move |_| {
             root_child_hovered.set(false);
+            let Some(submenu_popover) = submenu_popover.upgrade() else {
+                return;
+            };
             submenu_popover.popdown();
             if submenu_popover.parent().is_some() {
                 submenu_popover.unparent();
@@ -4977,11 +5032,13 @@ fn append_context_submenu(
     });
 
     parent_popover.connect_closed({
-        let submenu_popover = submenu_popover.clone();
+        let submenu_popover = submenu_popover.downgrade();
         let root_child_hovered = Rc::clone(root_child_hovered);
         move |_| {
             root_child_hovered.set(false);
-            submenu_popover.popdown();
+            if let Some(submenu_popover) = submenu_popover.upgrade() {
+                submenu_popover.popdown();
+            }
         }
     });
 
@@ -5433,9 +5490,11 @@ where
     text.set_halign(Align::Start);
     text.set_hexpand(true);
     button.set_child(Some(&text));
-    let popover = popover.clone();
+    let popover = popover.downgrade();
     button.connect_clicked(move |_| {
-        popover.popdown();
+        if let Some(popover) = popover.upgrade() {
+            popover.popdown();
+        }
         action();
     });
     menu.append(&button);
