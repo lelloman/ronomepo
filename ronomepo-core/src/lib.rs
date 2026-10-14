@@ -3202,7 +3202,7 @@ pub fn run_workspace_operation<F>(
     }
 
     if matches!(kind, OperationKind::Pull) && selected_repo_ids.is_empty() {
-        let root_event = pull_workspace_root(manifest);
+        let root_event = pull_target(&OperationTarget::workspace_root(manifest));
         match root_event.kind {
             OperationEventKind::Success => completed += 1,
             OperationEventKind::Skipped => skipped += 1,
@@ -3243,7 +3243,7 @@ pub fn run_workspace_operation<F>(
     if matches!(kind, OperationKind::Push | OperationKind::PushForce)
         && selected_repo_ids.is_empty()
     {
-        let root_event = push_workspace_root(manifest);
+        let root_event = push_target(&OperationTarget::workspace_root(manifest));
         match root_event.kind {
             OperationEventKind::Success => completed += 1,
             OperationEventKind::Skipped => skipped += 1,
@@ -3256,9 +3256,10 @@ pub fn run_workspace_operation<F>(
     for repo in entries {
         let event = match kind {
             OperationKind::CloneMissing => clone_missing_repo(manifest, repo),
-            OperationKind::Pull => pull_repo(manifest, repo),
-            OperationKind::Push => push_repo(manifest, repo),
-            OperationKind::PushForce => push_repo(manifest, repo),
+            OperationKind::Pull => pull_target(&OperationTarget::repo(manifest, repo)),
+            OperationKind::Push | OperationKind::PushForce => {
+                push_target(&OperationTarget::repo(manifest, repo))
+            }
             OperationKind::ApplyHooks => apply_hooks_repo(manifest, repo),
         };
 
@@ -3390,26 +3391,85 @@ fn clone_missing_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> O
     }
 }
 
-fn pull_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> OperationEvent {
-    let repo_path = manifest.root.join(&repo.dir_name);
-    if !repo_path.exists() {
-        return failed_event(repo, format!("{} is missing locally.", repo.dir_name));
+/// A repository targeted by pull/push: a manifest entry or the workspace root.
+struct OperationTarget {
+    repository_id: Option<String>,
+    repository_name: String,
+    label: String,
+    path: PathBuf,
+    /// The workspace root is only included implicitly, so a root that is not a
+    /// git repository is skipped instead of reported as a failure.
+    is_workspace_root: bool,
+}
+
+impl OperationTarget {
+    fn repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> Self {
+        Self {
+            repository_id: Some(repo.id.clone()),
+            repository_name: repo.name.clone(),
+            label: repo.dir_name.clone(),
+            path: manifest.root.join(&repo.dir_name),
+            is_workspace_root: false,
+        }
     }
 
-    if matches!(repository_state(&repo_path), RepositoryState::Dirty) {
-        return skipped_event(
-            repo,
-            format!(
-                "Skipped {} because it has uncommitted changes.",
-                repo.dir_name
-            ),
-        );
+    fn workspace_root(manifest: &WorkspaceManifest) -> Self {
+        Self {
+            repository_id: None,
+            repository_name: "workspace root".to_string(),
+            label: "workspace root".to_string(),
+            path: manifest.root.clone(),
+            is_workspace_root: true,
+        }
     }
 
-    let has_untracked = matches!(repository_state(&repo_path), RepositoryState::Untracked);
+    fn event(&self, kind: OperationEventKind, message: String) -> OperationEvent {
+        OperationEvent {
+            kind,
+            repository_id: self.repository_id.clone(),
+            repository_name: Some(self.repository_name.clone()),
+            message,
+        }
+    }
+
+    fn skipped(&self, reason: &str) -> OperationEvent {
+        self.event(
+            OperationEventKind::Skipped,
+            format!("Skipped {} because {reason}.", self.label),
+        )
+    }
+
+    fn failed(&self, message: String) -> OperationEvent {
+        self.event(OperationEventKind::Failed, message)
+    }
+
+    /// Returns the event to report when the target cannot be operated on.
+    fn unavailable_event(&self) -> Option<OperationEvent> {
+        if self.is_workspace_root {
+            return (!self.path.join(".git").exists())
+                .then(|| self.skipped("it is not a git repository"));
+        }
+        if !self.path.exists() {
+            return Some(self.failed(format!("{} is missing locally.", self.label)));
+        }
+        None
+    }
+}
+
+fn pull_target(target: &OperationTarget) -> OperationEvent {
+    if let Some(event) = target.unavailable_event() {
+        return event;
+    }
+
+    let state = repository_state(&target.path);
+    if matches!(state, RepositoryState::Dirty) {
+        return target.skipped("it has uncommitted changes");
+    }
+
+    let has_untracked = matches!(state, RepositoryState::Untracked);
     match Command::new("git")
         .arg("-C")
-        .arg(&repo_path)
+        .arg(&target.path)
         .arg("pull")
         .arg("--quiet")
         .output()
@@ -3420,179 +3480,54 @@ fn pull_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> OperationE
             } else {
                 ""
             };
-            success_event(repo, format!("Pulled {}.{suffix}", repo.dir_name))
+            target.event(
+                OperationEventKind::Success,
+                format!("Pulled {}.{suffix}", target.label),
+            )
         }
-        Ok(output) => failed_event(
-            repo,
-            format!(
-                "Pull failed for {}: {}",
-                repo.dir_name,
-                stderr_message(&output.stderr)
-            ),
-        ),
-        Err(error) => failed_event(repo, format!("Pull failed for {}: {error}", repo.dir_name)),
+        Ok(output) => target.failed(format!(
+            "Pull failed for {}: {}",
+            target.label,
+            stderr_message(&output.stderr)
+        )),
+        Err(error) => target.failed(format!("Pull failed for {}: {error}", target.label)),
     }
 }
 
-fn push_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> OperationEvent {
-    let repo_path = manifest.root.join(&repo.dir_name);
-    if !repo_path.exists() {
-        return failed_event(repo, format!("{} is missing locally.", repo.dir_name));
+fn push_target(target: &OperationTarget) -> OperationEvent {
+    if let Some(event) = target.unavailable_event() {
+        return event;
     }
 
-    let Some(upstream) = git_stdout(&repo_path, ["rev-parse", "--abbrev-ref", "@{upstream}"])
-    else {
-        return skipped_event(
-            repo,
-            format!("Skipped {} because it has no upstream.", repo.dir_name),
-        );
-    };
-    if upstream.is_empty() {
-        return skipped_event(
-            repo,
-            format!("Skipped {} because it has no upstream.", repo.dir_name),
-        );
+    let has_upstream = git_stdout(&target.path, ["rev-parse", "--abbrev-ref", "@{upstream}"])
+        .is_some_and(|upstream| !upstream.is_empty());
+    if !has_upstream {
+        return target.skipped("it has no upstream");
     }
 
-    let ahead = git_stdout(&repo_path, ["rev-list", "--count", "@{upstream}..HEAD"])
+    let ahead = git_stdout(&target.path, ["rev-list", "--count", "@{upstream}..HEAD"])
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
     if ahead == 0 {
-        return skipped_event(
-            repo,
-            format!("Skipped {} because it has nothing to push.", repo.dir_name),
-        );
+        return target.skipped("it has nothing to push");
     }
 
     match Command::new("git")
         .arg("-C")
-        .arg(&repo_path)
+        .arg(&target.path)
         .arg("push")
         .output()
     {
-        Ok(output) if output.status.success() => success_event(
-            repo,
-            format!("Pushed {} ({} commits).", repo.dir_name, ahead),
+        Ok(output) if output.status.success() => target.event(
+            OperationEventKind::Success,
+            format!("Pushed {} ({} commits).", target.label, ahead),
         ),
-        Ok(output) => failed_event(
-            repo,
-            format!(
-                "Push failed for {}: {}",
-                repo.dir_name,
-                stderr_message(&output.stderr)
-            ),
-        ),
-        Err(error) => failed_event(repo, format!("Push failed for {}: {error}", repo.dir_name)),
-    }
-}
-
-fn push_workspace_root(manifest: &WorkspaceManifest) -> OperationEvent {
-    let root = &manifest.root;
-    if !root.join(".git").exists() {
-        return OperationEvent {
-            kind: OperationEventKind::Skipped,
-            repository_id: None,
-            repository_name: Some("workspace root".to_string()),
-            message: "Skipped workspace root because it is not a git repository.".to_string(),
-        };
-    }
-
-    let has_upstream = git_stdout(root, ["rev-parse", "--abbrev-ref", "@{upstream}"])
-        .is_some_and(|s| !s.is_empty());
-    if !has_upstream {
-        return OperationEvent {
-            kind: OperationEventKind::Skipped,
-            repository_id: None,
-            repository_name: Some("workspace root".to_string()),
-            message: "Skipped workspace root because it has no upstream.".to_string(),
-        };
-    }
-
-    let ahead = git_stdout(root, ["rev-list", "--count", "@{upstream}..HEAD"])
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    if ahead == 0 {
-        return OperationEvent {
-            kind: OperationEventKind::Skipped,
-            repository_id: None,
-            repository_name: Some("workspace root".to_string()),
-            message: "Skipped workspace root because it has nothing to push.".to_string(),
-        };
-    }
-
-    match Command::new("git").arg("-C").arg(root).arg("push").output() {
-        Ok(output) if output.status.success() => OperationEvent {
-            kind: OperationEventKind::Success,
-            repository_id: None,
-            repository_name: Some("workspace root".to_string()),
-            message: format!("Pushed workspace root ({ahead} commits)."),
-        },
-        Ok(output) => OperationEvent {
-            kind: OperationEventKind::Failed,
-            repository_id: None,
-            repository_name: Some("workspace root".to_string()),
-            message: format!(
-                "Push failed for workspace root: {}",
-                stderr_message(&output.stderr)
-            ),
-        },
-        Err(error) => OperationEvent {
-            kind: OperationEventKind::Failed,
-            repository_id: None,
-            repository_name: Some("workspace root".to_string()),
-            message: format!("Push failed for workspace root: {error}"),
-        },
-    }
-}
-
-fn pull_workspace_root(manifest: &WorkspaceManifest) -> OperationEvent {
-    let root = &manifest.root;
-    if !root.join(".git").exists() {
-        return OperationEvent {
-            kind: OperationEventKind::Skipped,
-            repository_id: None,
-            repository_name: Some("workspace root".to_string()),
-            message: "Skipped workspace root because it is not a git repository.".to_string(),
-        };
-    }
-
-    if matches!(repository_state(root), RepositoryState::Dirty) {
-        return OperationEvent {
-            kind: OperationEventKind::Skipped,
-            repository_id: None,
-            repository_name: Some("workspace root".to_string()),
-            message: "Skipped workspace root because it has uncommitted changes.".to_string(),
-        };
-    }
-
-    match Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .arg("pull")
-        .arg("--quiet")
-        .output()
-    {
-        Ok(output) if output.status.success() => OperationEvent {
-            kind: OperationEventKind::Success,
-            repository_id: None,
-            repository_name: Some("workspace root".to_string()),
-            message: "Pulled workspace root.".to_string(),
-        },
-        Ok(output) => OperationEvent {
-            kind: OperationEventKind::Failed,
-            repository_id: None,
-            repository_name: Some("workspace root".to_string()),
-            message: format!(
-                "Pull failed for workspace root: {}",
-                stderr_message(&output.stderr)
-            ),
-        },
-        Err(error) => OperationEvent {
-            kind: OperationEventKind::Failed,
-            repository_id: None,
-            repository_name: Some("workspace root".to_string()),
-            message: format!("Pull failed for workspace root: {error}"),
-        },
+        Ok(output) => target.failed(format!(
+            "Push failed for {}: {}",
+            target.label,
+            stderr_message(&output.stderr)
+        )),
+        Err(error) => target.failed(format!("Push failed for {}: {error}", target.label)),
     }
 }
 
@@ -5723,7 +5658,12 @@ backup_required = false
     fn run_git<const N: usize>(path: &Path, args: [&str; N]) {
         // Keep the user's global hooks and signing setup out of test commits.
         let status = Command::new("git")
-            .args(["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"])
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ])
             .arg("-C")
             .arg(path)
             .args(args)
