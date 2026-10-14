@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -3367,15 +3367,24 @@ fn clone_missing_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> O
         return skipped_event(repo, format!("{} already exists locally.", repo.dir_name));
     }
 
-    match Command::new("git")
+    let mut command = network_git_command(None);
+    command
         .arg("clone")
+        .arg("--")
         .arg(&repo.remote_url)
-        .arg(&repo_path)
-        .output()
-    {
+        .arg(&repo_path);
+    match run_with_timeout(command, NETWORK_GIT_TIMEOUT) {
         Ok(output) if output.status.success() => {
             if let Some(hooks_path) = resolved_shared_hooks_path(manifest) {
-                let _ = configure_hooks_path(&repo_path, &hooks_path);
+                if let Err(error) = configure_hooks_path(&repo_path, &hooks_path) {
+                    return failed_event(
+                        repo,
+                        format!(
+                            "Cloned {} but failed to configure hooks: {error}",
+                            repo.dir_name
+                        ),
+                    );
+                }
             }
             success_event(repo, format!("Cloned {}.", repo.dir_name))
         }
@@ -3387,7 +3396,14 @@ fn clone_missing_repo(manifest: &WorkspaceManifest, repo: &RepositoryEntry) -> O
                 stderr_message(&output.stderr)
             ),
         ),
-        Err(error) => failed_event(repo, format!("Clone failed for {}: {error}", repo.dir_name)),
+        Err(error) => {
+            // A killed clone leaves a partial checkout that would make every
+            // later Clone Missing skip the repository.
+            if error.kind() == io::ErrorKind::TimedOut {
+                let _ = fs::remove_dir_all(&repo_path);
+            }
+            failed_event(repo, format!("Clone failed for {}: {error}", repo.dir_name))
+        }
     }
 }
 
@@ -3470,7 +3486,9 @@ fn pull_target(target: &OperationTarget) -> OperationEvent {
     }
 
     let has_untracked = matches!(state, RepositoryState::Untracked);
-    match repo_git(&target.path).arg("pull").arg("--quiet").output() {
+    let mut command = network_git_command(Some(&target.path));
+    command.arg("pull").arg("--quiet");
+    match run_with_timeout(command, NETWORK_GIT_TIMEOUT) {
         Ok(output) if output.status.success() => {
             let suffix = if has_untracked {
                 " Untracked files were present."
@@ -3509,7 +3527,9 @@ fn push_target(target: &OperationTarget) -> OperationEvent {
         return target.skipped("it has nothing to push");
     }
 
-    match repo_git(&target.path).arg("push").output() {
+    let mut command = network_git_command(Some(&target.path));
+    command.arg("push");
+    match run_with_timeout(command, NETWORK_GIT_TIMEOUT) {
         Ok(output) if output.status.success() => target.event(
             OperationEventKind::Success,
             format!("Pushed {} ({} commits).", target.label, ahead),
@@ -4044,6 +4064,128 @@ fn repo_git(repo_path: &Path) -> Command {
     }
     command.arg("-C").arg(repo_path);
     command
+}
+
+/// Upper bound for a single network git command (clone, pull, push, fetch)
+/// before it is killed and reported as failed.
+pub const NETWORK_GIT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// A git command for talking to remotes that can never block on a prompt:
+/// terminal credential prompts are disabled and ssh runs in batch mode, so a
+/// missing key or unknown host fails instead of hanging a worker forever.
+/// `repo_path` is used as `-C` (with the same ceiling as `repo_git`).
+pub fn network_git_command(repo_path: Option<&Path>) -> Command {
+    let mut command = match repo_path {
+        Some(repo_path) => repo_git(repo_path),
+        None => Command::new("git"),
+    };
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(ssh_command) = batch_mode_ssh_command(repo_path) {
+        command.env("GIT_SSH_COMMAND", ssh_command);
+    }
+    command
+}
+
+/// GIT_SSH_COMMAND overrides core.sshCommand, so the user's configured ssh
+/// command is kept and only `-o BatchMode=yes` is appended. A plain GIT_SSH
+/// program cannot take extra options and is left alone.
+fn batch_mode_ssh_command(repo_path: Option<&Path>) -> Option<String> {
+    if std::env::var_os("GIT_SSH").is_some() {
+        return None;
+    }
+    let configured = std::env::var("GIT_SSH_COMMAND")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            let mut config = match repo_path {
+                Some(repo_path) => repo_git(repo_path),
+                None => Command::new("git"),
+            };
+            let output = config
+                .args(["config", "--get", "core.sshCommand"])
+                .stderr(Stdio::null())
+                .output()
+                .ok()?;
+            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (output.status.success() && !value.is_empty()).then_some(value)
+        })
+        .unwrap_or_else(|| "ssh".to_string());
+    Some(format!("{configured} -o BatchMode=yes"))
+}
+
+/// Like `Command::output`, but kills the child once `timeout` elapses and
+/// returns an `io::ErrorKind::TimedOut` error. stdin is closed.
+pub fn run_with_timeout(mut command: Command, timeout: Duration) -> io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = drain_pipe(child.stdout.take());
+    let stderr = drain_pipe(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out after {}s", timeout.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    Ok(Output {
+        status,
+        stdout: stdout.finish(),
+        stderr: stderr.finish(),
+    })
+}
+
+/// Collects a child pipe on a helper thread. Reading is not joined
+/// unconditionally: a grandchild such as a persistent ssh control master can
+/// inherit the pipe and keep it open long after git itself has exited.
+struct PipeDrain {
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl PipeDrain {
+    fn finish(self) -> Vec<u8> {
+        let _ = self.done.recv_timeout(Duration::from_secs(1));
+        let buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        buffer.clone()
+    }
+}
+
+fn drain_pipe(pipe: Option<impl Read + Send + 'static>) -> PipeDrain {
+    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (done_tx, done) = std::sync::mpsc::channel();
+    if let Some(mut pipe) = pipe {
+        let buffer = buffer.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => buffer
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extend_from_slice(&chunk[..read]),
+                }
+            }
+            let _ = done_tx.send(());
+        });
+    }
+    PipeDrain { buffer, done }
 }
 
 /// Status scans must not write: `git status` otherwise takes `.git/index.lock`
@@ -4905,6 +5047,62 @@ mod tests {
             git_stdout(&workspace, ["rev-parse", "HEAD"]).as_deref(),
             Some(parent_head.as_str())
         );
+    }
+
+    #[test]
+    fn run_with_timeout_kills_slow_commands() {
+        let mut command = Command::new("sleep");
+        command.arg("5");
+        let started = Instant::now();
+        let error = run_with_timeout(command, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(4));
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo out; echo err >&2; exit 3"]);
+        let output = run_with_timeout(command, Duration::from_secs(10)).unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+    }
+
+    #[test]
+    fn network_git_commands_never_prompt() {
+        let command = network_git_command(None);
+        let env = command
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(env.get("GIT_TERMINAL_PROMPT"), Some(&"0"));
+        if std::env::var_os("GIT_SSH").is_none() {
+            assert!(env["GIT_SSH_COMMAND"].ends_with("-o BatchMode=yes"));
+        }
+    }
+
+    #[test]
+    fn clone_passes_the_url_after_double_dash() {
+        let workspace = temp_dir_path("clone-dash");
+        fs::create_dir_all(&workspace).unwrap();
+        let manifest = WorkspaceManifest {
+            name: "Example".to_string(),
+            root: workspace.to_path_buf(),
+            repos: vec![RepositoryEntry {
+                id: "alpha".to_string(),
+                name: "alpha".to_string(),
+                dir_name: "alpha".to_string(),
+                remote_url: "--upload-pack=touch injected".to_string(),
+                enabled: true,
+            }],
+            shared_hooks_path: None,
+            commit_check_rules: None,
+        };
+
+        let event = clone_missing_repo(&manifest, &manifest.repos[0]);
+        assert_eq!(event.kind, OperationEventKind::Failed);
+        // Parsed as an option, git would complain about the missing repository
+        // argument instead of failing to reach the "URL".
+        assert!(!event.message.contains("must specify a repository"));
+        assert!(!workspace.join("injected").exists());
     }
 
     #[test]
