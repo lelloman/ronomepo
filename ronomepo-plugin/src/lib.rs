@@ -336,6 +336,9 @@ struct AppState {
     /// Source of the installed watch manager, so checking whether a sync is a
     /// no-op does not need the watch manager lock.
     watch_source: Option<WatchSource>,
+    /// New directories seen while a watch rebuild runs, registered on the new
+    /// manager once it is installed.
+    deferred_watch_dirs: Vec<PathBuf>,
     /// The Pull/Push/... batch currently running; only one runs at a time.
     operation_in_flight: Option<OperationBatchState>,
     /// Each repo's invalidation_seq when the running full workspace scan was
@@ -401,6 +404,7 @@ impl Default for AppState {
             watch_manager_sync_pending: false,
             watch_manager_sync_pending_force: false,
             watch_source: None,
+            deferred_watch_dirs: Vec::new(),
             operation_in_flight: None,
             workspace_scan_seqs: HashMap::new(),
         }
@@ -2431,6 +2435,13 @@ fn handle_worker_result(result: WorkerResult) {
             if rerun {
                 WATCH_SYNC_PENDING_COLLAPSES.fetch_add(1, Ordering::Relaxed);
                 sync_watch_manager(rerun_force);
+            }
+            let deferred_dirs = {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                take_deferred_watch_dirs(&mut app_state)
+            };
+            if !deferred_dirs.is_empty() {
+                queue_watch_new_dirs(deferred_dirs);
             }
         }
         WorkerResult::RefreshWorkspaceCompleted {
@@ -4515,7 +4526,18 @@ fn watch_dir_tree(
     ignored: &HashSet<PathBuf>,
     unreadable: &mut Vec<PathBuf>,
 ) -> notify::Result<usize> {
-    let mut registered = 0;
+    let dirs = collect_dir_tree(root, ignored, unreadable).map_err(notify::Error::io)?;
+    watch_dirs(watcher, dirs, Some(root), unreadable)
+}
+
+/// Lists `root` and its subdirectories (root first) for `watch_dir_tree`,
+/// recording unreadable ones. Only failing to read `root` itself is an error.
+fn collect_dir_tree(
+    root: &Path,
+    ignored: &HashSet<PathBuf>,
+    unreadable: &mut Vec<PathBuf>,
+) -> std::io::Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let is_root = dir == root;
@@ -4525,19 +4547,10 @@ fn watch_dir_tree(
                 unreadable.push(dir);
                 continue;
             }
-            Err(error) if is_root => return Err(notify::Error::io(error)),
+            Err(error) if is_root => return Err(error),
             // Vanished while walking.
             Err(_) => continue,
         };
-        match watcher.watch(&dir, RecursiveMode::NonRecursive) {
-            Ok(()) => registered += 1,
-            Err(error) if is_permission_denied(&error) => {
-                unreadable.push(dir);
-                continue;
-            }
-            Err(error) if is_root => return Err(error),
-            Err(_) => continue,
-        }
         for entry in entries.flatten() {
             if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
                 continue;
@@ -4548,6 +4561,28 @@ fn watch_dir_tree(
             }
             stack.push(path);
         }
+        dirs.push(dir);
+    }
+    Ok(dirs)
+}
+
+/// Registers each directory non-recursively and returns how many were. Only a
+/// failure on `root` is an error; unreadable directories are recorded.
+fn watch_dirs(
+    watcher: &mut dyn Watcher,
+    dirs: Vec<PathBuf>,
+    root: Option<&Path>,
+    unreadable: &mut Vec<PathBuf>,
+) -> notify::Result<usize> {
+    let mut registered = 0;
+    for dir in dirs {
+        match watcher.watch(&dir, RecursiveMode::NonRecursive) {
+            Ok(()) => registered += 1,
+            Err(error) if is_permission_denied(&error) => unreadable.push(dir),
+            Err(error) if Some(dir.as_path()) == root => return Err(error),
+            // Vanished since it was listed.
+            Err(_) => {}
+        }
     }
     Ok(registered)
 }
@@ -4555,42 +4590,47 @@ fn watch_dir_tree(
 /// Registers directories created after the watch manager was built, along with
 /// anything already inside them, unless they are git-ignored. Runs on a worker:
 /// it spawns git, and the inotify backend cannot be driven from its own
-/// event callback.
+/// event callback. The walk and the git calls run without the watch manager
+/// lock, which is only held to register the result.
 fn watch_new_dirs(mut dirs: Vec<PathBuf>) {
-    let mut slot = watch_manager()
-        .lock()
-        .expect("watch manager mutex poisoned");
-    let Some(manager) = slot.as_mut() else {
-        return;
+    let (source, mut ignored) = {
+        let slot = watch_manager()
+            .lock()
+            .expect("watch manager mutex poisoned");
+        let Some(manager) = slot.as_ref() else {
+            return;
+        };
+        (manager.source.clone(), manager.ignored_dirs.clone())
     };
-    // Parents first, so a registered parent's walk covers its children.
+    // Parents first, so a collected parent's walk covers its children.
     dirs.sort_by_key(|dir| dir.components().count());
-    let mut added = 0;
+    let mut new_ignored = Vec::new();
+    let mut collected = HashSet::new();
+    let mut to_watch = Vec::new();
+    let mut unreadable = Vec::new();
     for dir in dirs {
         let dir = normalized_watch_path(&dir);
-        if !dir.is_dir()
-            || is_under_ignored_dir(&manager.ignored_dirs, &dir)
+        if collected.contains(&dir)
+            || !dir.is_dir()
+            || is_under_ignored_dir(&ignored, &dir)
             || dir.ancestors().any(is_unwatched_git_internal_dir)
         {
             continue;
         }
-        let repo_root = manager
-            .source
+        let repo_root = source
             .repo_roots
             .iter()
             .filter(|root| dir.starts_with(root) && dir != **root)
-            .max_by_key(|root| root.components().count())
-            .cloned();
-        let in_workspace_git = manager
-            .source
+            .max_by_key(|root| root.components().count());
+        let in_workspace_git = source
             .workspace_git_dir
             .as_ref()
             .is_some_and(|git_dir| dir.starts_with(git_dir));
-        if let Some(repo_root) = &repo_root {
-            manager
-                .ignored_dirs
-                .extend(git_ignored_dirs(repo_root, &dir));
-            if manager.ignored_dirs.contains(&dir) {
+        if let Some(repo_root) = repo_root {
+            let found = git_ignored_dirs(repo_root, &dir);
+            ignored.extend(found.iter().cloned());
+            new_ignored.extend(found);
+            if ignored.contains(&dir) {
                 continue;
             }
         } else if !in_workspace_git {
@@ -4598,15 +4638,36 @@ fn watch_new_dirs(mut dirs: Vec<PathBuf>) {
             // by the full resync that follows the manifest/scan change.
             continue;
         }
-        if let Ok(count) = watch_dir_tree(
-            watch_backend_mut(&mut manager.backend),
-            &dir,
-            &manager.ignored_dirs,
-            &mut manager.unreadable_paths,
-        ) {
-            added += count;
+        let Ok(tree) = collect_dir_tree(&dir, &ignored, &mut unreadable) else {
+            continue;
+        };
+        for path in tree {
+            if collected.insert(path.clone()) {
+                to_watch.push(path);
+            }
         }
     }
+    if to_watch.is_empty() && new_ignored.is_empty() && unreadable.is_empty() {
+        return;
+    }
+
+    let mut slot = watch_manager()
+        .lock()
+        .expect("watch manager mutex poisoned");
+    // A rebuild may have replaced the manager meanwhile; registering on the
+    // new one is still right (re-watching a directory is harmless).
+    let Some(manager) = slot.as_mut() else {
+        return;
+    };
+    manager.ignored_dirs.extend(new_ignored);
+    let added = watch_dirs(
+        watch_backend_mut(&mut manager.backend),
+        to_watch,
+        None,
+        &mut unreadable,
+    )
+    .unwrap_or(0);
+    manager.unreadable_paths.extend(unreadable);
     if added > 0 {
         manager.watched_paths += added;
         WATCHED_PATH_COUNT.store(manager.watched_paths, Ordering::Relaxed);
@@ -4779,15 +4840,42 @@ fn flush_pending_watch_events() {
         return;
     }
     if !pending.new_dirs.is_empty() {
-        let dirs = pending.new_dirs.into_iter().collect();
-        if let Err(error) = submit_job(WorkerJob::WatchNewDirs { dirs }) {
-            append_log(format!(
-                "Repository watcher could not add new directories: {error}"
-            ));
-        }
+        queue_watch_new_dirs(pending.new_dirs.into_iter().collect());
     }
 
     handle_watch_touches(pending.workspace_touched, pending.repo_ids);
+}
+
+fn queue_watch_new_dirs(dirs: Vec<PathBuf>) {
+    {
+        let mut app_state = state().lock().expect("state mutex poisoned");
+        if defer_watch_dirs_during_sync(&mut app_state, &dirs) {
+            return;
+        }
+    }
+    if let Err(error) = submit_job(WorkerJob::WatchNewDirs { dirs }) {
+        append_log(format!(
+            "Repository watcher could not add new directories: {error}"
+        ));
+    }
+}
+
+/// While a rebuild runs, its walk may already have passed where these
+/// directories appeared, and anything registered on the outgoing manager is
+/// dropped with it, so hold them until the new manager is installed.
+fn defer_watch_dirs_during_sync(app_state: &mut AppState, dirs: &[PathBuf]) -> bool {
+    if !app_state.watch_manager_sync_in_flight {
+        return false;
+    }
+    app_state.deferred_watch_dirs.extend_from_slice(dirs);
+    true
+}
+
+fn take_deferred_watch_dirs(app_state: &mut AppState) -> Vec<PathBuf> {
+    if app_state.watch_manager_sync_in_flight {
+        return Vec::new();
+    }
+    std::mem::take(&mut app_state.deferred_watch_dirs)
 }
 
 fn handle_watch_touches(workspace_touched: bool, mut repo_ids: HashSet<String>) {
@@ -12953,6 +13041,22 @@ mod tests {
             Some(&source)
         ));
         assert!(!app_state.watch_manager_sync_pending_force);
+    }
+
+    #[test]
+    fn new_dirs_seen_during_watch_rebuild_wait_for_the_new_manager() {
+        let mut app_state = AppState::default();
+        let dirs = vec![PathBuf::from("/workspace/alpha/src/fresh")];
+        assert!(!defer_watch_dirs_during_sync(&mut app_state, &dirs));
+
+        app_state.watch_manager_sync_in_flight = true;
+        assert!(defer_watch_dirs_during_sync(&mut app_state, &dirs));
+        // Still rebuilding (e.g. a collapsed rerun started): keep holding them.
+        assert!(take_deferred_watch_dirs(&mut app_state).is_empty());
+
+        app_state.watch_manager_sync_in_flight = false;
+        assert_eq!(take_deferred_watch_dirs(&mut app_state), dirs);
+        assert!(app_state.deferred_watch_dirs.is_empty());
     }
 
     #[test]
