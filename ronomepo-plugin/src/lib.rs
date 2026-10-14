@@ -7174,32 +7174,54 @@ fn append_commit_check_rule_row(
     });
 }
 
-fn open_add_commit_check_rule_dialog(parent: Option<Window>, editor: Rc<CommitCheckEditor>) {
-    let dialog = Dialog::builder()
-        .modal(true)
-        .title("Add Commit Check Rule")
-        .build();
-    if let Some(parent) = parent.as_ref() {
-        dialog.set_transient_for(Some(parent));
+/// A modal window showing `body` above a right-aligned row of `buttons`, used
+/// in place of the deprecated gtk::Dialog. Escape closes it.
+fn build_modal_window(
+    parent: Option<&Window>,
+    title: &str,
+    body: &impl IsA<gtk::Widget>,
+    buttons: &[&Button],
+) -> Window {
+    let window = Window::builder().modal(true).title(title).build();
+    if let Some(parent) = parent {
+        window.set_transient_for(Some(parent));
     }
-    let cancel = dialog.add_button("Cancel", ResponseType::Cancel);
-    mark_clickable(&cancel);
-    cancel.add_css_class(&button_css_class("secondary"));
-    let add = dialog.add_button("Add Rule", ResponseType::Accept);
-    mark_clickable(&add);
-    add.add_css_class(&button_css_class("primary"));
-    dialog.set_default_response(ResponseType::Accept);
-    dialog.add_css_class(&surface_css_class("workbench"));
-    dialog.add_css_class(&text_css_class("body"));
 
-    let content = dialog.content_area();
-    content.add_css_class(&surface_css_class("workbench"));
-    content.add_css_class(&text_css_class("body"));
+    let content = GtkBox::new(Orientation::Vertical, 12);
     content.set_margin_top(16);
     content.set_margin_bottom(16);
     content.set_margin_start(16);
     content.set_margin_end(16);
-    content.set_spacing(12);
+    content.append(body);
+
+    let button_row = GtkBox::new(Orientation::Horizontal, 8);
+    button_row.set_halign(Align::End);
+    for button in buttons {
+        mark_clickable(*button);
+        button_row.append(*button);
+    }
+    content.append(&button_row);
+    window.set_child(Some(&content));
+
+    let escape = gtk::EventControllerKey::new();
+    escape.connect_key_pressed(|controller, key, _, _| {
+        if key != gtk::gdk::Key::Escape {
+            return glib::Propagation::Proceed;
+        }
+        if let Some(window) = controller.widget().and_downcast::<Window>() {
+            window.close();
+        }
+        glib::Propagation::Stop
+    });
+    window.add_controller(escape);
+    window
+}
+
+fn open_add_commit_check_rule_dialog(parent: Option<Window>, editor: Rc<CommitCheckEditor>) {
+    let cancel = Button::with_label("Cancel");
+    cancel.add_css_class(&button_css_class("secondary"));
+    let add = Button::with_label("Add Rule");
+    add.add_css_class(&button_css_class("primary"));
 
     let body = GtkBox::new(Orientation::Vertical, 8);
     body.add_css_class(&surface_css_class("workbench"));
@@ -7248,10 +7270,32 @@ fn open_add_commit_check_rule_dialog(parent: Option<Window>, editor: Rc<CommitCh
     body.append(&labeled_field("Pattern Or Hash", &value));
     body.append(&labeled_field("Repository Scope", &repository_ids));
     body.append(&error);
-    content.append(&body);
+    for entry in [&name, &priority, &value, &repository_ids] {
+        entry.set_activates_default(true);
+    }
 
-    dialog.connect_response({
-        let dialog = dialog.clone();
+    let dialog = build_modal_window(
+        parent.as_ref(),
+        "Add Commit Check Rule",
+        &body,
+        &[&cancel, &add],
+    );
+    dialog.add_css_class(&surface_css_class("workbench"));
+    dialog.add_css_class(&text_css_class("body"));
+    dialog.set_default_widget(Some(&add));
+
+    cancel.connect_clicked({
+        let dialog = dialog.downgrade();
+        move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        }
+    });
+    // The handler lives on a button inside the window, so it must not hold the
+    // window strongly.
+    add.connect_clicked({
+        let dialog = dialog.downgrade();
         let enabled = enabled.clone();
         let allow = allow.clone();
         let hash_matcher = hash_matcher.clone();
@@ -7260,12 +7304,7 @@ fn open_add_commit_check_rule_dialog(parent: Option<Window>, editor: Rc<CommitCh
         let value = value.clone();
         let repository_ids = repository_ids.clone();
         let error = error.clone();
-        move |_, response| {
-            if response != ResponseType::Accept {
-                dialog.close();
-                return;
-            }
-
+        move |_| {
             let rule_name = name.text().trim().to_string();
             if rule_name.is_empty() {
                 error.set_text("Rule needs a name.");
@@ -7326,7 +7365,9 @@ fn open_add_commit_check_rule_dialog(parent: Option<Window>, editor: Rc<CommitCh
             editor.status.set_text("Saving commit check rule...");
             match save_commit_check_rules(rules) {
                 Ok(message) => {
-                    dialog.close();
+                    if let Some(dialog) = dialog.upgrade() {
+                        dialog.close();
+                    }
                     refresh_commit_check_views_now();
                     editor
                         .status
@@ -7886,27 +7927,35 @@ fn fucina_preview_allows_confirmation(preview: &Result<FucinaPolicyCommandResult
 }
 
 fn show_fucina_apply_confirmation(workspace_root: PathBuf, action_status: Label) {
-    let dialog = Dialog::builder()
-        .title("Apply Fucina configuration?")
-        .modal(true)
-        .build();
-    dialog.add_button("Cancel", ResponseType::Cancel);
-    let apply = dialog.add_button("Apply", ResponseType::Accept);
+    let cancel = Button::with_label("Cancel");
+    let apply = Button::with_label("Apply");
     apply.add_css_class("destructive-action");
-    dialog.set_default_response(ResponseType::Cancel);
     let content = Label::new(Some(
         "The preview succeeded. Apply only the safe changes accepted by the policy engine? Unexpected remotes and unresolved backup gates will still be refused.",
     ));
     content.set_wrap(true);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
-    dialog.content_area().append(&content);
-    dialog.connect_response(move |dialog, response| {
-        dialog.close();
-        if response != ResponseType::Accept {
-            return;
+    content.set_max_width_chars(60);
+    content.set_margin_top(2);
+    content.set_margin_bottom(2);
+    let dialog = build_modal_window(
+        active_window().as_ref(),
+        "Apply Fucina configuration?",
+        &content,
+        &[&cancel, &apply],
+    );
+    dialog.set_default_widget(Some(&cancel));
+    cancel.connect_clicked({
+        let dialog = dialog.downgrade();
+        move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        }
+    });
+    let dialog_ref = dialog.downgrade();
+    apply.connect_clicked(move |_| {
+        if let Some(dialog) = dialog_ref.upgrade() {
+            dialog.close();
         }
         action_status.set_text("Applying · see Operations for details");
         let action_status = action_status.clone();
