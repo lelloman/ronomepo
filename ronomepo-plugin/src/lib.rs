@@ -3416,10 +3416,8 @@ fn update_repository_monitor_empty_state(
         return;
     }
     if is_empty {
-        list.add_css_class("repo-monitor-empty");
         list.set_placeholder(Some(&repository_monitor_empty_placeholder(snapshot)));
     } else {
-        list.remove_css_class("repo-monitor-empty");
         list.set_placeholder(Option::<&gtk::Widget>::None);
     }
 }
@@ -3450,19 +3448,6 @@ fn sync_repository_monitor_selection(list: &ListBox, selected_repo_ids: &[String
             .is_some_and(|id| selected_repo_ids.iter().any(|selected| selected == &id))
         {
             list.select_row(Some(&row));
-        }
-        index += 1;
-    }
-    sync_selection_css(list);
-}
-
-fn sync_selection_css(list: &ListBox) {
-    let mut index = 0;
-    while let Some(row) = list.row_at_index(index) {
-        if row.is_selected() {
-            row.add_css_class("repo-selected");
-        } else {
-            row.remove_css_class("repo-selected");
         }
         index += 1;
     }
@@ -5614,7 +5599,6 @@ fn update_repo_context_selection(list: &ListBox, row: &ListBoxRow) {
         list.unselect_all();
         list.select_row(Some(row));
     }
-    sync_selection_css(list);
     update_selected_repo_ids(selection_ids_from_list(list));
 }
 
@@ -6658,7 +6642,6 @@ fn create_repo_monitor_view(
                     list_ref.select_row(Some(&row));
                 }
             }
-            sync_selection_css(&list_ref);
             update_selected_repo_ids(selection_ids_from_list(&list_ref));
         });
         list.add_controller(click);
