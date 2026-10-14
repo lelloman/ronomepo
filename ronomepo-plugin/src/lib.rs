@@ -1,5 +1,4 @@
 mod diag;
-mod ui;
 
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
@@ -34,6 +33,7 @@ use gtk::{
     Orientation, Paned, PolicyType, Popover, PositionType, ScrolledWindow, SelectionMode,
     SortListModel, SorterChange, Stack, TextBuffer, TextView, ToggleButton, Window, WrapMode,
 };
+use maruzzella_sdk::ui;
 use maruzzella_sdk::{
     attach_text_tooltip, export_plugin, input_css_class, CommandSpec, HostApi, MzLogLevel,
     MzStatusCode, MzToolbarDisplayMode, MzViewOpenDisposition, MzViewPlacement,
@@ -2316,7 +2316,7 @@ fn present_operation_failure_dialog(operation: &'static str, failures: &[Operati
     };
     let title = Label::new(Some(&title_text));
     title.set_xalign(0.0);
-    title.add_css_class("ronomepo-section-title");
+    title.add_css_class(ui::class::HEADING);
     title.set_wrap(true);
     header.append(&icon);
     header.append(&title);
@@ -2334,7 +2334,7 @@ fn present_operation_failure_dialog(operation: &'static str, failures: &[Operati
         message.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         message.set_selectable(true);
         message.add_css_class("mono");
-        message.add_css_class("ronomepo-meta");
+        message.add_css_class(ui::class::META);
         ui::list_card_item(&messages, &message);
     }
     let scroller = ScrolledWindow::new();
@@ -3593,7 +3593,7 @@ fn build_repo_monitor_row(
 ) -> GtkBox {
     let item = &row.item;
     let content = ui::hbox(12);
-    content.add_css_class("ronomepo-tree-row");
+    content.add_css_class(ui::class::LIST_ROW);
     mark_clickable(&content);
     content.set_widget_name(&item.id);
     content.set_tooltip_text(Some(&format!(
@@ -3612,8 +3612,8 @@ fn build_repo_monitor_row(
         }
         MonitorViewMode::Git => {
             let branch = monitor_cell(branch_label(item), Some(MONITOR_BRANCH_COL_WIDTH));
-            branch.add_css_class("ronomepo-fg-muted");
-            branch.add_css_class("ronomepo-meta");
+            ui::set_fg_tone(&branch, ui::Tone::Muted);
+            branch.add_css_class(ui::class::META);
             content.append(&branch);
             content.append(&monitor_state_cell(&item.status.state));
             content.append(&monitor_sync_cell(&item.status.sync));
@@ -3629,8 +3629,8 @@ fn build_repo_monitor_row(
             content.append(&monitor_enabled_cell(row.enabled));
             let remote = monitor_cell(&item.remote_url, None);
             remote.add_css_class("mono");
-            remote.add_css_class("ronomepo-meta");
-            remote.add_css_class("ronomepo-fg-muted");
+            remote.add_css_class(ui::class::META);
+            ui::set_fg_tone(&remote, ui::Tone::Muted);
             content.append(&remote);
         }
     }
@@ -3655,11 +3655,11 @@ fn build_repo_monitor_list_row(
 /// Project tool window.
 fn append_monitor_name_cell(row: &GtkBox, item: &RepositoryListItem, show_branch: bool) {
     let name = monitor_cell(&item.name, None);
-    name.add_css_class("ronomepo-row-name");
     if item.id == MONOREPO_ROW_ID {
-        name.add_css_class("ronomepo-strong");
-    } else if let Some(class) = repo_name_vcs_class(&item.status.state) {
-        name.add_css_class(class);
+        ui::set_fg_tone(&name, ui::Tone::Strong);
+        name.add_css_class(ui::class::STRONG);
+    } else {
+        ui::set_fg_tone(&name, repo_name_tone(&item.status));
     }
     if !show_branch || item.id == MONOREPO_ROW_ID {
         row.append(&name);
@@ -3673,8 +3673,8 @@ fn append_monitor_name_cell(row: &GtkBox, item: &RepositoryListItem, show_branch
     cell.set_hexpand(true);
     cell.set_size_request(96, -1);
     let branch = monitor_cell(branch_label(item), None);
-    branch.add_css_class("ronomepo-fg-muted");
-    branch.add_css_class("ronomepo-meta");
+    ui::set_fg_tone(&branch, ui::Tone::Muted);
+    branch.add_css_class(ui::class::META);
     branch.set_size_request(24, -1);
     cell.append(&name);
     cell.append(&branch);
@@ -5488,7 +5488,7 @@ fn build_repo_context_menu(
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> Popover {
     let popover = Popover::new();
-    popover.add_css_class("ronomepo-popup");
+    popover.add_css_class(ui::class::POPUP);
     popover.set_autohide(true);
     popover.set_has_arrow(false);
     popover.set_position(PositionType::Bottom);
@@ -5566,7 +5566,7 @@ fn update_repo_context_selection(list: &ListBox, row: &ListBoxRow) {
 
 fn populate_repo_context_menu(popover: &Popover, host_ptr: *const maruzzella_sdk::ffi::MzHostApi) {
     let menu = GtkBox::new(Orientation::Vertical, 0);
-    menu.add_css_class("ronomepo-menu");
+    menu.add_css_class(ui::class::MENU);
     menu.set_size_request(160, -1);
 
     let selection = selected_repository_items_from_state();
@@ -5605,7 +5605,7 @@ fn populate_repo_context_menu(popover: &Popover, host_ptr: *const maruzzella_sdk
     if !has_section {
         let empty = Label::new(Some("No actions available for this selection."));
         empty.set_xalign(0.0);
-        empty.add_css_class("ronomepo-fg-muted");
+        ui::set_fg_tone(&empty, ui::Tone::Muted);
         empty.set_margin_top(6);
         empty.set_margin_bottom(6);
         empty.set_margin_start(8);
@@ -5792,16 +5792,16 @@ fn append_context_submenu(
 
     let chevron = Image::from_icon_name("pan-end-symbolic");
     chevron.set_halign(Align::End);
-    chevron.add_css_class("ronomepo-menu-chevron");
+    chevron.add_css_class(ui::class::MENU_CHEVRON);
 
     row.append(&label);
     row.append(&chevron);
     header.set_child(Some(&row));
 
-    submenu.add_css_class("ronomepo-menu");
+    submenu.add_css_class(ui::class::MENU);
     submenu.set_size_request(180, -1);
     let submenu_popover = Popover::new();
-    submenu_popover.add_css_class("ronomepo-popup");
+    submenu_popover.add_css_class(ui::class::POPUP);
     submenu_popover.set_autohide(true);
     submenu_popover.set_has_arrow(false);
     submenu_popover.set_position(PositionType::Right);
@@ -6355,7 +6355,6 @@ fn create_repo_monitor_view(
     }
 
     let host = remember_host_ptr(host);
-    ui::install_stylesheet();
 
     let content = GtkBox::new(Orientation::Vertical, 0);
     content.set_hexpand(true);
@@ -6370,11 +6369,7 @@ fn create_repo_monitor_view(
     let mut sort_dropdowns = Vec::new();
 
     // Tool window header: title, view tabs and the sort controls.
-    let header = ui::hbox(0);
-    header.add_css_class("ronomepo-toolwindow-header");
-    let title = Label::new(Some("Repositories"));
-    title.add_css_class("ronomepo-toolwindow-title");
-    header.append(&title);
+    let header = ui::tool_window_header("Repositories", 0);
 
     let mut first_view_button: Option<ToggleButton> = None;
     let mut view_buttons = Vec::new();
@@ -6431,8 +6426,7 @@ fn create_repo_monitor_view(
             .map(|mode| monitor_sort_mode_label(*mode))
             .collect::<Vec<_>>();
         let dropdown = clickable_dropdown_from_strings(&labels);
-        dropdown.add_css_class("ronomepo-dropdown");
-        dropdown.set_valign(Align::Center);
+        ui::style_dropdown(&dropdown);
         let active_sort = initial_snapshot.monitor_settings.view(*view).sort;
         dropdown.set_selected(monitor_sort_mode_index(*view, active_sort));
         dropdown.set_tooltip_text(Some("Sort repositories by the selected criterion"));
@@ -6513,7 +6507,7 @@ fn create_repo_monitor_view(
     }
 
     let filter_bar = ui::hbox(0);
-    filter_bar.add_css_class("ronomepo-filter-bar");
+    filter_bar.add_css_class(ui::class::FILTER_BAR);
     filter_bar.append(&filter_stack);
 
     let store = gio::ListStore::new::<BoxedAnyObject>();
@@ -6540,7 +6534,7 @@ fn create_repo_monitor_view(
     let sort_model = SortListModel::new(Some(filter_model.clone()), Some(sorter.clone()));
 
     let list = ListBox::new();
-    list.add_css_class("ronomepo-tree");
+    list.add_css_class(ui::class::LIST);
     mark_clickable_list_rows(&list);
     list.set_hexpand(true);
     list.set_valign(Align::Start);
@@ -6665,7 +6659,7 @@ fn create_repo_monitor_view(
 
 fn repo_monitor_header_for_view(view: MonitorViewMode) -> GtkBox {
     let header = ui::hbox(12);
-    header.add_css_class("ronomepo-table-header");
+    header.add_css_class(ui::class::LIST_HEADER);
 
     let mut labels = vec![monitor_cell("Name", None)];
     match view {
@@ -6720,7 +6714,7 @@ fn monitor_cell(text: &str, width: Option<i32>) -> Label {
 /// A monitor cell whose text is colored by `tone`.
 fn monitor_tone_cell(text: &str, tone: ui::Tone, width: i32, tooltip: Option<String>) -> Label {
     let label = monitor_cell(text, Some(width));
-    label.add_css_class("ronomepo-meta");
+    label.add_css_class(ui::class::META);
     ui::set_fg_tone(&label, tone);
     if let Some(tooltip) = tooltip {
         attach_text_tooltip(&label, tooltip);
@@ -6984,8 +6978,8 @@ fn monitor_attention_cell(signals: &[AttentionSignal]) -> GtkBox {
         ui::badge(text, ui::Tone::Danger)
     } else {
         let label = Label::new(Some(text));
-        label.add_css_class("ronomepo-fg-muted");
-        label.add_css_class("ronomepo-meta");
+        ui::set_fg_tone(&label, ui::Tone::Muted);
+        label.add_css_class(ui::class::META);
         label
     };
     attach_text_tooltip(&label, attention_monitor_tooltip(signals));
@@ -7022,7 +7016,7 @@ fn append_attention_signals_section(
     let list = ui::lines_card();
     for signal in &signals {
         let row = ui::hbox(8);
-        row.add_css_class("ronomepo-line");
+        row.add_css_class(ui::class::LINE);
         let icon = ui::severity_icon(attention_severity(signal.level));
         icon.set_valign(Align::Center);
         icon.set_margin_top(0);
@@ -7030,7 +7024,7 @@ fn append_attention_signals_section(
         let summary = Label::new(Some(&signal.summary));
         summary.set_xalign(0.0);
         summary.set_ellipsize(EllipsizeMode::End);
-        summary.add_css_class("ronomepo-fg-strong");
+        ui::set_fg_tone(&summary, ui::Tone::Strong);
         row.append(&summary);
         let meta = ui::ellipsized(
             &format!(
@@ -7041,7 +7035,7 @@ fn append_attention_signals_section(
                 attention_source_label(signal.source),
                 attention_urgency_label(signal.urgency),
             ),
-            &["ronomepo-fg-muted", "ronomepo-meta"],
+            &[&ui::Tone::Muted.fg_class(), ui::class::META],
         );
         meta.set_hexpand(true);
         row.append(&meta);
@@ -7364,14 +7358,14 @@ fn state_tone(state: &ronomepo_core::RepositoryState) -> ui::Tone {
     }
 }
 
-/// The CSS class coloring a repository name by its working tree state.
-fn repo_name_vcs_class(state: &ronomepo_core::RepositoryState) -> Option<&'static str> {
-    match state {
-        ronomepo_core::RepositoryState::Clean => None,
-        ronomepo_core::RepositoryState::Dirty => Some("ronomepo-vcs-modified"),
-        ronomepo_core::RepositoryState::Untracked => Some("ronomepo-vcs-unversioned"),
-        ronomepo_core::RepositoryState::Missing => Some("ronomepo-vcs-missing"),
-        ronomepo_core::RepositoryState::Unknown => Some("ronomepo-vcs-unknown"),
+/// The tone coloring a repository name by its working tree state.
+fn repo_name_tone(status: &RepositoryStatus) -> ui::Tone {
+    match status.state {
+        ronomepo_core::RepositoryState::Clean => ui::Tone::Strong,
+        ronomepo_core::RepositoryState::Dirty => ui::Tone::Accent,
+        ronomepo_core::RepositoryState::Untracked => ui::Tone::Danger,
+        ronomepo_core::RepositoryState::Missing => ui::Tone::Muted,
+        ronomepo_core::RepositoryState::Unknown => ui::Tone::Neutral,
     }
 }
 
@@ -7421,7 +7415,6 @@ fn create_monorepo_overview_view(
     }
 
     let host = remember_host_ptr(host);
-    ui::install_stylesheet();
 
     let root = padded_view_root(20, 24);
     root.set_vexpand(true);
@@ -7487,7 +7480,6 @@ fn create_commit_check_view(
     }
 
     remember_host_ptr(host);
-    ui::install_stylesheet();
 
     let root = padded_view_root(18, 24);
 
@@ -7707,8 +7699,8 @@ fn build_commit_check_view(root: &GtkBox, initial: &StateSnapshot) -> Rc<CommitC
     let rule_status = Label::new(None);
     rule_status.set_xalign(0.0);
     rule_status.set_wrap(true);
-    rule_status.add_css_class("ronomepo-fg-muted");
-    rule_status.add_css_class("ronomepo-meta");
+    ui::set_fg_tone(&rule_status, ui::Tone::Muted);
+    rule_status.add_css_class(ui::class::META);
 
     let editor = Rc::new(CommitCheckEditor {
         rules_box: ui::vbox(8),
@@ -7868,7 +7860,7 @@ fn append_commit_check_rule_row(
     rule: Option<&CommitCheckRule>,
 ) {
     let row = ui::vbox(8);
-    row.add_css_class("ronomepo-card");
+    row.add_css_class(ui::class::CARD);
 
     let enabled = clickable_check_button_with_label("Enabled");
     enabled.set_active(rule.map(|rule| rule.enabled).unwrap_or(true));
@@ -8053,7 +8045,7 @@ fn open_add_commit_check_rule_dialog(parent: Option<Window>, editor: Rc<CommitCh
     let error = Label::new(None);
     error.set_xalign(0.0);
     error.set_wrap(true);
-    error.add_css_class("ronomepo-fg-danger");
+    ui::set_fg_tone(&error, ui::Tone::Danger);
 
     body.append(&toggles);
     body.append(&labeled_field("Name", &name));
@@ -8312,7 +8304,6 @@ fn create_repo_overview_view(
     }
 
     let host = remember_host_ptr(host);
-    ui::install_stylesheet();
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
@@ -8413,7 +8404,6 @@ fn create_workspace_settings_view(
     }
 
     remember_host_ptr(host);
-    ui::install_stylesheet();
 
     let root = padded_view_root(16, 24);
 
@@ -8592,7 +8582,7 @@ fn fucina_repository_row(
     details.set_hexpand(true);
     let title = ui::hbox(6);
     let name = Label::new(Some(&repository.name));
-    name.add_css_class("ronomepo-section-title");
+    name.add_css_class(ui::class::HEADING);
     title.append(&name);
     title.append(&ui::badge(&repository.role, ui::Tone::Neutral));
     title.append(&ui::badge(&repository.publication, ui::Tone::Neutral));
@@ -8613,8 +8603,8 @@ fn fucina_repository_row(
         let key = Label::new(Some(kind));
         key.set_xalign(0.0);
         key.set_size_request(84, -1);
-        key.add_css_class("ronomepo-kv-key");
-        key.add_css_class("ronomepo-meta");
+        key.add_css_class(ui::class::KV_KEY);
+        key.add_css_class(ui::class::META);
         let value = Label::new(Some(&url));
         value.set_xalign(0.0);
         value.set_hexpand(true);
@@ -8624,7 +8614,7 @@ fn fucina_repository_row(
         if mono {
             value.add_css_class("mono");
         }
-        value.add_css_class("ronomepo-meta");
+        value.add_css_class(ui::class::META);
         ui::set_fg_tone(&value, tone);
         line.append(&key);
         line.append(&value);
@@ -8890,7 +8880,7 @@ fn labeled_field(label: &str, widget: &impl IsA<gtk::Widget>) -> GtkBox {
     let row = ui::vbox(4);
     let title = Label::new(Some(label));
     title.set_xalign(0.0);
-    title.add_css_class("ronomepo-kv-key");
+    title.add_css_class(ui::class::KV_KEY);
     row.append(&title);
     row.append(widget);
     row
@@ -9526,7 +9516,7 @@ fn reload_capability_registry() {
 /// An underline tab bar switching `stack` between its `(name, title)` pages.
 fn stack_tab_bar(stack: &Stack, pages: &[(&'static str, &'static str)]) -> GtkBox {
     let bar = ui::hbox(0);
-    bar.add_css_class("ronomepo-tab-bar");
+    bar.add_css_class(ui::class::TAB_BAR);
     let mut tabs: Vec<(&'static str, ToggleButton)> = Vec::new();
     for (name, title) in pages {
         let tab = ui::tab_button(title);
@@ -9981,7 +9971,7 @@ fn repo_overview_context(
     let meta_row = ui::hbox(12);
     let path = ui::ellipsized(
         &item.status.repo_path.display().to_string(),
-        &["mono", "ronomepo-meta", "ronomepo-fg-muted"],
+        &["mono", ui::class::META, &ui::Tone::Muted.fg_class()],
     );
     path.set_hexpand(false);
     path.set_ellipsize(EllipsizeMode::Start);
@@ -9992,7 +9982,7 @@ fn repo_overview_context(
         "{sync_arrows}  {}",
         sync_description(&item.status.sync)
     )));
-    sync.add_css_class("ronomepo-meta");
+    sync.add_css_class(ui::class::META);
     ui::set_fg_tone(&sync, sync_tone);
     meta_row.append(&branch);
     meta_row.append(&sync);
@@ -10023,10 +10013,10 @@ fn repo_overview_attention_section(signals: &[AttentionSignal]) -> GtkBox {
     if signals.is_empty() {
         let empty = ui::hbox(8);
         let icon = Image::from_icon_name("object-select-symbolic");
-        icon.add_css_class("ronomepo-fg-success");
+        ui::set_fg_tone(&icon, ui::Tone::Success);
         empty.append(&icon);
         let label = Label::new(Some("No open attention signals."));
-        label.add_css_class("ronomepo-fg-muted");
+        ui::set_fg_tone(&label, ui::Tone::Muted);
         empty.append(&label);
         return ui::section("Needs Attention", &[count.upcast_ref()], &empty);
     }
@@ -10154,7 +10144,7 @@ fn repo_overview_lines_body(lines: &[String], empty_message: &str, mono: bool) -
         let block = ui::vbox(0);
         let empty = Label::new(Some(empty_message));
         empty.set_xalign(0.0);
-        empty.add_css_class("ronomepo-fg-muted");
+        ui::set_fg_tone(&empty, ui::Tone::Muted);
         block.append(&empty);
         return block;
     }
@@ -10165,10 +10155,10 @@ fn repo_overview_lines_body(lines: &[String], empty_message: &str, mono: bool) -
         row.set_wrap(true);
         row.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         row.set_selectable(true);
-        row.add_css_class("ronomepo-line");
+        row.add_css_class(ui::class::LINE);
         if mono {
             row.add_css_class("mono");
-            row.add_css_class("ronomepo-meta");
+            row.add_css_class(ui::class::META);
         }
         list.append(&row);
     }
@@ -10180,11 +10170,7 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
     panel.set_hexpand(true);
     panel.set_vexpand(true);
 
-    let header = ui::hbox(4);
-    header.add_css_class("ronomepo-toolwindow-header");
-    let title = Label::new(Some("Terminal"));
-    title.add_css_class("ronomepo-toolwindow-title");
-    header.append(&title);
+    let header = ui::tool_window_header("Terminal", 4);
 
     let restart = ui::icon_button("view-refresh-symbolic", "Restart terminal");
     restart.set_sensitive(false);
@@ -10240,7 +10226,7 @@ fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str
         ));
         disabled.set_xalign(0.0);
         disabled.set_wrap(true);
-        disabled.add_css_class("ronomepo-fg-muted");
+        ui::set_fg_tone(&disabled, ui::Tone::Muted);
         body.append(&disabled);
     }
 
@@ -10494,7 +10480,7 @@ fn overview_command_group(label: &str, actions: GtkBox) -> GtkBox {
     label_widget.set_xalign(0.0);
     label_widget.set_valign(Align::Center);
     label_widget.set_size_request(80, -1);
-    label_widget.add_css_class("ronomepo-kv-key");
+    label_widget.add_css_class(ui::class::KV_KEY);
     group.append(&label_widget);
 
     actions.set_hexpand(true);
@@ -10594,7 +10580,7 @@ fn overview_repo_row(
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> GtkBox {
     let row = ui::hbox(12);
-    row.add_css_class("ronomepo-tree-row");
+    row.add_css_class(ui::class::LIST_ROW);
     row.set_tooltip_text(Some(&format!(
         "{}\n{}",
         item.status.repo_path.display(),
@@ -10602,12 +10588,9 @@ fn overview_repo_row(
     )));
 
     let name = monitor_cell(&item.name, None);
-    name.add_css_class("ronomepo-row-name");
-    if let Some(class) = repo_name_vcs_class(&item.status.state) {
-        name.add_css_class(class);
-    }
+    ui::set_fg_tone(&name, repo_name_tone(&item.status));
     let branch = monitor_cell(branch_label(item), Some(MONITOR_BRANCH_COL_WIDTH));
-    branch.add_css_class("ronomepo-fg-muted");
+    ui::set_fg_tone(&branch, ui::Tone::Muted);
 
     row.append(&name);
     row.append(&branch);
@@ -10626,7 +10609,7 @@ const OVERVIEW_ROW_ACTIONS_WIDTH: i32 = 96;
 
 fn overview_repo_header() -> GtkBox {
     let header = ui::hbox(12);
-    header.add_css_class("ronomepo-table-header");
+    header.add_css_class(ui::class::LIST_HEADER);
     header.append(&monitor_cell("Name", None));
     header.append(&monitor_cell("Branch", Some(MONITOR_BRANCH_COL_WIDTH)));
     header.append(&monitor_cell("Status", Some(MONITOR_STATE_COL_WIDTH)));
@@ -10912,7 +10895,7 @@ fn append_repo_group_section(
     if items.is_empty() {
         let empty_label = Label::new(Some("Nothing to show."));
         empty_label.set_xalign(0.0);
-        empty_label.add_css_class("ronomepo-fg-muted");
+        ui::set_fg_tone(&empty_label, ui::Tone::Muted);
         block.append(&empty_label);
     } else {
         let take = limit.unwrap_or(items.len());
@@ -10928,7 +10911,7 @@ fn append_repo_group_section(
                 items.len() - take
             )));
             more_label.set_xalign(0.0);
-            more_label.add_css_class("ronomepo-fg-muted");
+            ui::set_fg_tone(&more_label, ui::Tone::Muted);
             block.append(&more_label);
         }
     }
@@ -11193,7 +11176,6 @@ fn create_repo_manifest_editor_view(
     }
 
     let host = remember_host_ptr(host);
-    ui::install_stylesheet();
 
     let repo_id = unsafe { request.as_ref() }
         .and_then(|request| decode_mzstr(request.instance_key))
@@ -11266,7 +11248,7 @@ fn render_repo_manifest_editor_into(
     let title = ui::page_title(&format!("{} Manifest", item.name));
     let subtitle = ui::ellipsized(
         &format!("Editing {}", manifest_path.display()),
-        &["mono", "ronomepo-meta", "ronomepo-fg-muted"],
+        &["mono", ui::class::META, &ui::Tone::Muted.fg_class()],
     );
 
     let preserved_repo_actions = Rc::new(manifest.repo_actions.clone());
@@ -11303,14 +11285,14 @@ fn render_repo_manifest_editor_into(
     ));
     status.set_xalign(0.0);
     status.set_wrap(true);
-    status.add_css_class("ronomepo-fg-muted");
-    status.add_css_class("ronomepo-meta");
+    ui::set_fg_tone(&status, ui::Tone::Muted);
+    status.add_css_class(ui::class::META);
 
     let preview_buffer = TextBuffer::new(None);
     let preview_text = TextView::with_buffer(&preview_buffer);
     preview_text.set_monospace(true);
     preview_text.set_editable(false);
-    preview_text.add_css_class("ronomepo-editor");
+    preview_text.add_css_class(ui::class::EDITOR);
     preview_text.set_top_margin(8);
     preview_text.set_bottom_margin(8);
     preview_text.set_left_margin(12);
@@ -11498,7 +11480,7 @@ fn append_repo_manifest_item_row(
     item: Option<&ronomepo_core::RepoItem>,
 ) {
     let row = ui::hbox(8);
-    row.add_css_class("ronomepo-card");
+    row.add_css_class(ui::class::CARD);
     let id = Entry::new();
     id.set_placeholder_text(Some("id"));
     id.set_width_chars(16);
@@ -11548,7 +11530,7 @@ fn append_repo_manifest_action_row(
     action: Option<&ronomepo_core::RepoActionDefinition>,
 ) {
     let row = ui::hbox(8);
-    row.add_css_class("ronomepo-card");
+    row.add_css_class(ui::class::CARD);
     let id = Entry::new();
     id.set_placeholder_text(Some("id"));
     id.set_width_chars(20);
@@ -11617,7 +11599,7 @@ fn append_repo_manifest_capability_row(
     capability: Option<&ronomepo_core::RepoCapabilityDeclaration>,
 ) {
     let row = ui::vbox(6);
-    row.add_css_class("ronomepo-card");
+    row.add_css_class(ui::class::CARD);
     let top = ui::hbox(8);
     let bottom = ui::hbox(8);
     let id = Entry::new();
@@ -12010,7 +11992,6 @@ fn create_text_editor_view(
     }
 
     let host = remember_host_ptr(host);
-    ui::install_stylesheet();
 
     let root = padded_view_root(12, 16);
 
@@ -12052,8 +12033,8 @@ fn create_text_editor_view(
 
     let status = Label::new(Some("Open a text file from the workspace."));
     status.set_xalign(0.0);
-    status.add_css_class("ronomepo-fg-muted");
-    status.add_css_class("ronomepo-meta");
+    ui::set_fg_tone(&status, ui::Tone::Muted);
+    status.add_css_class(ui::class::META);
     status.set_wrap(true);
 
     let buffer = TextBuffer::new(None);
@@ -12071,7 +12052,7 @@ fn create_text_editor_view(
     text.set_monospace(true);
     text.set_wrap_mode(WrapMode::WordChar);
     text.set_vexpand(true);
-    text.add_css_class("ronomepo-editor");
+    text.add_css_class(ui::class::EDITOR);
     text.set_top_margin(8);
     text.set_bottom_margin(8);
     text.set_left_margin(12);
@@ -12380,7 +12361,6 @@ fn create_operations_view(
     }
 
     let host = remember_host_ptr(host);
-    ui::install_stylesheet();
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
@@ -12392,11 +12372,7 @@ fn create_operations_view(
     };
 
     // Run tool window style header: title, live counters, then actions.
-    let header = ui::hbox(12);
-    header.add_css_class("ronomepo-toolwindow-header");
-    let title = Label::new(Some("Operations"));
-    title.add_css_class("ronomepo-toolwindow-title");
-    header.append(&title);
+    let header = ui::tool_window_header("Operations", 12);
     let stats = ui::hbox(12);
     let mut stat_values = Vec::new();
     for caption in ["started", "ok", "skipped", "failed"] {
@@ -12409,7 +12385,7 @@ fn create_operations_view(
     latest.set_xalign(0.0);
     latest.set_hexpand(true);
     latest.set_ellipsize(EllipsizeMode::End);
-    latest.add_css_class("ronomepo-meta");
+    latest.add_css_class(ui::class::META);
     header.append(&latest);
     let [started, ok, skipped, failed]: [Label; 4] = stat_values
         .try_into()
@@ -12475,7 +12451,7 @@ fn create_operations_view(
     text.set_cursor_visible(false);
     text.set_monospace(true);
     text.set_wrap_mode(WrapMode::WordChar);
-    text.add_css_class("ronomepo-console");
+    text.add_css_class(ui::class::CONSOLE);
     text.set_top_margin(8);
     text.set_bottom_margin(8);
     text.set_left_margin(12);
