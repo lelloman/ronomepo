@@ -288,10 +288,11 @@ fn main() {
     product.layout.bottom_panel_layout = BottomPanelLayout::CenterOnly;
     product.layout.left_panel_resize = PanelResizePolicy::CappedProportional { max_factor: 1.5 };
     product.layout.bottom_panel_resize = PanelResizePolicy::CappedProportional { max_factor: 1.5 };
-    product.layout.left_panel = TabGroupSpec::new(
-        "panel-left",
-        Some("repositories"),
-        vec![plugin_tab(
+    // The panels keep the default product's appearances; only their content
+    // changes.
+    product.layout.left_panel = TabGroupSpec {
+        active_tab_id: Some("repositories".to_string()),
+        tabs: vec![plugin_tab(
             "repositories",
             "panel-left",
             "Repositories",
@@ -299,21 +300,12 @@ fn main() {
             "The Ronomepo repository monitor could not be created.",
             false,
         )],
-    )
-    .with_tab_strip_hidden()
-    .with_panel_appearance("primary")
-    .with_panel_header_appearance("secondary")
-    .with_tab_strip_appearance("utility")
-    .with_text_appearance("body");
-    product.layout.right_panel = TabGroupSpec::new("panel-right", None, Vec::new())
-        .with_panel_appearance("secondary")
-        .with_panel_header_appearance("secondary")
-        .with_tab_strip_appearance("utility")
-        .with_text_appearance("body");
-    product.layout.bottom_panel = TabGroupSpec::new(
-        "panel-bottom",
-        Some("operations"),
-        vec![plugin_tab(
+        ..product.layout.left_panel
+    }
+    .with_tab_strip_hidden();
+    product.layout.bottom_panel = TabGroupSpec {
+        active_tab_id: Some("operations".to_string()),
+        tabs: vec![plugin_tab(
             "operations",
             "panel-bottom",
             "Operations",
@@ -321,12 +313,9 @@ fn main() {
             "The Ronomepo operations view could not be created.",
             false,
         )],
-    )
-    .with_tab_strip_hidden()
-    .with_panel_appearance("console")
-    .with_panel_header_appearance("secondary")
-    .with_tab_strip_appearance("console")
-    .with_text_appearance("code");
+        ..product.layout.bottom_panel
+    }
+    .with_tab_strip_hidden();
     product.layout.workbench = WorkbenchNodeSpec::Group(
         TabGroupSpec::new(
             "workbench-main",
@@ -351,9 +340,7 @@ fn main() {
             ],
         )
         .with_panel_appearance("workbench")
-        .with_panel_header_appearance("secondary")
-        .with_tab_strip_appearance("editor")
-        .with_text_appearance("body"),
+        .with_tab_strip_appearance("editor"),
     );
 
     let config = MaruzzellaConfig::new("com.lelloman.ronomepo")
