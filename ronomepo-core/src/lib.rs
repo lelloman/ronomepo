@@ -3210,7 +3210,30 @@ pub fn run_workspace_operation<F>(
     }
 
     if matches!(kind, OperationKind::Push) {
-        let flagged = generated_history_matches(manifest, selected_repo_ids, 25);
+        let report = push_preflight_report(manifest, selected_repo_ids);
+        if !report.invalid_rules.is_empty() {
+            // There is no warning event kind; a Started event is logged
+            // without counting as an outcome.
+            emit(OperationEvent {
+                kind: OperationEventKind::Started,
+                repository_id: None,
+                repository_name: None,
+                message: format!(
+                    "Warning: ignoring invalid commit check rules: {}.",
+                    report
+                        .invalid_rules
+                        .iter()
+                        .map(|rule| format!("{} ({})", rule.rule_name, rule.message))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            });
+        }
+        let flagged = report
+            .matches
+            .into_iter()
+            .map(|entry| entry.repository_name)
+            .collect::<BTreeSet<_>>();
         if !flagged.is_empty() {
             emit(OperationEvent {
                 kind: OperationEventKind::Failed,
@@ -3218,7 +3241,7 @@ pub fn run_workspace_operation<F>(
                 repository_name: None,
                 message: format!(
                     "Push aborted because commit check rules blocked commits in: {}. Use force push to override.",
-                    flagged.join(", ")
+                    flagged.into_iter().collect::<Vec<_>>().join(", ")
                 ),
             });
             emit(OperationEvent {
@@ -3296,12 +3319,60 @@ pub fn collect_commit_check_report(
     selected_repo_ids: &[String],
     num_commits: usize,
 ) -> CommitCheckReport {
+    commit_check_report(
+        manifest,
+        selected_repo_ids,
+        true,
+        CommitScanRange::Recent(num_commits),
+    )
+}
+
+/// The push preflight only looks at what a push would publish, and at the
+/// workspace root only when the root is pushed too (no explicit selection).
+fn push_preflight_report(
+    manifest: &WorkspaceManifest,
+    selected_repo_ids: &[String],
+) -> CommitCheckReport {
+    commit_check_report(
+        manifest,
+        selected_repo_ids,
+        selected_repo_ids.is_empty(),
+        CommitScanRange::Unpushed {
+            fallback: PUSH_PREFLIGHT_FALLBACK_COMMITS,
+        },
+    )
+}
+
+/// Commits checked for a branch without an upstream, where the unpushed
+/// range cannot be computed.
+const PUSH_PREFLIGHT_FALLBACK_COMMITS: usize = 25;
+
+/// Which commits of a repository the commit check scans.
+#[derive(Clone, Copy, Debug)]
+enum CommitScanRange {
+    /// The most recent commits of HEAD.
+    Recent(usize),
+    /// `@{upstream}..HEAD`, or the most recent `fallback` commits when the
+    /// branch has no upstream.
+    Unpushed { fallback: usize },
+}
+
+fn commit_check_report(
+    manifest: &WorkspaceManifest,
+    selected_repo_ids: &[String],
+    include_workspace_root: bool,
+    range: CommitScanRange,
+) -> CommitCheckReport {
     let rules = manifest
         .commit_check_rules
         .clone()
         .unwrap_or_else(default_commit_check_rules);
     let compiled_rules = compile_commit_check_rules(&rules);
-    let mut commits = collect_repo_recent_commits(&manifest.root, None, "(monorepo)", num_commits);
+    let mut commits = if include_workspace_root {
+        collect_repo_recent_commits(&manifest.root, None, "(monorepo)", range)
+    } else {
+        Vec::new()
+    };
 
     for repo in manifest
         .repos
@@ -3319,7 +3390,7 @@ pub fn collect_commit_check_report(
             &repo_path,
             Some(&repo.id),
             &repo.name,
-            num_commits,
+            range,
         ));
     }
 
@@ -3669,18 +3740,6 @@ fn operation_kind_label(kind: OperationKind) -> &'static str {
     }
 }
 
-fn generated_history_matches(
-    manifest: &WorkspaceManifest,
-    selected_repo_ids: &[String],
-    num_commits: usize,
-) -> Vec<String> {
-    collect_commit_check_report(manifest, selected_repo_ids, num_commits)
-        .matches
-        .into_iter()
-        .map(|entry| entry.repository_name)
-        .collect()
-}
-
 #[cfg(test)]
 fn repo_history_has_generated_markers(repo_path: &Path, num_commits: usize) -> bool {
     let manifest = WorkspaceManifest {
@@ -3779,22 +3838,34 @@ fn collect_repo_recent_commits(
     repo_path: &Path,
     repository_id: Option<&str>,
     repository_name: &str,
-    num_commits: usize,
+    range: CommitScanRange,
 ) -> Vec<RecentCommit> {
-    let limit = num_commits.to_string();
     // NUL separates fields and RS separates commits, so no subject or body
     // text can be mistaken for structure. Signature output would otherwise be
     // mixed into the log when log.showSignature is configured.
-    let Some(output) = git_stdout(
-        repo_path,
-        [
-            "log",
-            "--no-show-signature",
-            "-n",
-            &limit,
-            "--format=%H%x00%s%x00%b%x1e",
-        ],
-    ) else {
+    let mut command = read_only_git(repo_path);
+    command.args(["log", "--no-show-signature", "--format=%H%x00%s%x00%b%x1e"]);
+    match range {
+        CommitScanRange::Recent(limit) => {
+            command.arg("-n").arg(limit.to_string());
+        }
+        CommitScanRange::Unpushed { fallback } => {
+            let has_upstream = git_stdout(repo_path, ["rev-parse", "--abbrev-ref", "@{upstream}"])
+                .is_some_and(|upstream| !upstream.is_empty());
+            if has_upstream {
+                command.arg("@{upstream}..HEAD");
+            } else {
+                command.arg("-n").arg(fallback.to_string());
+            }
+        }
+    }
+    let Some(output) = command
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    else {
         return Vec::new();
     };
 
@@ -5391,7 +5462,8 @@ mod tests {
             ],
         );
 
-        let commits = collect_repo_recent_commits(&repo_path, None, "repo", 25);
+        let commits =
+            collect_repo_recent_commits(&repo_path, None, "repo", CommitScanRange::Recent(25));
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].subject, "fix a|b parsing");
         assert_eq!(commits[0].head_offset, 0);
@@ -5571,6 +5643,110 @@ mod tests {
             .iter()
             .any(|event| matches!(event.kind, OperationEventKind::Failed)
                 && event.message.contains("Push aborted")));
+    }
+
+    #[test]
+    fn push_preflight_only_checks_unpushed_commits_of_pushed_repos() {
+        let workspace = temp_dir_path("push-preflight-range");
+        init_git_repo(&workspace);
+        run_git(
+            &workspace,
+            [
+                "commit",
+                "--allow-empty",
+                "-m",
+                "root bot",
+                "-m",
+                "Generated: Claude",
+            ],
+        );
+        let repo_path = workspace.join("alpha");
+        init_git_repo(&repo_path);
+        run_git(
+            &repo_path,
+            [
+                "commit",
+                "--allow-empty",
+                "-m",
+                "already pushed bot",
+                "-m",
+                "Generated: Claude",
+            ],
+        );
+        run_git(&repo_path, ["branch", "published"]);
+        run_git(&repo_path, ["branch", "--set-upstream-to=published"]);
+        run_git(&repo_path, ["commit", "--allow-empty", "-m", "clean work"]);
+
+        let mut manifest = WorkspaceManifest {
+            name: "Example".to_string(),
+            root: workspace.to_path_buf(),
+            repos: vec![RepositoryEntry {
+                id: "alpha".to_string(),
+                name: "alpha".to_string(),
+                dir_name: "alpha".to_string(),
+                remote_url: "git@example.com:alpha.git".to_string(),
+                enabled: true,
+            }],
+            shared_hooks_path: None,
+            commit_check_rules: Some(default_commit_check_rules()),
+        };
+
+        // The root is not pushed for an explicit selection and alpha's only
+        // flagged commit is already on its upstream.
+        let report = push_preflight_report(&manifest, &["alpha".to_string()]);
+        assert!(report.matches.is_empty());
+
+        // Without a selection the root is pushed and checked too.
+        let report = push_preflight_report(&manifest, &[]);
+        assert_eq!(report.matches.len(), 1);
+        assert_eq!(report.matches[0].repository_name, "(monorepo)");
+
+        // An unpushed flagged commit is caught, and the abort message names
+        // each repository once even with several flagged commits.
+        for subject in ["bot one", "bot two"] {
+            run_git(
+                &repo_path,
+                [
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    subject,
+                    "-m",
+                    "Generated: Claude",
+                ],
+            );
+        }
+        manifest
+            .commit_check_rules
+            .as_mut()
+            .unwrap()
+            .push(CommitCheckRule {
+                id: "bad-regex".to_string(),
+                name: "Bad regex".to_string(),
+                enabled: true,
+                priority: 0,
+                effect: CommitCheckRuleEffect::Block,
+                scope: CommitCheckRuleScope::All,
+                matcher: CommitCheckRuleMatcher::Regex {
+                    pattern: "[".to_string(),
+                },
+            });
+        let mut events = Vec::new();
+        run_workspace_operation(
+            &manifest,
+            &["alpha".to_string()],
+            OperationKind::Push,
+            |event| events.push(event),
+        );
+        assert!(events.iter().any(|event| event
+            .message
+            .contains("invalid commit check rules: Bad regex")));
+        let aborted = events
+            .iter()
+            .find(|event| event.message.contains("Push aborted"))
+            .unwrap();
+        assert_eq!(aborted.message.matches("alpha").count(), 1);
+        assert!(!aborted.message.contains("(monorepo)"));
     }
 
     #[test]
