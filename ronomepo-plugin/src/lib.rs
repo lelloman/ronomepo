@@ -1,4 +1,5 @@
 mod diag;
+mod ui;
 
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
@@ -31,8 +32,8 @@ use gtk::{
     Align, Box as GtkBox, Button, CheckButton, CustomFilter, CustomSorter, DropDown, Entry,
     EventControllerMotion, FilterChange, GestureClick, Image, Label, ListBox, ListBoxRow,
     Orientation, Paned, PolicyType, Popover, PositionType, ScrolledWindow, SelectionMode,
-    Separator, SortListModel, SorterChange, Stack, StackSwitcher, TextBuffer, TextView,
-    ToggleButton, Window, WrapMode,
+    Separator, SortListModel, SorterChange, Stack, TextBuffer, TextView, ToggleButton, Window,
+    WrapMode,
 };
 use maruzzella_sdk::{
     attach_text_tooltip, button_css_class, export_plugin, input_css_class, surface_css_class,
@@ -95,20 +96,6 @@ fn update_clickable_cursor<W: IsA<gtk::Widget>>(widget: &W) {
     }
 }
 
-fn mark_clickable_descendant_buttons<W: IsA<gtk::Widget>>(widget: &W) {
-    let widget = widget.as_ref();
-    if let Some(button) = widget.downcast_ref::<Button>() {
-        mark_clickable(button);
-    }
-
-    let mut child = widget.first_child();
-    while let Some(child_widget) = child {
-        let next = child_widget.next_sibling();
-        mark_clickable_descendant_buttons(&child_widget);
-        child = next;
-    }
-}
-
 fn mark_clickable_list_rows(list: &ListBox) {
     let motion = EventControllerMotion::new();
     motion.connect_motion({
@@ -148,18 +135,6 @@ fn clickable_button_with_label(label: impl AsRef<str>) -> Button {
     button
 }
 
-fn clickable_toggle_button() -> ToggleButton {
-    let button = ToggleButton::new();
-    mark_clickable(&button);
-    button
-}
-
-fn clickable_toggle_button_with_label(label: impl AsRef<str>) -> ToggleButton {
-    let button = ToggleButton::with_label(label.as_ref());
-    mark_clickable(&button);
-    button
-}
-
 fn clickable_check_button_with_label(label: impl AsRef<str>) -> CheckButton {
     let button = CheckButton::with_label(label.as_ref());
     mark_clickable(&button);
@@ -181,20 +156,16 @@ const CMD_OPEN_FUCINA_POLICY: &str = "ronomepo.workspace.open_fucina_policy";
 const CMD_EXIT: &str = "ronomepo.workspace.exit";
 const CMD_REFRESH_LOGS: &str = "ronomepo.logs.refresh";
 const CMD_CLEAR_LOGS: &str = "ronomepo.logs.clear";
-const MONITOR_NAME_COL_CHARS: i32 = 28;
-const MONITOR_BRANCH_COL_CHARS: i32 = 14;
-const MONITOR_MANIFEST_COL_CHARS: i32 = 12;
-const MONITOR_STATE_COL_CHARS: i32 = 12;
-const MONITOR_CAPABILITY_COL_CHARS: i32 = 10;
-const MONITOR_ATTENTION_COL_CHARS: i32 = 12;
-const MONITOR_ACTIONS_COL_CHARS: i32 = 12;
-const MONITOR_NAME_COL_WIDTH: i32 = 300;
-const MONITOR_BRANCH_COL_WIDTH: i32 = 120;
-const MONITOR_MANIFEST_COL_WIDTH: i32 = 120;
-const MONITOR_STATE_COL_WIDTH: i32 = 120;
-const MONITOR_CAPABILITY_COL_WIDTH: i32 = 96;
-const MONITOR_ATTENTION_COL_WIDTH: i32 = 112;
-const MONITOR_ACTIONS_COL_WIDTH: i32 = 120;
+// Fixed monitor column widths in pixels; the name (and the remote, in the
+// Manifest view) column takes the remaining width.
+const MONITOR_BRANCH_COL_WIDTH: i32 = 112;
+const MONITOR_MANIFEST_COL_WIDTH: i32 = 96;
+const MONITOR_STATE_COL_WIDTH: i32 = 80;
+const MONITOR_SYNC_COL_WIDTH: i32 = 76;
+const MONITOR_CAPABILITY_COL_WIDTH: i32 = 72;
+const MONITOR_ATTENTION_COL_WIDTH: i32 = 76;
+const MONITOR_ACTIONS_COL_WIDTH: i32 = 60;
+const MONITOR_ENABLED_COL_WIDTH: i32 = 72;
 const WORKER_POOL_SIZE: usize = 4;
 const LOCAL_RESCAN_INTERVAL_SECS: u32 = 5 * 60;
 const REMOTE_FETCH_TICK_SECS: u32 = 30;
@@ -966,6 +937,16 @@ struct TextEditorState {
     dirty: bool,
 }
 
+/// The live counters in the Operations header.
+struct OperationSummaryHandle {
+    root: glib::WeakRef<GtkBox>,
+    started: Label,
+    ok: Label,
+    skipped: Label,
+    failed: Label,
+    latest: Label,
+}
+
 struct OperationFollowHandle {
     scroller: glib::WeakRef<ScrolledWindow>,
     toggle: glib::WeakRef<ToggleButton>,
@@ -981,7 +962,7 @@ thread_local! {
     static FUCINA_POLICY_VIEWS: RefCell<Vec<FucinaPolicyViewHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_BUFFERS: RefCell<Vec<OperationBufferHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_SUMMARY_CURSOR: Cell<Option<LogCursor>> = const { Cell::new(None) };
-    static OPERATION_SUMMARIES: RefCell<Vec<glib::WeakRef<Label>>> = const { RefCell::new(Vec::new()) };
+    static OPERATION_SUMMARIES: RefCell<Vec<OperationSummaryHandle>> = const { RefCell::new(Vec::new()) };
     static OPERATION_FOLLOWERS: RefCell<Vec<OperationFollowHandle>> = const { RefCell::new(Vec::new()) };
     /// Pull/Push buttons, disabled while an operation batch runs. Views keep
     /// them across refreshes, so their state is synced on every refresh.
@@ -2934,16 +2915,17 @@ fn refresh_operation_log_views(cursor: LogCursor, logs: &[String]) {
         != Some(cursor)
         || runtime_profile_enabled();
     if summary_stale {
-        let text = operation_summary_text(logs);
-        OPERATION_SUMMARIES.with(|labels| {
-            let mut labels = labels.borrow_mut();
-            labels.retain(|label_ref| match label_ref.upgrade() {
-                Some(label) => {
-                    label.set_text(&text);
-                    true
-                }
-                None => false,
-            });
+        let summary = operation_summary(logs);
+        OPERATION_SUMMARIES.with(|handles| {
+            handles
+                .borrow_mut()
+                .retain(|handle| match handle.root.upgrade() {
+                    Some(_) => {
+                        sync_operation_summary(handle, &summary);
+                        true
+                    }
+                    None => false,
+                });
         });
     }
 
@@ -3100,17 +3082,7 @@ fn schedule_scroll_to_bottom(scroller: &ScrolledWindow, suppress_scroll_events: 
 }
 
 fn operation_follow_button() -> ToggleButton {
-    let button = clickable_toggle_button();
-    button.add_css_class("toolbar-button");
-    button.add_css_class("toolbar-icon-button");
-    button.add_css_class(&button_css_class("ghost"));
-    button.set_focus_on_click(false);
-    button.set_tooltip_text(Some("Follow scroll to bottom"));
-
-    let icon = Image::from_icon_name("document-save-symbolic");
-    icon.set_icon_size(gtk::IconSize::Normal);
-    button.set_child(Some(&icon));
-    button
+    ui::icon_toggle("go-bottom-symbolic", "Follow scroll to bottom")
 }
 
 /// The host hands view factories a pointer to a temporary copy of its API that
@@ -3368,7 +3340,7 @@ struct MonitorControls {
     filter_buttons: Vec<(MonitorViewMode, MonitorFilterMode, ToggleButton)>,
     sort_dropdowns: Vec<(MonitorViewMode, DropDown)>,
     sort_direction: Rc<Cell<bool>>,
-    sort_direction_label: Label,
+    sort_direction_icon: Image,
     /// Filter, sort and column-header stacks, each with one page per view.
     stacks: [Stack; 3],
 }
@@ -3404,8 +3376,8 @@ fn sync_monitor_controls(controls: &MonitorControls, snapshot: &StateSnapshot) {
     if controls.sort_direction.get() != descending {
         controls.sort_direction.set(descending);
         controls
-            .sort_direction_label
-            .set_text(monitor_sort_direction_label(descending));
+            .sort_direction_icon
+            .set_icon_name(Some(monitor_sort_direction_icon(descending)));
     }
     controls.syncing.set(false);
 }
@@ -3430,31 +3402,21 @@ fn update_repository_monitor_empty_state(
 }
 
 fn repository_monitor_empty_placeholder(snapshot: &StateSnapshot) -> GtkBox {
-    let empty = GtkBox::new(Orientation::Vertical, 6);
-    empty.set_margin_top(18);
-    empty.set_margin_bottom(18);
-    empty.set_margin_start(12);
-    empty.set_margin_end(12);
-
-    let title = Label::new(Some(if snapshot.manifest.is_some() {
-        "No repositories match the current filter"
+    if snapshot.manifest.is_some() {
+        ui::empty_state(
+            "edit-find-symbolic",
+            "No repositories match the current filter",
+            "Try a broader search term or clear the filter to see the full workspace.",
+            None,
+        )
     } else {
-        "No workspace manifest loaded"
-    }));
-    title.set_xalign(0.0);
-    title.add_css_class("title-4");
-
-    let body = Label::new(Some(if snapshot.manifest.is_some() {
-        "Try a broader search term or clear the filter to see the full workspace."
-    } else {
-        "Ronomepo is running, but no ronomepo.json was found. Import repos.txt from the current workspace root to bootstrap the manifest."
-    }));
-    body.set_xalign(0.0);
-    body.set_wrap(true);
-
-    empty.append(&title);
-    empty.append(&body);
-    empty
+        ui::empty_state(
+            "folder-symbolic",
+            "No workspace manifest loaded",
+            "Ronomepo is running, but no ronomepo.json was found. Import repos.txt from the current workspace root to bootstrap the manifest.",
+            None,
+        )
+    }
 }
 
 fn sync_repository_monitor_selection(list: &ListBox, selected_repo_ids: &[String]) {
@@ -3635,12 +3597,9 @@ fn build_repo_monitor_row(
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> GtkBox {
     let item = &row.item;
-    let content = GtkBox::new(Orientation::Horizontal, 10);
+    let content = ui::hbox(12);
+    content.add_css_class("ronomepo-tree-row");
     mark_clickable(&content);
-    content.set_margin_top(8);
-    content.set_margin_bottom(8);
-    content.set_margin_start(10);
-    content.set_margin_end(10);
     content.set_widget_name(&item.id);
     content.set_tooltip_text(Some(&format!(
         "{}\n{}\n{}",
@@ -3657,12 +3616,9 @@ fn build_repo_monitor_row(
             content.append(&monitor_attention_cell(&row.attention_signals));
         }
         MonitorViewMode::Git => {
-            content.append(&monitor_text_cell(
-                branch_label(item),
-                MONITOR_BRANCH_COL_CHARS,
-                MONITOR_BRANCH_COL_WIDTH,
-                false,
-            ));
+            let branch = monitor_cell(branch_label(item), Some(MONITOR_BRANCH_COL_WIDTH));
+            branch.add_css_class("ronomepo-fg-muted");
+            content.append(&branch);
             content.append(&monitor_state_cell(&item.status.state));
             content.append(&monitor_sync_cell(&item.status.sync));
         }
@@ -3675,12 +3631,11 @@ fn build_repo_monitor_row(
             content.append(&monitor_manifest_cell(item.repo_manifest.as_ref()));
             content.append(&monitor_manifest_actions_cell(item));
             content.append(&monitor_enabled_cell(row.enabled));
-            content.append(&monitor_text_cell(
-                &item.remote_url,
-                MONITOR_BRANCH_COL_CHARS,
-                MONITOR_BRANCH_COL_WIDTH,
-                true,
-            ));
+            let remote = monitor_cell(&item.remote_url, None);
+            remote.add_css_class("mono");
+            remote.add_css_class("ronomepo-meta");
+            remote.add_css_class("ronomepo-fg-muted");
+            content.append(&remote);
         }
     }
     attach_repo_monitor_context_menu(&content, host_ptr);
@@ -3700,12 +3655,14 @@ fn build_repo_monitor_list_row(
 }
 
 fn append_monitor_name_cell(row: &GtkBox, item: &RepositoryListItem) {
-    row.append(&monitor_text_cell(
-        &item.name,
-        MONITOR_NAME_COL_CHARS,
-        MONITOR_NAME_COL_WIDTH,
-        false,
-    ));
+    let name = monitor_cell(&item.name, None);
+    name.add_css_class("ronomepo-row-name");
+    if item.id == MONOREPO_ROW_ID {
+        name.add_css_class("ronomepo-strong");
+    } else if let Some(class) = repo_name_vcs_class(&item.status.state) {
+        name.add_css_class(class);
+    }
+    row.append(&name);
 }
 
 fn repository_items(snapshot: &StateSnapshot) -> Vec<RepositoryListItem> {
@@ -3871,11 +3828,11 @@ fn monitor_sort_mode_index(view: MonitorViewMode, mode: MonitorSortMode) -> u32 
         .unwrap_or(0) as u32
 }
 
-fn monitor_sort_direction_label(descending: bool) -> &'static str {
+fn monitor_sort_direction_icon(descending: bool) -> &'static str {
     if descending {
-        "↓"
+        "view-sort-descending-symbolic"
     } else {
-        "↑"
+        "view-sort-ascending-symbolic"
     }
 }
 
@@ -6387,15 +6344,12 @@ fn create_repo_monitor_view(
     }
 
     let host = remember_host_ptr(host);
+    ui::install_stylesheet();
 
-    let content = GtkBox::new(Orientation::Vertical, 12);
+    let content = GtkBox::new(Orientation::Vertical, 0);
     content.set_hexpand(true);
     content.set_valign(Align::Fill);
     content.set_vexpand(true);
-    content.set_margin_top(8);
-    content.set_margin_bottom(8);
-    content.set_margin_start(8);
-    content.set_margin_end(8);
 
     let initial_snapshot = snapshot();
     // Set while a refresh mirrors the state into the controls, so their
@@ -6404,15 +6358,17 @@ fn create_repo_monitor_view(
     let mut filter_buttons = Vec::new();
     let mut sort_dropdowns = Vec::new();
 
-    let view_row = GtkBox::new(Orientation::Horizontal, 8);
-    view_row.set_hexpand(true);
+    // Tool window header: title, view tabs and the sort controls.
+    let header = ui::hbox(0);
+    header.add_css_class("ronomepo-toolwindow-header");
+    let title = Label::new(Some("Repositories"));
+    title.add_css_class("ronomepo-toolwindow-title");
+    header.append(&title);
 
-    let view_box = GtkBox::new(Orientation::Horizontal, 0);
-    view_box.add_css_class("linked");
     let mut first_view_button: Option<ToggleButton> = None;
     let mut view_buttons = Vec::new();
     for view in monitor_view_modes() {
-        let button = clickable_toggle_button_with_label(monitor_view_mode_label(*view));
+        let button = ui::tab_button(monitor_view_mode_label(*view));
         if let Some(first) = first_view_button.as_ref() {
             button.set_group(Some(first));
         } else {
@@ -6420,20 +6376,19 @@ fn create_repo_monitor_view(
         }
         button.set_active(initial_snapshot.monitor_view_mode == *view);
         view_buttons.push((*view, button.clone()));
-        view_box.append(&button);
+        header.append(&button);
     }
-    view_row.append(&view_box);
+    header.append(&ui::spacer());
 
     let filter_stack = Stack::new();
     filter_stack.set_hexpand(true);
+    filter_stack.set_hhomogeneous(false);
     for view in monitor_view_modes() {
-        let filter_box = GtkBox::new(Orientation::Horizontal, 0);
-        filter_box.add_css_class("linked");
+        let filter_box = ui::hbox(4);
         let active_filter = initial_snapshot.monitor_settings.view(*view).filter;
         let mut first_filter_button: Option<ToggleButton> = None;
         for filter_mode in monitor_filter_modes_for_view(*view) {
-            let button =
-                clickable_toggle_button_with_label(monitor_filter_mode_label(*filter_mode));
+            let button = ui::chip_toggle(monitor_filter_mode_label(*filter_mode));
             if let Some(first) = first_filter_button.as_ref() {
                 button.set_group(Some(first));
             } else {
@@ -6458,12 +6413,15 @@ fn create_repo_monitor_view(
     filter_stack.set_visible_child_name(monitor_view_mode_key(initial_snapshot.monitor_view_mode));
 
     let sort_stack = Stack::new();
+    sort_stack.set_hhomogeneous(false);
     for view in monitor_view_modes() {
         let labels = monitor_sort_modes_for_view(*view)
             .iter()
             .map(|mode| monitor_sort_mode_label(*mode))
             .collect::<Vec<_>>();
         let dropdown = clickable_dropdown_from_strings(&labels);
+        dropdown.add_css_class("ronomepo-dropdown");
+        dropdown.set_valign(Align::Center);
         let active_sort = initial_snapshot.monitor_settings.view(*view).sort;
         dropdown.set_selected(monitor_sort_mode_index(*view, active_sort));
         dropdown.set_tooltip_text(Some("Sort repositories by the selected criterion"));
@@ -6484,33 +6442,31 @@ fn create_repo_monitor_view(
         sort_dropdowns.push((view, dropdown));
     }
     sort_stack.set_visible_child_name(monitor_view_mode_key(initial_snapshot.monitor_view_mode));
+    header.append(&sort_stack);
 
-    let sort_box = GtkBox::new(Orientation::Horizontal, 6);
-    sort_box.set_halign(Align::End);
-    sort_box.set_hexpand(false);
-    sort_box.append(&sort_stack);
     let sort_direction = Rc::new(Cell::new(
         active_monitor_settings(&initial_snapshot).descending,
     ));
-    let sort_indicator = clickable_button();
-    sort_indicator.add_css_class("flat");
-    sort_indicator.set_tooltip_text(Some("Toggle sort direction"));
-    let sort_indicator_label = Label::new(Some(monitor_sort_direction_label(sort_direction.get())));
-    sort_indicator_label.add_css_class("title-4");
-    sort_indicator_label.add_css_class("dim-label");
-    sort_indicator.set_child(Some(&sort_indicator_label));
+    let sort_indicator = ui::icon_button(
+        monitor_sort_direction_icon(sort_direction.get()),
+        "Toggle sort direction",
+    );
+    let sort_indicator_icon = sort_indicator
+        .child()
+        .and_downcast::<Image>()
+        .expect("icon buttons hold an image");
     sort_indicator.connect_clicked({
         let sort_direction = Rc::clone(&sort_direction);
-        let sort_indicator_label = sort_indicator_label.clone();
+        let sort_indicator_icon = sort_indicator_icon.clone();
         move |_| {
             let next = !sort_direction.get();
             sort_direction.set(next);
-            sort_indicator_label.set_text(monitor_sort_direction_label(next));
+            sort_indicator_icon.set_icon_name(Some(monitor_sort_direction_icon(next)));
             update_monitor_sort_descending(next);
             refresh_repository_views(&snapshot());
         }
     });
-    sort_box.append(&sort_indicator);
+    header.append(&sort_indicator);
 
     let header_stack = Stack::new();
     for view in monitor_view_modes() {
@@ -6527,7 +6483,7 @@ fn create_repo_monitor_view(
         let sort_stack = sort_stack.clone();
         let header_stack = header_stack.clone();
         let sort_direction = Rc::clone(&sort_direction);
-        let sort_indicator_label = sort_indicator_label.clone();
+        let sort_indicator_icon = sort_indicator_icon.clone();
         let syncing = Rc::clone(&syncing);
         button.connect_toggled(move |button| {
             if !button.is_active() || syncing.get() {
@@ -6540,23 +6496,14 @@ fn create_repo_monitor_view(
             let snapshot = snapshot();
             let descending = active_monitor_settings(&snapshot).descending;
             sort_direction.set(descending);
-            sort_indicator_label.set_text(monitor_sort_direction_label(descending));
+            sort_indicator_icon.set_icon_name(Some(monitor_sort_direction_icon(descending)));
             refresh_views();
         });
     }
 
-    let controls = GtkBox::new(Orientation::Vertical, 6);
-    controls.set_hexpand(true);
-    controls.append(&view_row);
-
-    let filter_sort_row = GtkBox::new(Orientation::Horizontal, 10);
-    filter_sort_row.set_hexpand(true);
-    filter_sort_row.append(&filter_stack);
-    let spacer = GtkBox::new(Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    filter_sort_row.append(&spacer);
-    filter_sort_row.append(&sort_box);
-    controls.append(&filter_sort_row);
+    let filter_bar = ui::hbox(0);
+    filter_bar.add_css_class("ronomepo-filter-bar");
+    filter_bar.append(&filter_stack);
 
     let store = gio::ListStore::new::<BoxedAnyObject>();
     let query = Rc::new(RefCell::new(monitor_query(&initial_snapshot)));
@@ -6582,7 +6529,7 @@ fn create_repo_monitor_view(
     let sort_model = SortListModel::new(Some(filter_model.clone()), Some(sorter.clone()));
 
     let list = ListBox::new();
-    list.add_css_class("boxed-list");
+    list.add_css_class("ronomepo-tree");
     mark_clickable_list_rows(&list);
     list.set_hexpand(true);
     list.set_valign(Align::Start);
@@ -6671,7 +6618,8 @@ fn create_repo_monitor_view(
 
     let scroller = vertical_view_scroller(&list);
 
-    content.append(&controls);
+    content.append(&header);
+    content.append(&filter_bar);
     content.append(&header_stack);
     content.append(&scroller);
 
@@ -6685,7 +6633,7 @@ fn create_repo_monitor_view(
             filter_buttons,
             sort_dropdowns,
             sort_direction,
-            sort_direction_label: sort_indicator_label,
+            sort_direction_icon: sort_indicator_icon,
             stacks: [filter_stack, sort_stack, header_stack],
         },
         store,
@@ -6705,116 +6653,67 @@ fn create_repo_monitor_view(
 }
 
 fn repo_monitor_header_for_view(view: MonitorViewMode) -> GtkBox {
-    let header = GtkBox::new(Orientation::Horizontal, 10);
-    header.add_css_class("mono");
-    header.set_margin_bottom(4);
+    let header = ui::hbox(12);
+    header.add_css_class("ronomepo-table-header");
 
-    let mut labels = vec![monitor_text_cell(
-        "Name",
-        MONITOR_NAME_COL_CHARS,
-        MONITOR_NAME_COL_WIDTH,
-        false,
-    )];
-
+    let mut labels = vec![monitor_cell("Name", None)];
     match view {
         MonitorViewMode::Overview => {
-            labels.push(monitor_text_cell(
-                "Status",
-                MONITOR_STATE_COL_CHARS,
-                MONITOR_STATE_COL_WIDTH,
-                false,
-            ));
-            labels.push(monitor_expand_cell("Sync"));
-            labels.push(monitor_text_cell(
-                "Attention",
-                MONITOR_ATTENTION_COL_CHARS,
-                MONITOR_ATTENTION_COL_WIDTH,
-                false,
-            ));
+            labels.push(monitor_cell("Status", Some(MONITOR_STATE_COL_WIDTH)));
+            labels.push(monitor_cell("Sync", Some(MONITOR_SYNC_COL_WIDTH)));
+            labels.push(monitor_cell("Attention", Some(MONITOR_ATTENTION_COL_WIDTH)));
         }
         MonitorViewMode::Git => {
-            labels.push(monitor_text_cell(
-                "Branch",
-                MONITOR_BRANCH_COL_CHARS,
-                MONITOR_BRANCH_COL_WIDTH,
-                false,
-            ));
-            labels.push(monitor_text_cell(
-                "Status",
-                MONITOR_STATE_COL_CHARS,
-                MONITOR_STATE_COL_WIDTH,
-                false,
-            ));
-            labels.push(monitor_expand_cell("Sync"));
+            labels.push(monitor_cell("Branch", Some(MONITOR_BRANCH_COL_WIDTH)));
+            labels.push(monitor_cell("Status", Some(MONITOR_STATE_COL_WIDTH)));
+            labels.push(monitor_cell("Sync", Some(MONITOR_SYNC_COL_WIDTH)));
         }
         MonitorViewMode::Checks => {
-            labels.push(monitor_text_cell(
-                "Manifest",
-                MONITOR_MANIFEST_COL_CHARS,
-                MONITOR_MANIFEST_COL_WIDTH,
-                false,
-            ));
-            labels.push(monitor_text_cell(
-                "Checks",
-                MONITOR_CAPABILITY_COL_CHARS,
-                MONITOR_CAPABILITY_COL_WIDTH,
-                false,
-            ));
-            labels.push(monitor_text_cell(
-                "Attention",
-                MONITOR_ATTENTION_COL_CHARS,
-                MONITOR_ATTENTION_COL_WIDTH,
-                false,
-            ));
+            labels.push(monitor_cell("Manifest", Some(MONITOR_MANIFEST_COL_WIDTH)));
+            labels.push(monitor_cell("Checks", Some(MONITOR_CAPABILITY_COL_WIDTH)));
+            labels.push(monitor_cell("Attention", Some(MONITOR_ATTENTION_COL_WIDTH)));
         }
         MonitorViewMode::Manifest => {
-            labels.push(monitor_text_cell(
-                "Manifest",
-                MONITOR_MANIFEST_COL_CHARS,
-                MONITOR_MANIFEST_COL_WIDTH,
-                false,
-            ));
-            labels.push(monitor_text_cell(
-                "Actions",
-                MONITOR_ACTIONS_COL_CHARS,
-                MONITOR_ACTIONS_COL_WIDTH,
-                false,
-            ));
-            labels.push(monitor_text_cell(
-                "Enabled",
-                MONITOR_STATE_COL_CHARS,
-                MONITOR_STATE_COL_WIDTH,
-                false,
-            ));
-            labels.push(monitor_expand_cell("Remote"));
+            labels.push(monitor_cell("Manifest", Some(MONITOR_MANIFEST_COL_WIDTH)));
+            labels.push(monitor_cell("Actions", Some(MONITOR_ACTIONS_COL_WIDTH)));
+            labels.push(monitor_cell("Enabled", Some(MONITOR_ENABLED_COL_WIDTH)));
+            labels.push(monitor_cell("Remote", None));
         }
     }
-
     for label in labels {
-        label.add_css_class("dim-label");
         header.append(&label);
     }
-
     header
 }
 
-fn monitor_expand_cell(text: &str) -> Label {
+/// One ellipsizing monitor table cell: `width` pixels wide, or sharing the
+/// remaining width when `None`.
+fn monitor_cell(text: &str, width: Option<i32>) -> Label {
     let label = Label::new(Some(text));
     label.set_xalign(0.0);
-    label.set_hexpand(true);
     label.set_ellipsize(EllipsizeMode::End);
+    match width {
+        Some(width) => {
+            // A tiny natural width keeps long values from widening the
+            // column; the size request sets the actual width.
+            label.set_max_width_chars(1);
+            label.set_size_request(width, -1);
+        }
+        None => {
+            label.set_hexpand(true);
+            label.set_size_request(96, -1);
+        }
+    }
     label
 }
 
-fn monitor_text_cell(text: &str, width_chars: i32, width_px: i32, expand: bool) -> Label {
-    let label = Label::new(Some(text));
-    label.set_xalign(0.0);
-    label.add_css_class("mono");
-    label.set_width_chars(width_chars);
-    label.set_max_width_chars(width_chars);
-    label.set_size_request(width_px, -1);
-    label.set_ellipsize(EllipsizeMode::End);
-    label.set_hexpand(expand);
+/// A monitor cell whose text is colored by `tone`.
+fn monitor_tone_cell(text: &str, tone: ui::Tone, width: i32, tooltip: Option<String>) -> Label {
+    let label = monitor_cell(text, Some(width));
+    ui::set_fg_tone(&label, tone);
+    if let Some(tooltip) = tooltip {
+        attach_text_tooltip(&label, tooltip);
+    }
     label
 }
 
@@ -6947,17 +6846,17 @@ fn capability_monitor_label(summary: &CapabilityMonitorSummary) -> &'static str 
     }
 }
 
-fn capability_monitor_color(summary: &CapabilityMonitorSummary) -> &'static str {
+fn capability_monitor_tone(summary: &CapabilityMonitorSummary) -> ui::Tone {
     if summary.policy_issues > 0 || summary.unsupported > 0 {
-        "#f6c177"
+        ui::Tone::Warning
     } else if summary.error > 0 || summary.failed > 0 {
-        "#ff6b6b"
+        ui::Tone::Danger
     } else if summary.stale > 0 || summary.warning > 0 || summary.unknown > 0 {
-        "#ff8e5f"
+        ui::Tone::Warning
     } else if summary.declared > 0 || summary.stored > 0 {
-        "#7fdc8a"
+        ui::Tone::Success
     } else {
-        "#8f96a3"
+        ui::Tone::Muted
     }
 }
 
@@ -7020,15 +6919,6 @@ fn attention_monitor_label(signals: &[AttentionSignal]) -> &'static str {
     }
 }
 
-fn attention_monitor_color(signals: &[AttentionSignal]) -> &'static str {
-    match attention_rank(signals) {
-        0 | 1 => "#ff6b6b",
-        2 => "#ff8e5f",
-        3 | 4 => "#f6c177",
-        _ => "#7fdc8a",
-    }
-}
-
 fn attention_monitor_tooltip(signals: &[AttentionSignal]) -> String {
     if signals.is_empty() {
         return "No open attention signals.".to_string();
@@ -7068,14 +6958,27 @@ fn attention_monitor_search_text(signals: &[AttentionSignal]) -> String {
     text
 }
 
-fn monitor_attention_cell(signals: &[AttentionSignal]) -> Label {
-    monitor_colored_cell(
-        attention_monitor_label(signals),
-        attention_monitor_color(signals),
-        MONITOR_ATTENTION_COL_CHARS,
-        MONITOR_ATTENTION_COL_WIDTH,
-        Some(attention_monitor_tooltip(signals)),
-    )
+/// Attention is shown loudly only when it is blocking or urgent; routine
+/// levels stay muted so they do not drown the list.
+fn monitor_attention_cell(signals: &[AttentionSignal]) -> GtkBox {
+    let cell = ui::hbox(0);
+    cell.set_size_request(MONITOR_ATTENTION_COL_WIDTH, -1);
+    let rank = attention_rank(signals);
+    let text = if rank > 4 {
+        ""
+    } else {
+        attention_monitor_label(signals)
+    };
+    let label = if rank <= 1 {
+        ui::badge(text, ui::Tone::Danger)
+    } else {
+        let label = Label::new(Some(text));
+        label.add_css_class("ronomepo-fg-muted");
+        label
+    };
+    attach_text_tooltip(&label, attention_monitor_tooltip(signals));
+    cell.append(&label);
+    cell
 }
 
 fn workspace_attention_lines(
@@ -7335,41 +7238,18 @@ fn capability_summary_needs_attention(summary: &CapabilityMonitorSummary) -> boo
 }
 
 fn monitor_capability_cell(summary: &CapabilityMonitorSummary) -> Label {
-    monitor_colored_cell(
+    monitor_tone_cell(
         capability_monitor_label(summary),
-        capability_monitor_color(summary),
-        MONITOR_CAPABILITY_COL_CHARS,
+        capability_monitor_tone(summary),
         MONITOR_CAPABILITY_COL_WIDTH,
         Some(capability_monitor_tooltip(summary)),
     )
 }
 
-/// A fixed-width monitor cell showing `text` in `color`.
-fn monitor_colored_cell(
-    text: &str,
-    color: &str,
-    width_chars: i32,
-    width_px: i32,
-    tooltip: Option<String>,
-) -> Label {
-    let label = monitor_text_cell(text, width_chars, width_px, false);
-    if let Some(tooltip) = tooltip {
-        attach_text_tooltip(&label, tooltip);
-    }
-    set_colored_markup(&label, text, color);
-    label
-}
-
-fn set_colored_markup(label: &Label, text: &str, color: &str) {
-    let escaped = glib::markup_escape_text(text);
-    label.set_markup(&format!("<span foreground=\"{color}\">{escaped}</span>"));
-}
-
 fn monitor_manifest_cell(scan: Option<&RepoManifestScan>) -> Label {
-    monitor_colored_cell(
+    monitor_tone_cell(
         manifest_presence_label(scan),
-        manifest_presence_color(scan),
-        MONITOR_MANIFEST_COL_CHARS,
+        manifest_presence_tone(scan),
         MONITOR_MANIFEST_COL_WIDTH,
         manifest_presence_tooltip(scan),
     )
@@ -7377,92 +7257,108 @@ fn monitor_manifest_cell(scan: Option<&RepoManifestScan>) -> Label {
 
 fn monitor_manifest_actions_cell(item: &RepositoryListItem) -> Label {
     let count = manifest_action_count(item);
-    let text = if count == 0 {
-        "-".to_string()
+    let (text, tone) = if count == 0 {
+        ("-".to_string(), ui::Tone::Muted)
     } else {
-        count.to_string()
+        (count.to_string(), ui::Tone::Neutral)
     };
-    let label = monitor_text_cell(
+    monitor_tone_cell(
         &text,
-        MONITOR_ACTIONS_COL_CHARS,
+        tone,
         MONITOR_ACTIONS_COL_WIDTH,
-        false,
-    );
-    attach_text_tooltip(&label, format!("{count} configured repo action(s)"));
-    label
-}
-
-fn monitor_enabled_cell(enabled: Option<bool>) -> Label {
-    let text = match enabled {
-        Some(true) => "Enabled",
-        Some(false) => "Disabled",
-        None => "-",
-    };
-    let color = if enabled == Some(true) {
-        "#7fdc8a"
-    } else {
-        "#8f96a3"
-    };
-    monitor_colored_cell(
-        text,
-        color,
-        MONITOR_STATE_COL_CHARS,
-        MONITOR_STATE_COL_WIDTH,
-        None,
+        Some(format!("{count} configured repo action(s)")),
     )
 }
 
-fn manifest_presence_color(scan: Option<&RepoManifestScan>) -> &'static str {
+fn monitor_enabled_cell(enabled: Option<bool>) -> Label {
+    let (text, tone) = match enabled {
+        Some(true) => ("Enabled", ui::Tone::Neutral),
+        Some(false) => ("Disabled", ui::Tone::Muted),
+        None => ("-", ui::Tone::Muted),
+    };
+    monitor_tone_cell(text, tone, MONITOR_ENABLED_COL_WIDTH, None)
+}
+
+fn manifest_presence_tone(scan: Option<&RepoManifestScan>) -> ui::Tone {
     match scan.map(|scan| &scan.state) {
         Some(RepoManifestScanState::Valid(summary))
             if summary.missing_required_capability_count > 0 =>
         {
-            "#f6c177"
+            ui::Tone::Warning
         }
-        Some(RepoManifestScanState::Valid(_)) => "#7fdc8a",
-        Some(RepoManifestScanState::Invalid { .. }) => "#ff6b6b",
-        Some(RepoManifestScanState::Missing) => "#8f96a3",
-        None => "#8f96a3",
+        Some(RepoManifestScanState::Valid(_)) => ui::Tone::Neutral,
+        Some(RepoManifestScanState::Invalid { .. }) => ui::Tone::Danger,
+        Some(RepoManifestScanState::Missing) | None => ui::Tone::Muted,
     }
 }
 
 fn monitor_state_cell(state: &ronomepo_core::RepositoryState) -> Label {
-    monitor_colored_cell(
+    monitor_tone_cell(
         status_label(state),
-        state_color(state),
-        MONITOR_STATE_COL_CHARS,
+        state_tone(state),
         MONITOR_STATE_COL_WIDTH,
         None,
     )
 }
 
-fn state_color(state: &ronomepo_core::RepositoryState) -> &'static str {
+/// IDEA-like VCS colors: modified in the accent color, unversioned in red,
+/// clean in the default text color.
+fn state_tone(state: &ronomepo_core::RepositoryState) -> ui::Tone {
     match state {
-        ronomepo_core::RepositoryState::Clean => "#7fdc8a",
-        ronomepo_core::RepositoryState::Missing => "#ff6b6b",
-        ronomepo_core::RepositoryState::Dirty
-        | ronomepo_core::RepositoryState::Untracked
-        | ronomepo_core::RepositoryState::Unknown => "#ff8e5f",
+        ronomepo_core::RepositoryState::Clean => ui::Tone::Muted,
+        ronomepo_core::RepositoryState::Dirty => ui::Tone::Accent,
+        ronomepo_core::RepositoryState::Untracked | ronomepo_core::RepositoryState::Missing => {
+            ui::Tone::Danger
+        }
+        ronomepo_core::RepositoryState::Unknown => ui::Tone::Muted,
+    }
+}
+
+/// The CSS class coloring a repository name by its working tree state.
+fn repo_name_vcs_class(state: &ronomepo_core::RepositoryState) -> Option<&'static str> {
+    match state {
+        ronomepo_core::RepositoryState::Clean => None,
+        ronomepo_core::RepositoryState::Dirty => Some("ronomepo-vcs-modified"),
+        ronomepo_core::RepositoryState::Untracked => Some("ronomepo-vcs-unversioned"),
+        ronomepo_core::RepositoryState::Missing => Some("ronomepo-vcs-missing"),
+        ronomepo_core::RepositoryState::Unknown => Some("ronomepo-vcs-unknown"),
     }
 }
 
 fn monitor_sync_cell(sync: &ronomepo_core::RepositorySync) -> Label {
-    let text = format_sync_label(sync);
-    let label = monitor_expand_cell(&text);
-    label.add_css_class("mono");
-    set_colored_markup(&label, &text, sync_color(sync));
-    label
+    let (text, tone) = sync_compact(sync);
+    monitor_tone_cell(
+        &text,
+        tone,
+        MONITOR_SYNC_COL_WIDTH,
+        Some(sync_description(sync)),
+    )
 }
 
-fn sync_color(sync: &ronomepo_core::RepositorySync) -> &'static str {
+/// Compact ahead/behind arrows, e.g. `↑2 ↓1`.
+fn sync_compact(sync: &ronomepo_core::RepositorySync) -> (String, ui::Tone) {
     match sync {
-        ronomepo_core::RepositorySync::UpToDate => "#7fdc8a",
-        ronomepo_core::RepositorySync::Ahead(_) | ronomepo_core::RepositorySync::Behind(_) => {
-            "#ff8e5f"
+        ronomepo_core::RepositorySync::UpToDate => ("✓".to_string(), ui::Tone::Muted),
+        ronomepo_core::RepositorySync::Ahead(ahead) => (format!("↑{ahead}"), ui::Tone::Accent),
+        ronomepo_core::RepositorySync::Behind(behind) => (format!("↓{behind}"), ui::Tone::Warning),
+        ronomepo_core::RepositorySync::Diverged { ahead, behind } => {
+            (format!("↑{ahead} ↓{behind}"), ui::Tone::Warning)
         }
-        ronomepo_core::RepositorySync::Diverged { .. }
-        | ronomepo_core::RepositorySync::Unknown
-        | ronomepo_core::RepositorySync::NoUpstream => "#ff6b6b",
+        ronomepo_core::RepositorySync::NoUpstream => ("–".to_string(), ui::Tone::Muted),
+        ronomepo_core::RepositorySync::Unknown => ("?".to_string(), ui::Tone::Muted),
+    }
+}
+
+fn sync_description(sync: &ronomepo_core::RepositorySync) -> String {
+    match sync {
+        ronomepo_core::RepositorySync::UpToDate => "Up to date with upstream".to_string(),
+        ronomepo_core::RepositorySync::Ahead(ahead) => format!("{ahead} commit(s) to push"),
+        ronomepo_core::RepositorySync::Behind(behind) => format!("{behind} commit(s) to pull"),
+        ronomepo_core::RepositorySync::Diverged { ahead, behind } => {
+            format!("Diverged: {ahead} to push, {behind} to pull")
+        }
+        ronomepo_core::RepositorySync::NoUpstream => "No upstream branch".to_string(),
+        ronomepo_core::RepositorySync::Unknown => "Sync state unknown".to_string(),
     }
 }
 
@@ -7475,8 +7371,9 @@ fn create_monorepo_overview_view(
     }
 
     let host = remember_host_ptr(host);
+    ui::install_stylesheet();
 
-    let root = padded_view_root(18, 24);
+    let root = padded_view_root(20, 24);
     root.set_vexpand(true);
 
     let scroller = vertical_view_scroller(&root);
@@ -7485,16 +7382,16 @@ fn create_monorepo_overview_view(
     root_ref.set(Some(&root));
     let view = Rc::new(MonorepoOverview {
         root: root_ref,
-        top: GtkBox::new(Orientation::Vertical, 18),
+        top: GtkBox::new(Orientation::Vertical, 16),
         selection_slot: GtkBox::new(Orientation::Vertical, 0),
         files_slot: GtkBox::new(Orientation::Vertical, 0),
-        sections: GtkBox::new(Orientation::Vertical, 12),
+        sections: GtkBox::new(Orientation::Vertical, 24),
         reports: monorepo_report_controls(),
         host_ptr: host as usize,
         stale: Cell::new(false),
     });
 
-    let command_area = GtkBox::new(Orientation::Vertical, 8);
+    let command_area = GtkBox::new(Orientation::Vertical, 10);
     command_area.append(&overview_command_group(
         "Workspace",
         overview_actions(false),
@@ -7506,7 +7403,7 @@ fn create_monorepo_overview_view(
     command_area.append(&overview_command_group("Reports", view.reports.row.clone()));
     command_area.append(&overview_command_group("Files", view.files_slot.clone()));
     root.append(&view.top);
-    root.append(&command_area);
+    root.append(&ui::card(&command_area));
     root.append(&view.sections);
 
     render_monorepo_overview(&view, &snapshot());
@@ -7540,6 +7437,7 @@ fn create_commit_check_view(
     }
 
     remember_host_ptr(host);
+    ui::install_stylesheet();
 
     let root = padded_view_root(18, 24);
 
@@ -7626,34 +7524,31 @@ fn render_monorepo_overview(view: &MonorepoOverview, snapshot: &StateSnapshot) {
         .count();
     let selected = selected_repository_items(snapshot, &items);
 
-    let hero = GtkBox::new(Orientation::Vertical, 8);
-    let title = Label::new(Some("Monorepo Overview"));
-    title.set_xalign(0.0);
-    title.add_css_class("title-2");
-    let subtitle = Label::new(Some(&format!(
+    let hero = ui::vbox(4);
+    hero.append(&ui::page_title("Monorepo Overview"));
+    let subtitle = ui::hint(&format!(
         "{} repositories tracked in {}",
         summary.repo_count, summary.workspace_name
-    )));
-    subtitle.set_xalign(0.0);
-    subtitle.add_css_class("muted");
-    subtitle.set_wrap(true);
-    hero.append(&title);
+    ));
     hero.append(&subtitle);
-    let stats = GtkBox::new(Orientation::Horizontal, 12);
-    for (label, value) in [
-        ("Attention", attention),
-        ("Selected", snapshot.selected_repo_ids.len()),
-        ("Dirty", dirty),
-        ("Missing", missing),
-        ("Ahead", ahead),
-        ("Behind", behind),
-        ("Diverged", diverged),
-        ("No Upstream", no_upstream),
-        ("Cap Issues", capability_attention),
-        ("Cap Due", capability_due),
-    ] {
-        stats.append(&stat_card(label, &value.to_string()));
-    }
+    let tiles = [
+        ("Attention", attention, ui::Tone::Warning),
+        (
+            "Selected",
+            snapshot.selected_repo_ids.len(),
+            ui::Tone::Accent,
+        ),
+        ("Dirty", dirty, ui::Tone::Accent),
+        ("Missing", missing, ui::Tone::Danger),
+        ("Ahead", ahead, ui::Tone::Accent),
+        ("Behind", behind, ui::Tone::Warning),
+        ("Diverged", diverged, ui::Tone::Warning),
+        ("No Upstream", no_upstream, ui::Tone::Strong),
+        ("Cap Issues", capability_attention, ui::Tone::Warning),
+        ("Cap Due", capability_due, ui::Tone::Warning),
+    ]
+    .map(|(label, value, tone)| ui::stat_tile(label, value, tone));
+    let stats = ui::wrap_box(&tiles.each_ref().map(|tile| tile.upcast_ref()), 8);
 
     view.selection_slot
         .append(&monorepo_selection_actions(snapshot, host_ptr, &items));
@@ -8382,44 +8277,27 @@ fn create_repo_overview_view(
     }
 
     let host = remember_host_ptr(host);
+    ui::install_stylesheet();
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
 
-    let tab_bar = GtkBox::new(Orientation::Horizontal, 8);
-    tab_bar.set_margin_top(10);
-    tab_bar.set_margin_bottom(8);
-    tab_bar.set_margin_start(12);
-    tab_bar.set_margin_end(12);
-
     let stack = Stack::new();
     stack.set_hexpand(true);
     stack.set_vexpand(true);
 
-    let switcher = StackSwitcher::new();
-    switcher.set_stack(Some(&stack));
-    tab_bar.append(&switcher);
-
-    let spacer = GtkBox::new(Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    tab_bar.append(&spacer);
-
-    root.append(&tab_bar);
-
     let mut pages = Vec::new();
     for page in RepoOverviewPage::ALL {
         let page_root = repo_overview_page_root();
-        stack.add_titled(
-            &vertical_view_scroller(&page_root),
-            Some(page.name()),
-            page.title(),
-        );
+        stack.add_named(&vertical_view_scroller(&page_root), Some(page.name()));
         pages.push((page, page_root));
     }
     stack.set_visible_child_name(RepoOverviewPage::Summary.name());
-    mark_clickable(&switcher);
-    mark_clickable_descendant_buttons(&switcher);
+    root.append(&stack_tab_bar(
+        &stack,
+        &RepoOverviewPage::ALL.map(|page| (page.name(), page.title())),
+    ));
 
     let repo_body = Paned::new(Orientation::Vertical);
     repo_body.set_hexpand(true);
@@ -8500,29 +8378,24 @@ fn create_workspace_settings_view(
     }
 
     remember_host_ptr(host);
+    ui::install_stylesheet();
 
-    let root = padded_view_root(18, 24);
+    let root = padded_view_root(16, 24);
 
-    let heading = Label::new(Some("Fucina repository policy"));
-    heading.set_xalign(0.0);
-    heading.add_css_class("title-2");
-    root.append(&heading);
-
-    let explanation = Label::new(Some(
+    let header = ui::vbox(4);
+    header.append(&ui::page_title("Fucina repository policy"));
+    header.append(&ui::hint(
         "repos.toml is authoritative. Ronomepo delegates validation, audits, and safe remote configuration to fucina_policy.py.",
     ));
-    explanation.set_xalign(0.0);
-    explanation.set_wrap(true);
-    root.append(&explanation);
+    root.append(&header);
 
-    let policy_area = GtkBox::new(Orientation::Vertical, 18);
+    let policy_area = ui::vbox(12);
     let action_status = Label::new(Some("Ready · detailed results appear in Operations"));
-    action_status.set_xalign(0.0);
-    action_status.set_wrap(true);
+    let status_bar = ui::info_bar(&action_status, "dialog-information-symbolic");
     let repository_area = GtkBox::new(Orientation::Vertical, 0);
     repository_area.set_vexpand(true);
     root.append(&policy_area);
-    root.append(&action_status);
+    root.append(&status_bar);
     root.append(&repository_area);
 
     let root_ref = glib::WeakRef::new();
@@ -8568,26 +8441,29 @@ fn render_fucina_policy(handle: &FucinaPolicyViewHandle, policy_root: &Path) {
 
     match load_fucina_policy(policy_root) {
         Ok(policy) => {
-            action_status.set_visible(true);
-            let summary = Label::new(Some(&format!(
-                "Schema {} · {} repositories",
-                policy.schema_version,
-                policy.repositories.len()
-            )));
-            summary.set_xalign(0.0);
-            summary.add_css_class("title-4");
-            root.append(&summary);
-
-            let actions = GtkBox::new(Orientation::Horizontal, 8);
-            let validate = clickable_button_with_label("Validate");
-            let audit = clickable_button_with_label("Audit all");
-            let preview = clickable_button_with_label("Preview configuration");
-            let apply = clickable_button_with_label("Apply configuration…");
-            actions.append(&validate);
-            actions.append(&audit);
-            actions.append(&preview);
-            actions.append(&apply);
-            root.append(&actions);
+            set_fucina_status_visible(action_status, true);
+            let toolbar = ui::hbox(8);
+            toolbar.append(&ui::badge(
+                &format!("Schema {}", policy.schema_version),
+                ui::Tone::Neutral,
+            ));
+            toolbar.append(&ui::badge(
+                &format!("{} repositories", policy.repositories.len()),
+                ui::Tone::Neutral,
+            ));
+            toolbar.append(&ui::spacer());
+            let validate = ui::button("Validate", ui::ButtonKind::Secondary);
+            let audit = ui::button("Audit all", ui::ButtonKind::Secondary);
+            let preview = ui::button("Preview configuration", ui::ButtonKind::Secondary);
+            let apply = ui::button("Apply configuration…", ui::ButtonKind::Primary);
+            apply.set_tooltip_text(Some(
+                "Previews first, then asks for confirmation before applying the safe changes",
+            ));
+            toolbar.append(&validate);
+            toolbar.append(&audit);
+            toolbar.append(&preview);
+            toolbar.append(&apply);
+            root.append(&toolbar);
 
             connect_fucina_action(
                 &validate,
@@ -8612,31 +8488,46 @@ fn render_fucina_policy(handle: &FucinaPolicyViewHandle, policy_root: &Path) {
             );
             connect_fucina_apply(&apply, policy_root.to_path_buf(), action_status.clone());
 
-            let repository_list = GtkBox::new(Orientation::Vertical, 6);
+            let repository_list = ui::list_card();
             for repository in &policy.repositories {
-                repository_list.append(&fucina_repository_row(
-                    repository,
-                    policy_root,
-                    action_status,
-                ));
+                ui::list_card_item(
+                    &repository_list,
+                    &fucina_repository_row(repository, policy_root, action_status),
+                );
             }
             let repositories = ScrolledWindow::builder()
-                .hscrollbar_policy(PolicyType::Automatic)
+                .hscrollbar_policy(PolicyType::Never)
                 .vscrollbar_policy(PolicyType::Automatic)
                 .min_content_height(280)
                 .vexpand(true)
                 .child(&repository_list)
                 .build();
+            repositories.set_margin_top(4);
             handle.repository_area.append(&repositories);
         }
         Err(message) => {
-            action_status.set_visible(false);
-            let error = Label::new(Some(&message));
-            error.set_xalign(0.0);
-            error.set_wrap(true);
-            error.add_css_class("error");
-            root.append(&error);
+            set_fucina_status_visible(action_status, false);
+            root.append(&ui::problem_row(
+                ui::Severity::Error,
+                &message,
+                "The Fucina policy could not be loaded.",
+            ));
         }
+    }
+}
+
+/// Shows or hides the status bar holding `action_status`.
+fn set_fucina_status_visible(action_status: &Label, visible: bool) {
+    match action_status.parent() {
+        Some(bar) => bar.set_visible(visible),
+        None => action_status.set_visible(visible),
+    }
+}
+
+/// Tints the status bar holding `action_status` by the last result.
+fn set_fucina_status_tone(action_status: &Label, tone: ui::Tone) {
+    if let Some(bar) = action_status.parent().and_downcast::<GtkBox>() {
+        ui::set_info_bar_tone(&bar, tone);
     }
 }
 
@@ -8656,44 +8547,50 @@ fn fucina_repository_row(
     workspace_root: &Path,
     action_status: &Label,
 ) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, 12);
-    row.add_css_class("card");
-    row.set_margin_top(4);
-    row.set_margin_bottom(4);
-    row.set_margin_start(4);
-    row.set_margin_end(4);
+    let row = ui::hbox(16);
 
-    let details = GtkBox::new(Orientation::Vertical, 2);
+    let details = ui::vbox(4);
     details.set_hexpand(true);
-    let title = Label::new(Some(&format!(
-        "{} · {} · {}{}",
-        repository.name,
-        repository.role,
-        repository.publication,
-        if repository.archived {
-            " · archived"
-        } else {
-            ""
-        }
-    )));
-    title.set_xalign(0.0);
-    title.add_css_class("title-5");
-    details.append(&title);
-    let remotes = Label::new(Some(&fucina_repository_remotes(repository)));
-    remotes.set_xalign(0.0);
-    remotes.set_selectable(true);
-    remotes.set_wrap(true);
-    details.append(&remotes);
-    let backup = Label::new(Some(&fucina_repository_backup(repository)));
-    backup.set_xalign(0.0);
-    backup.set_wrap(true);
-    if repository.backup_required && repository.backups.is_empty() {
-        backup.add_css_class("warning");
+    let title = ui::hbox(6);
+    let name = Label::new(Some(&repository.name));
+    name.add_css_class("ronomepo-section-title");
+    title.append(&name);
+    title.append(&ui::badge(&repository.role, ui::Tone::Neutral));
+    title.append(&ui::badge(&repository.publication, ui::Tone::Neutral));
+    if repository.archived {
+        title.append(&ui::badge("archived", ui::Tone::Warning));
     }
-    details.append(&backup);
+    let (backup_text, backup_tone) = fucina_repository_backup_badge(repository);
+    title.append(&ui::badge(&backup_text, backup_tone));
+    details.append(&title);
+
+    let remotes = ui::vbox(0);
+    remotes.set_tooltip_text(Some(&fucina_repository_remotes(repository)));
+    for (kind, url) in fucina_repository_remote_lines(repository) {
+        let line = ui::hbox(8);
+        let key = Label::new(Some(kind));
+        key.set_xalign(0.0);
+        key.set_size_request(84, -1);
+        key.add_css_class("ronomepo-kv-key");
+        key.add_css_class("ronomepo-meta");
+        let value = Label::new(Some(&url));
+        value.set_xalign(0.0);
+        value.set_hexpand(true);
+        value.set_ellipsize(EllipsizeMode::Middle);
+        value.set_selectable(true);
+        value.add_css_class("mono");
+        value.add_css_class("ronomepo-meta");
+        value.add_css_class("ronomepo-fg-muted");
+        line.append(&key);
+        line.append(&value);
+        remotes.append(&line);
+    }
+    details.append(&remotes);
     row.append(&details);
 
-    let audit = clickable_button_with_label("Audit");
+    let actions = ui::hbox(12);
+    actions.set_valign(Align::Center);
+    let audit = ui::link_button("Audit");
     connect_fucina_action(
         &audit,
         workspace_root.to_path_buf(),
@@ -8701,8 +8598,8 @@ fn fucina_repository_row(
         vec![repository.name.clone()],
         action_status.clone(),
     );
-    row.append(&audit);
-    let preview = clickable_button_with_label("Preview");
+    actions.append(&audit);
+    let preview = ui::link_button("Preview");
     connect_fucina_action(
         &preview,
         workspace_root.to_path_buf(),
@@ -8710,22 +8607,44 @@ fn fucina_repository_row(
         vec![repository.name.clone()],
         action_status.clone(),
     );
-    row.append(&preview);
+    actions.append(&preview);
+    row.append(&actions);
     row
 }
 
-fn fucina_repository_remotes(repository: &FucinaRepositoryPolicy) -> String {
-    let mut values = vec![format!("Fucina: {}", repository.forgejo)];
+fn fucina_repository_remote_lines(
+    repository: &FucinaRepositoryPolicy,
+) -> Vec<(&'static str, String)> {
+    let mut values = vec![("Fucina", repository.forgejo.clone())];
     if let Some(upstream) = &repository.upstream {
-        values.push(format!("Upstream: {upstream}"));
+        values.push(("Upstream", upstream.clone()));
     }
     if let Some(target) = &repository.publication_target {
-        values.push(format!("Publication: {target}"));
+        values.push(("Publication", target.clone()));
     }
     if let Some(schedule) = &repository.mirror_schedule {
-        values.push(format!("Pull schedule: {schedule}"));
+        values.push(("Pull schedule", schedule.clone()));
     }
-    values.join(" · ")
+    values
+}
+
+fn fucina_repository_remotes(repository: &FucinaRepositoryPolicy) -> String {
+    fucina_repository_remote_lines(repository)
+        .into_iter()
+        .map(|(kind, value)| format!("{kind}: {value}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn fucina_repository_backup_badge(repository: &FucinaRepositoryPolicy) -> (String, ui::Tone) {
+    let tone = if repository.backup_required && repository.backups.is_empty() {
+        ui::Tone::Warning
+    } else if repository.backups.is_empty() {
+        ui::Tone::Muted
+    } else {
+        ui::Tone::Success
+    };
+    (fucina_repository_backup(repository), tone)
 }
 
 fn fucina_repository_backup(repository: &FucinaRepositoryPolicy) -> String {
@@ -8754,6 +8673,7 @@ fn connect_fucina_action(
     button.connect_clicked(move |button| {
         button.set_sensitive(false);
         action_status.set_text("Running · see Operations for details");
+        set_fucina_status_tone(&action_status, ui::Tone::Neutral);
         let button = button.clone();
         let action_status = action_status.clone();
         run_fucina_action_async(
@@ -8772,6 +8692,7 @@ fn connect_fucina_apply(button: &Button, workspace_root: PathBuf, action_status:
     button.connect_clicked(move |button| {
         button.set_sensitive(false);
         action_status.set_text("Previewing · see Operations for details");
+        set_fucina_status_tone(&action_status, ui::Tone::Neutral);
         let button = button.clone();
         let action_status = action_status.clone();
         let workspace_root = workspace_root.clone();
@@ -8799,9 +8720,8 @@ fn fucina_preview_allows_confirmation(preview: &Result<FucinaPolicyCommandResult
 }
 
 fn show_fucina_apply_confirmation(workspace_root: PathBuf, action_status: Label) {
-    let cancel = Button::with_label("Cancel");
-    let apply = Button::with_label("Apply");
-    apply.add_css_class("destructive-action");
+    let cancel = ui::button("Cancel", ui::ButtonKind::Secondary);
+    let apply = ui::button("Apply", ui::ButtonKind::Danger);
     let content = Label::new(Some(
         "The preview succeeded. Apply only the safe changes accepted by the policy engine? Unexpected remotes and unresolved backup gates will still be refused.",
     ));
@@ -8830,6 +8750,7 @@ fn show_fucina_apply_confirmation(workspace_root: PathBuf, action_status: Label)
             dialog.close();
         }
         action_status.set_text("Applying · see Operations for details");
+        set_fucina_status_tone(&action_status, ui::Tone::Neutral);
         let action_status = action_status.clone();
         run_fucina_action_async(
             workspace_root.clone(),
@@ -8871,6 +8792,14 @@ fn present_fucina_result(
         format!("{label} refused or failed · details in Operations")
     };
     action_status.set_text(&status);
+    set_fucina_status_tone(
+        action_status,
+        if successful {
+            ui::Tone::Success
+        } else {
+            ui::Tone::Danger
+        },
+    );
     append_log(format!(
         "Fucina {label}\n{}",
         fucina_command_result_text(result)
@@ -9549,6 +9478,40 @@ fn reload_capability_registry() {
 }
 
 /// A vertical view root with the same padding on every side.
+/// An underline tab bar switching `stack` between its `(name, title)` pages.
+fn stack_tab_bar(stack: &Stack, pages: &[(&'static str, &'static str)]) -> GtkBox {
+    let bar = ui::hbox(0);
+    bar.add_css_class("ronomepo-tab-bar");
+    let mut tabs: Vec<(&'static str, ToggleButton)> = Vec::new();
+    for (name, title) in pages {
+        let tab = ui::tab_button(title);
+        if let Some((_, first)) = tabs.first() {
+            tab.set_group(Some(first));
+        }
+        tab.set_active(stack.visible_child_name().as_deref() == Some(*name));
+        tab.connect_toggled({
+            let stack = stack.downgrade();
+            let name = *name;
+            move |tab| {
+                if let Some(stack) = stack.upgrade().filter(|_| tab.is_active()) {
+                    stack.set_visible_child_name(name);
+                }
+            }
+        });
+        bar.append(&tab);
+        tabs.push((name, tab));
+    }
+    stack.connect_visible_child_name_notify(move |stack| {
+        let visible = stack.visible_child_name();
+        for (name, tab) in &tabs {
+            if visible.as_deref() == Some(*name) && !tab.is_active() {
+                tab.set_active(true);
+            }
+        }
+    });
+    bar
+}
+
 fn padded_view_root(spacing: i32, padding: i32) -> GtkBox {
     let root = GtkBox::new(Orientation::Vertical, spacing);
     root.set_margin_top(padding);
@@ -9583,8 +9546,8 @@ fn into_view_ptr(widget: impl IsA<gtk::Widget>) -> *mut std::ffi::c_void {
 }
 
 fn repo_overview_page_root() -> GtkBox {
-    let root = GtkBox::new(Orientation::Vertical, 18);
-    root.set_margin_top(18);
+    let root = GtkBox::new(Orientation::Vertical, 20);
+    root.set_margin_top(16);
     root.set_margin_bottom(24);
     root.set_margin_start(24);
     root.set_margin_end(24);
@@ -9698,23 +9661,28 @@ fn render_repo_overview_empty_page(
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
     message: &str,
 ) {
-    append_repo_overview_empty_title(root);
-    let body = Label::new(Some(message));
-    body.set_xalign(0.0);
-    body.set_wrap(true);
-    body.add_css_class("muted");
-    root.append(&body);
-    root.append(&overview_actions(true));
-    root.append(&overview_file_actions(snapshot, host_ptr));
+    root.append(&ui::empty_state(
+        "folder-symbolic",
+        "Repo Overview",
+        message,
+        None,
+    ));
+    let actions = ui::vbox(8);
+    actions.set_halign(Align::Center);
+    actions.append(&overview_actions(true));
+    let files = overview_file_actions(snapshot, host_ptr);
+    files.set_halign(Align::Center);
+    actions.append(&files);
+    root.append(&actions);
 }
 
 fn render_repo_overview_muted_page(root: &GtkBox, message: &str) {
-    append_repo_overview_empty_title(root);
-    let body = Label::new(Some(message));
-    body.set_xalign(0.0);
-    body.set_wrap(true);
-    body.add_css_class("muted");
-    root.append(&body);
+    root.append(&ui::empty_state(
+        "folder-symbolic",
+        "Repo Overview",
+        message,
+        None,
+    ));
 }
 
 fn render_repo_overview_summary_page(
@@ -9724,23 +9692,22 @@ fn render_repo_overview_summary_page(
     attention_signals: &[AttentionSignal],
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
+    root.append(&repo_overview_action_row(
+        item,
+        host_ptr,
+        &[
+            ("Open In Editor", None, ui::ButtonKind::Primary),
+            ("Run Cap Checks", None, ui::ButtonKind::Secondary),
+            ("Target This Repo", None, ui::ButtonKind::Secondary),
+            ("Open Folder", None, ui::ButtonKind::Secondary),
+        ],
+    ));
     root.append(&repo_overview_summary_facts_section(
         snapshot,
         item,
         attention_signals,
     ));
     root.append(&repo_overview_attention_section(attention_signals));
-    root.append(&repo_overview_action_section(
-        "Primary Actions",
-        item,
-        host_ptr,
-        &[
-            ("Target This Repo", None),
-            ("Run Cap Checks", None),
-            ("Open In Editor", None),
-            ("Open Folder", None),
-        ],
-    ));
 }
 
 fn render_repo_overview_git_page(
@@ -9750,22 +9717,40 @@ fn render_repo_overview_git_page(
     details: Option<&RepositoryDetails>,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    root.append(&repo_overview_action_section(
-        "Git Actions",
+    root.append(&repo_overview_action_row(
         item,
         host_ptr,
         &[
-            ("Pull Repo", Some(OperationKind::Pull)),
-            ("Push Repo", Some(OperationKind::Push)),
-            ("Clone Repo", Some(OperationKind::CloneMissing)),
+            (
+                "Pull Repo",
+                Some(OperationKind::Pull),
+                ui::ButtonKind::Primary,
+            ),
+            (
+                "Push Repo",
+                Some(OperationKind::Push),
+                ui::ButtonKind::Secondary,
+            ),
+            (
+                "Clone Repo",
+                Some(OperationKind::CloneMissing),
+                ui::ButtonKind::Secondary,
+            ),
+            (
+                "Apply Hooks",
+                Some(OperationKind::ApplyHooks),
+                ui::ButtonKind::Secondary,
+            ),
             (
                 "Push Repo (skip checks)",
                 Some(OperationKind::PushSkipChecks),
+                ui::ButtonKind::Danger,
             ),
-            ("Apply Hooks", Some(OperationKind::ApplyHooks)),
         ],
     ));
-    root.append(&repo_overview_git_section(snapshot, item, details));
+    for section in repo_overview_git_sections(snapshot, item, details) {
+        root.append(&section);
+    }
 }
 
 fn render_repo_overview_manifest_page(
@@ -9774,18 +9759,17 @@ fn render_repo_overview_manifest_page(
     item: &RepositoryListItem,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    root.append(&repo_overview_manifest_status_section(item));
-    root.append(&repo_overview_action_section(
-        "Manifest Actions",
+    root.append(&repo_overview_action_row(
         item,
         host_ptr,
         &[
-            ("Edit Repo Manifest", None),
-            ("Run Cap Checks", None),
-            ("Edit README", None),
-            ("Edit .git/config", None),
+            ("Edit Repo Manifest", None, ui::ButtonKind::Primary),
+            ("Run Cap Checks", None, ui::ButtonKind::Secondary),
+            ("Edit README", None, ui::ButtonKind::Link),
+            ("Edit .git/config", None, ui::ButtonKind::Link),
         ],
     ));
+    root.append(&repo_overview_manifest_status_section(item));
     root.append(&repo_overview_capabilities_section(snapshot, item));
 }
 
@@ -9829,7 +9813,7 @@ fn repo_overview_summary_facts_section(
             repo_due_capability_count(snapshot, item, current_epoch_secs()).to_string(),
         ),
     ];
-    repo_overview_section("Status", &repo_overview_facts_body(&facts))
+    ui::section("Status", &[], &ui::card(&ui::key_value_grid(&facts)))
 }
 
 fn repo_overview_manifest_status_section(item: &RepositoryListItem) -> GtkBox {
@@ -9875,120 +9859,146 @@ fn repo_overview_manifest_status_section(item: &RepositoryListItem) -> GtkBox {
         }
     }
 
-    repo_overview_section("Manifest", &repo_overview_facts_body(&facts))
+    ui::section("Manifest", &[], &ui::card(&ui::key_value_grid(&facts)))
 }
 
-fn repo_overview_action_section(
-    title: &str,
+/// The page's action toolbar: buttons for operations, links for editors.
+fn repo_overview_action_row(
     item: &RepositoryListItem,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
-    actions: &[(&'static str, Option<OperationKind>)],
+    actions: &[(&'static str, Option<OperationKind>, ui::ButtonKind)],
 ) -> GtkBox {
-    let body = GtkBox::new(Orientation::Horizontal, 8);
-    body.set_hexpand(true);
-    for (label, kind) in actions {
-        body.append(&repo_overview_action_button(item, host_ptr, label, *kind));
+    let row = ui::hbox(8);
+    for (label, kind, style) in actions {
+        row.append(&repo_overview_action_button(
+            item, host_ptr, label, *kind, *style,
+        ));
     }
-    repo_overview_section(title, &body)
+    row
 }
 
-fn append_repo_overview_empty_title(root: &GtkBox) {
-    let title = Label::new(Some("Repo Overview"));
-    title.set_xalign(0.0);
-    title.add_css_class("title-2");
-    root.append(&title);
-}
-
+/// The page header: repository name with status badges, then its path,
+/// branch and sync state.
 fn repo_overview_context(
     item: &RepositoryListItem,
     snapshot: &StateSnapshot,
     attention_signals: &[AttentionSignal],
 ) -> GtkBox {
-    let block = GtkBox::new(Orientation::Vertical, 4);
+    let block = ui::vbox(6);
 
-    let context = Label::new(Some(&format!(
-        "{}   {}   {}",
-        item.status.repo_path.display(),
-        branch_label(item),
-        format_sync_label(&item.status.sync)
-    )));
-    context.set_xalign(0.0);
-    context.add_css_class("muted");
-    context.set_wrap(true);
-    block.append(&context);
-
-    let status = Label::new(Some(&format!(
-        "{} · attention {} · caps {} · due {} · {}",
+    let title_row = ui::hbox(8);
+    let title = ui::page_title(&item.name);
+    title_row.append(&title);
+    title_row.append(&ui::badge(
         status_label(&item.status.state),
-        attention_monitor_label(attention_signals),
-        capability_monitor_label(&capability_monitor_summary(
-            item,
-            &snapshot.capability_registry
-        )),
-        repo_due_capability_count(snapshot, item, current_epoch_secs()),
-        if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
-            "selected"
-        } else {
-            "not selected"
-        }
+        state_badge_tone(&item.status.state),
+    ));
+    let rank = attention_rank(attention_signals);
+    if rank <= 4 {
+        let badge = ui::badge(
+            &format!("Attention: {}", attention_monitor_label(attention_signals)),
+            match rank {
+                0 | 1 => ui::Tone::Danger,
+                2 => ui::Tone::Warning,
+                _ => ui::Tone::Muted,
+            },
+        );
+        attach_text_tooltip(&badge, attention_monitor_tooltip(attention_signals));
+        title_row.append(&badge);
+    }
+    let capabilities = capability_monitor_summary(item, &snapshot.capability_registry);
+    let capability_label = capability_monitor_label(&capabilities);
+    let capability_badge = if capability_label == "-" {
+        ui::badge("No checks", ui::Tone::Muted)
+    } else {
+        ui::badge(
+            &format!("Checks: {capability_label}"),
+            capability_monitor_tone(&capabilities),
+        )
+    };
+    attach_text_tooltip(&capability_badge, capability_monitor_tooltip(&capabilities));
+    title_row.append(&capability_badge);
+    let due = repo_due_capability_count(snapshot, item, current_epoch_secs());
+    if due > 0 {
+        title_row.append(&ui::badge(&format!("{due} due"), ui::Tone::Warning));
+    }
+    if snapshot.selected_repo_ids.iter().any(|id| id == &item.id) {
+        title_row.append(&ui::badge("Selected", ui::Tone::Accent));
+    }
+    block.append(&title_row);
+
+    let meta_row = ui::hbox(12);
+    let path = ui::ellipsized(
+        &item.status.repo_path.display().to_string(),
+        &["mono", "ronomepo-meta", "ronomepo-fg-muted"],
+    );
+    path.set_hexpand(false);
+    path.set_ellipsize(EllipsizeMode::Start);
+    let branch = ui::badge(branch_label(item), ui::Tone::Neutral);
+    branch.set_tooltip_text(Some("Current branch"));
+    let (sync_arrows, sync_tone) = sync_compact(&item.status.sync);
+    let sync = Label::new(Some(&format!(
+        "{sync_arrows}  {}",
+        sync_description(&item.status.sync)
     )));
-    status.set_xalign(0.0);
-    status.add_css_class("dim-label");
-    status.set_wrap(true);
-    block.append(&status);
+    sync.add_css_class("ronomepo-meta");
+    ui::set_fg_tone(&sync, sync_tone);
+    meta_row.append(&branch);
+    meta_row.append(&sync);
+    meta_row.append(&path);
+    block.append(&meta_row);
 
     block
 }
 
-fn repo_overview_section(title: &str, child: &impl IsA<gtk::Widget>) -> GtkBox {
-    let block = GtkBox::new(Orientation::Vertical, 8);
+fn state_badge_tone(state: &ronomepo_core::RepositoryState) -> ui::Tone {
+    match state {
+        ronomepo_core::RepositoryState::Clean => ui::Tone::Success,
+        other => state_tone(other),
+    }
+}
 
-    let heading = Label::new(Some(title));
-    heading.set_xalign(0.0);
-    heading.add_css_class("title-4");
-    block.append(&heading);
-    block.append(child);
-
-    block
+fn attention_severity(level: AttentionLevel) -> ui::Severity {
+    match level {
+        AttentionLevel::Blocked | AttentionLevel::Urgent => ui::Severity::Error,
+        AttentionLevel::ShouldDo => ui::Severity::Warning,
+        AttentionLevel::Opportunity => ui::Severity::WeakWarning,
+        AttentionLevel::Info => ui::Severity::Info,
+    }
 }
 
 fn repo_overview_attention_section(signals: &[AttentionSignal]) -> GtkBox {
-    let body = GtkBox::new(Orientation::Vertical, 8);
+    let count = ui::badge(&signals.len().to_string(), ui::Tone::Muted);
     if signals.is_empty() {
-        let empty = Label::new(Some("No open attention signals."));
-        empty.set_xalign(0.0);
-        empty.add_css_class("muted");
-        body.append(&empty);
-    } else {
-        for signal in signals {
-            body.append(&repo_overview_attention_row(signal));
-        }
+        let empty = ui::hbox(8);
+        let icon = Image::from_icon_name("object-select-symbolic");
+        icon.add_css_class("ronomepo-fg-success");
+        empty.append(&icon);
+        let label = Label::new(Some("No open attention signals."));
+        label.add_css_class("ronomepo-fg-muted");
+        empty.append(&label);
+        return ui::section("Needs Attention", &[count.upcast_ref()], &empty);
     }
-    repo_overview_section("Needs Attention", &body)
+    let list = ui::list_card();
+    for signal in signals {
+        ui::list_card_item(&list, &repo_overview_attention_row(signal));
+    }
+    ui::section("Needs Attention", &[count.upcast_ref()], &list)
 }
 
 fn repo_overview_attention_row(signal: &AttentionSignal) -> GtkBox {
-    let row = GtkBox::new(Orientation::Vertical, 2);
-
-    let summary = Label::new(Some(&signal.summary));
-    summary.set_xalign(0.0);
-    summary.set_wrap(true);
-    row.append(&summary);
-
-    let meta = Label::new(Some(&format!(
-        "{} · {} · {} · urgency {} · impact {}",
-        attention_level_label(signal.level),
-        attention_kind_label(signal.kind),
-        attention_source_label(signal.source),
-        attention_urgency_label(signal.urgency),
-        attention_impact_label(signal.impact)
-    )));
-    meta.set_xalign(0.0);
-    meta.set_wrap(true);
-    meta.add_css_class("dim-label");
-    row.append(&meta);
-
-    row
+    ui::problem_row(
+        attention_severity(signal.level),
+        &signal.summary,
+        &format!(
+            "{} · {} · {} · urgency {} · impact {}",
+            attention_level_label(signal.level),
+            attention_kind_label(signal.kind),
+            attention_source_label(signal.source),
+            attention_urgency_label(signal.urgency),
+            attention_impact_label(signal.impact)
+        ),
+    )
 }
 
 fn repo_overview_capabilities_section(
@@ -9999,18 +10009,17 @@ fn repo_overview_capabilities_section(
     let body = repo_overview_lines_body(
         &lines,
         "No capabilities declared or recorded for this repository.",
-        false,
+        true,
     );
-    repo_overview_section("Capabilities", &body)
+    ui::section("Capabilities", &[], &body)
 }
 
-fn repo_overview_git_section(
+fn repo_overview_git_sections(
     snapshot: &StateSnapshot,
     item: &RepositoryListItem,
     details: Option<&RepositoryDetails>,
-) -> GtkBox {
-    let body = GtkBox::new(Orientation::Vertical, 10);
-    body.append(&repo_overview_facts_body(&[
+) -> [GtkBox; 3] {
+    let facts = ui::key_value_grid(&[
         ("State", status_label(&item.status.state).to_string()),
         ("Sync", format_sync_label(&item.status.sync)),
         ("Selection", repo_selection_scope_label(snapshot, item)),
@@ -10028,52 +10037,53 @@ fn repo_overview_git_section(
                 }),
         ),
         ("Remote", item.remote_url.clone()),
-    ]));
-
-    body.append(&repo_overview_subsection_label("Changed Files"));
-    body.append(&repo_overview_lines_body(
-        &details
-            .map(|details| details.changed_files.clone())
-            .unwrap_or_else(|| {
-                if snapshot.repo_details_loading.contains(&item.id) {
-                    vec!["Loading working tree details...".to_string()]
-                } else {
-                    Vec::new()
-                }
-            }),
-        "Working tree is clean.",
-        true,
-    ));
-
-    body.append(&repo_overview_subsection_label("Remotes"));
-    body.append(&repo_overview_lines_body(
-        &details
-            .map(|details| details.remotes.clone())
-            .unwrap_or_else(|| {
-                if snapshot.repo_details_loading.contains(&item.id) {
-                    vec!["Loading remotes...".to_string()]
-                } else {
-                    Vec::new()
-                }
-            }),
-        "No remotes reported for this repository.",
-        true,
-    ));
-
-    repo_overview_section("Git", &body)
+    ]);
+    let loading = snapshot.repo_details_loading.contains(&item.id);
+    let changed_files = details
+        .map(|details| details.changed_files.clone())
+        .unwrap_or_else(|| {
+            if loading {
+                vec!["Loading working tree details...".to_string()]
+            } else {
+                Vec::new()
+            }
+        });
+    let remotes = details
+        .map(|details| details.remotes.clone())
+        .unwrap_or_else(|| {
+            if loading {
+                vec!["Loading remotes...".to_string()]
+            } else {
+                Vec::new()
+            }
+        });
+    let changed_count = ui::badge(&changed_files.len().to_string(), ui::Tone::Muted);
+    [
+        ui::section("Git", &[], &ui::card(&facts)),
+        ui::section(
+            "Changed Files",
+            &[changed_count.upcast_ref()],
+            &repo_overview_lines_body(&changed_files, "Working tree is clean.", true),
+        ),
+        ui::section(
+            "Remotes",
+            &[],
+            &repo_overview_lines_body(&remotes, "No remotes reported for this repository.", true),
+        ),
+    ]
 }
 
 fn repo_overview_workspace_section(
     snapshot: &StateSnapshot,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> GtkBox {
-    let body = GtkBox::new(Orientation::Vertical, 8);
+    let body = ui::vbox(8);
     body.append(&overview_command_group("Actions", overview_actions(true)));
     body.append(&overview_command_group(
         "Files",
         overview_file_actions(snapshot, host_ptr),
     ));
-    repo_overview_section("Workspace", &body)
+    ui::section("Workspace", &[], &body)
 }
 
 fn repo_overview_activity_section(logs: &[String], limit: usize) -> GtkBox {
@@ -10083,63 +10093,34 @@ fn repo_overview_activity_section(logs: &[String], limit: usize) -> GtkBox {
         visible.push("No operations recorded yet.".to_string());
     }
     let body = repo_overview_lines_body(&visible, "No operations recorded yet.", true);
-    repo_overview_section("Activity", &body)
+    ui::section("Activity", &[], &body)
 }
 
-fn repo_overview_subsection_label(text: &str) -> Label {
-    let label = Label::new(Some(text));
-    label.set_xalign(0.0);
-    label.add_css_class("dim-label");
-    label
-}
-
+/// Lines in a bordered list (monospace for paths, logs and git output), or a
+/// muted message when there are none.
 fn repo_overview_lines_body(lines: &[String], empty_message: &str, mono: bool) -> GtkBox {
-    let block = GtkBox::new(Orientation::Vertical, 6);
     if lines.is_empty() {
+        let block = ui::vbox(0);
         let empty = Label::new(Some(empty_message));
         empty.set_xalign(0.0);
-        empty.add_css_class("muted");
+        empty.add_css_class("ronomepo-fg-muted");
         block.append(&empty);
-    } else {
-        for line in lines {
-            let row = Label::new(Some(line));
-            row.set_xalign(0.0);
-            row.set_wrap(true);
-            if mono {
-                row.add_css_class("mono");
-            }
-            block.append(&row);
+        return block;
+    }
+    let list = ui::list_card();
+    for line in lines {
+        let row = Label::new(Some(line));
+        row.set_xalign(0.0);
+        row.set_wrap(true);
+        row.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        row.set_selectable(true);
+        if mono {
+            row.add_css_class("mono");
+            row.add_css_class("ronomepo-meta");
         }
+        ui::list_card_item(&list, &row);
     }
-    block
-}
-
-fn repo_overview_facts_body(facts: &[(&str, String)]) -> GtkBox {
-    facts_body(facts, 9)
-}
-
-/// Rows of dimmed keys (`key_width_chars` wide) and wrapping values.
-fn facts_body(facts: &[(&str, String)], key_width_chars: i32) -> GtkBox {
-    let block = GtkBox::new(Orientation::Vertical, 6);
-    for (label, value) in facts {
-        let row = GtkBox::new(Orientation::Horizontal, 10);
-        row.set_hexpand(true);
-
-        let key = Label::new(Some(label));
-        key.set_xalign(0.0);
-        key.set_width_chars(key_width_chars);
-        key.add_css_class("dim-label");
-
-        let value_label = Label::new(Some(value));
-        value_label.set_xalign(0.0);
-        value_label.set_hexpand(true);
-        value_label.set_wrap(true);
-
-        row.append(&key);
-        row.append(&value_label);
-        block.append(&row);
-    }
-    block
+    list
 }
 
 fn build_repo_terminal_panel(snapshot: &StateSnapshot, instance_key: Option<&str>) -> GtkBox {
@@ -10435,7 +10416,7 @@ fn overview_actions(include_open_overview: bool) -> GtkBox {
 
     let operation_running = operation_in_flight();
     for (label, handler) in entries {
-        let button = clickable_button_with_label(label);
+        let button = ui::button(label, ui::ButtonKind::Secondary);
         if matches!(label, "Pull" | "Push") {
             set_operation_button_running(&button, operation_running);
             let button_ref = glib::WeakRef::new();
@@ -10468,14 +10449,16 @@ fn refresh_operation_buttons() {
     });
 }
 
+/// A labelled row of actions, the label aligned like a settings key.
 fn overview_command_group(label: &str, actions: GtkBox) -> GtkBox {
-    let group = GtkBox::new(Orientation::Horizontal, 12);
+    let group = ui::hbox(16);
     group.set_hexpand(true);
 
     let label_widget = Label::new(Some(label));
     label_widget.set_xalign(0.0);
-    label_widget.set_width_chars(10);
-    label_widget.add_css_class("dim-label");
+    label_widget.set_valign(Align::Center);
+    label_widget.set_size_request(80, -1);
+    label_widget.add_css_class("ronomepo-kv-key");
     group.append(&label_widget);
 
     actions.set_hexpand(true);
@@ -10484,7 +10467,7 @@ fn overview_command_group(label: &str, actions: GtkBox) -> GtkBox {
 }
 
 fn action_button(label: &str, count: usize) -> Button {
-    let button = clickable_button_with_label(&format!("{label} ({count})"));
+    let button = ui::button(&format!("{label} ({count})"), ui::ButtonKind::Secondary);
     button.set_sensitive(count > 0);
     button
 }
@@ -10533,7 +10516,7 @@ fn report_button(
     label: &str,
     handler: extern "C" fn(maruzzella_sdk::ffi::MzBytes) -> maruzzella_sdk::ffi::MzStatus,
 ) -> Button {
-    let button = clickable_button_with_label(label);
+    let button = ui::button(label, ui::ButtonKind::Secondary);
     button.connect_clicked(move |_| {
         let _ = handler(maruzzella_sdk::ffi::MzBytes::empty());
     });
@@ -10549,7 +10532,7 @@ fn set_report_button_loading(button: &Button, label: &str, loading: bool) {
 }
 
 fn repo_target_button(item: &RepositoryListItem) -> Button {
-    let button = clickable_button_with_label("Target");
+    let button = ui::link_button("Target");
     let repo_id = item.id.clone();
     button.connect_clicked(move |_| {
         update_selected_repo_ids(vec![repo_id.clone()]);
@@ -10562,7 +10545,7 @@ fn repo_open_button(
     item: &RepositoryListItem,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> Button {
-    let button = clickable_button_with_label("Open");
+    let button = ui::link_button("Open");
     let repo_id = item.id.clone();
     button.connect_clicked(move |_| {
         open_repo_overviews(host_ptr, std::slice::from_ref(&repo_id));
@@ -10574,93 +10557,55 @@ fn overview_repo_row(
     item: &RepositoryListItem,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, 10);
-    row.set_margin_top(2);
-    row.set_margin_bottom(2);
-    row.set_margin_start(8);
-    row.set_margin_end(8);
+    let row = ui::hbox(12);
+    row.add_css_class("ronomepo-tree-row");
     row.set_tooltip_text(Some(&format!(
         "{}\n{}",
         item.status.repo_path.display(),
         item.remote_url
     )));
 
-    let name = monitor_text_cell(
-        &item.name,
-        MONITOR_NAME_COL_CHARS,
-        MONITOR_NAME_COL_WIDTH,
-        false,
-    );
-    let branch = monitor_text_cell(
-        branch_label(item),
-        MONITOR_BRANCH_COL_CHARS,
-        MONITOR_BRANCH_COL_WIDTH,
-        false,
-    );
-    let state = monitor_state_cell(&item.status.state);
-    let sync = monitor_sync_cell(&item.status.sync);
+    let name = monitor_cell(&item.name, None);
+    name.add_css_class("ronomepo-row-name");
+    if let Some(class) = repo_name_vcs_class(&item.status.state) {
+        name.add_css_class(class);
+    }
+    let branch = monitor_cell(branch_label(item), Some(MONITOR_BRANCH_COL_WIDTH));
+    branch.add_css_class("ronomepo-fg-muted");
 
     row.append(&name);
     row.append(&branch);
-    row.append(&state);
-    row.append(&sync);
-    row.append(&repo_target_button(item));
-    row.append(&repo_open_button(item, host_ptr));
+    row.append(&monitor_state_cell(&item.status.state));
+    row.append(&monitor_sync_cell(&item.status.sync));
+    let actions = ui::hbox(12);
+    actions.set_size_request(OVERVIEW_ROW_ACTIONS_WIDTH, -1);
+    actions.set_halign(Align::End);
+    actions.append(&repo_target_button(item));
+    actions.append(&repo_open_button(item, host_ptr));
+    row.append(&actions);
     row
 }
 
+const OVERVIEW_ROW_ACTIONS_WIDTH: i32 = 96;
+
 fn overview_repo_header() -> GtkBox {
-    let header = GtkBox::new(Orientation::Horizontal, 10);
-    header.add_css_class("mono");
-    header.set_margin_start(8);
-    header.set_margin_end(8);
-    header.set_margin_bottom(2);
-
-    let name = monitor_text_cell(
-        "Name",
-        MONITOR_NAME_COL_CHARS,
-        MONITOR_NAME_COL_WIDTH,
-        false,
-    );
-    let branch = monitor_text_cell(
-        "Branch",
-        MONITOR_BRANCH_COL_CHARS,
-        MONITOR_BRANCH_COL_WIDTH,
-        false,
-    );
-    let state = monitor_text_cell(
-        "State",
-        MONITOR_STATE_COL_CHARS,
-        MONITOR_STATE_COL_WIDTH,
-        false,
-    );
-    let sync = Label::new(Some("Sync"));
-    sync.set_xalign(0.0);
-    sync.set_hexpand(true);
-    sync.set_ellipsize(EllipsizeMode::End);
-
-    for label in [&name, &branch, &state, &sync] {
-        label.add_css_class("dim-label");
-        header.append(label);
-    }
-
-    let action_space = Label::new(Some(""));
-    action_space.set_width_chars(14);
-    header.append(&action_space);
+    let header = ui::hbox(12);
+    header.add_css_class("ronomepo-table-header");
+    header.append(&monitor_cell("Name", None));
+    header.append(&monitor_cell("Branch", Some(MONITOR_BRANCH_COL_WIDTH)));
+    header.append(&monitor_cell("Status", Some(MONITOR_STATE_COL_WIDTH)));
+    header.append(&monitor_cell("Sync", Some(MONITOR_SYNC_COL_WIDTH)));
+    let actions = monitor_cell("", Some(OVERVIEW_ROW_ACTIONS_WIDTH));
+    header.append(&actions);
     header
 }
 
 fn append_facts_section(container: &GtkBox, heading: &str, facts: &[(&str, String)]) {
-    let block = GtkBox::new(Orientation::Vertical, 8);
-
-    let heading_label = Label::new(Some(heading));
-    heading_label.set_xalign(0.0);
-    heading_label.add_css_class("title-4");
-    block.append(&heading_label);
-    block.append(&facts_body(facts, 12));
-
-    container.append(&block);
-    container.append(&Separator::new(Orientation::Horizontal));
+    container.append(&ui::section(
+        heading,
+        &[],
+        &ui::card(&ui::key_value_grid(facts)),
+    ));
 }
 
 fn sync_bucket_ids(items: &[RepositoryListItem], sync_label: &str) -> Vec<String> {
@@ -10683,8 +10628,9 @@ fn repo_overview_action_button(
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
     label: &'static str,
     kind: Option<OperationKind>,
+    style: ui::ButtonKind,
 ) -> Button {
-    let button = clickable_button_with_label(label);
+    let button = ui::button(label, style);
     let repo_id = item.id.clone();
     let repo_name = item.name.clone();
     let repo_path = item.status.repo_path.clone();
@@ -10730,7 +10676,7 @@ fn overview_file_actions(
     snapshot: &StateSnapshot,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) -> GtkBox {
-    let actions = GtkBox::new(Orientation::Horizontal, 8);
+    let actions = ui::hbox(16);
 
     for (label, path) in [
         (
@@ -10742,7 +10688,7 @@ fn overview_file_actions(
         ),
         ("Edit repos.txt", snapshot.workspace_root.join("repos.txt")),
     ] {
-        let button = clickable_button_with_label(label);
+        let button = ui::link_button(label);
         button.connect_clicked(move |_| {
             open_text_editor_for_path(host_ptr, &path);
         });
@@ -10757,14 +10703,13 @@ fn monorepo_selection_actions(
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
     items: &[RepositoryListItem],
 ) -> GtkBox {
-    let actions = GtkBox::new(Orientation::Vertical, 8);
-    let bucket_row = GtkBox::new(Orientation::Horizontal, 8);
-    let scope_row = GtkBox::new(Orientation::Horizontal, 8);
+    let actions = ui::vbox(8);
+    let scope_row = ui::hbox(8);
 
     let selected_ids = snapshot.selected_repo_ids.clone();
     let selected_count = selected_ids.len();
 
-    for button in [
+    let buckets = [
         select_repo_bucket(
             "Select Attention",
             collect_repo_ids(items, |item| repo_attention_rank(snapshot, item) < 7),
@@ -10789,9 +10734,8 @@ fn monorepo_selection_actions(
         select_repo_bucket("Select Behind", sync_bucket_ids(items, "behind")),
         select_repo_bucket("Select Diverged", sync_bucket_ids(items, "diverged")),
         select_repo_bucket("Select No Upstream", sync_bucket_ids(items, "no_upstream")),
-    ] {
-        bucket_row.append(&button);
-    }
+    ];
+    let bucket_row = ui::wrap_box(&buckets.each_ref().map(|button| button.upcast_ref()), 8);
 
     scope_row.append(&repo_overview_open_button(
         host_ptr,
@@ -10800,7 +10744,7 @@ fn monorepo_selection_actions(
     ));
     scope_row.append(&clear_selection_button(selected_count));
 
-    let settings = clickable_button_with_label("Fucina Policy");
+    let settings = ui::link_button("Fucina Policy");
     settings.connect_clicked(move |_| {
         if let Err(message) = open_workspace_settings_tab() {
             append_log(message);
@@ -10815,58 +10759,60 @@ fn monorepo_selection_actions(
 }
 
 fn monorepo_report_controls() -> MonorepoReportControls {
-    let actions = GtkBox::new(Orientation::Horizontal, 8);
-
+    let history_row = ui::hbox(8);
     let check_history = report_button("Check History", command_check_history);
-    actions.append(&check_history);
-
-    let open_commit_check = clickable_button_with_label("Open Commit Check");
+    history_row.append(&check_history);
+    let open_commit_check = ui::link_button("Open Commit Check");
     open_commit_check.connect_clicked(|_| {
         let _ = command_open_commit_check(maruzzella_sdk::ffi::MzBytes::empty());
     });
-    actions.append(&open_commit_check);
+    history_row.append(&open_commit_check);
 
+    let stats_row = ui::hbox(8);
     let since_entry = Entry::new();
+    since_entry.add_css_class(&input_css_class("field"));
     since_entry.set_placeholder_text(Some("Since date YYYY-MM-DD"));
-    since_entry.set_hexpand(true);
+    since_entry.set_width_chars(22);
     since_entry.connect_changed(|entry| {
         update_line_stats_since(entry.text().to_string());
     });
     since_entry.connect_activate(|_| {
         let _ = command_line_stats(maruzzella_sdk::ffi::MzBytes::empty());
     });
-    actions.append(&since_entry);
-
+    stats_row.append(&since_entry);
     let line_stats = report_button("Line Stats", command_line_stats);
-    actions.append(&line_stats);
-
-    let capability_checks = clickable_button_with_label("Capability Checks");
-    capability_checks.connect_clicked(|_| {
-        run_selected_repo_capability_checks();
-    });
-    actions.append(&capability_checks);
-
-    let stale_capability_checks = clickable_button_with_label("Stale Cap Checks");
-    stale_capability_checks.connect_clicked(|_| {
-        run_stale_repo_capability_checks();
-    });
-    actions.append(&stale_capability_checks);
-
-    let due_capability_checks = clickable_button_with_label("Due Cap Checks");
-    due_capability_checks.connect_clicked(|_| {
-        run_due_repo_capability_checks();
-    });
-    actions.append(&due_capability_checks);
-
-    let all_time = clickable_button_with_label("All Time");
+    stats_row.append(&line_stats);
+    let all_time = ui::button("All Time", ui::ButtonKind::Ghost);
     all_time.connect_clicked(|_| {
         update_line_stats_since(String::new());
         let _ = command_line_stats(maruzzella_sdk::ffi::MzBytes::empty());
     });
-    actions.append(&all_time);
+    stats_row.append(&all_time);
+
+    let capability_row = ui::hbox(8);
+    let capability_checks = ui::button("Capability Checks", ui::ButtonKind::Secondary);
+    capability_checks.connect_clicked(|_| {
+        run_selected_repo_capability_checks();
+    });
+    capability_row.append(&capability_checks);
+    let stale_capability_checks = ui::button("Stale Cap Checks", ui::ButtonKind::Secondary);
+    stale_capability_checks.connect_clicked(|_| {
+        run_stale_repo_capability_checks();
+    });
+    capability_row.append(&stale_capability_checks);
+    let due_capability_checks = ui::button("Due Cap Checks", ui::ButtonKind::Secondary);
+    due_capability_checks.connect_clicked(|_| {
+        run_due_repo_capability_checks();
+    });
+    capability_row.append(&due_capability_checks);
+
+    let rows = ui::vbox(8);
+    rows.append(&history_row);
+    rows.append(&stats_row);
+    rows.append(&capability_row);
 
     MonorepoReportControls {
-        row: actions,
+        row: rows,
         check_history,
         since_entry,
         line_stats,
@@ -10908,46 +10854,12 @@ where
         .collect()
 }
 
-fn stat_card(label: &str, value: &str) -> GtkBox {
-    let card = GtkBox::new(Orientation::Vertical, 4);
-    card.set_margin_bottom(8);
-
-    let value_label = Label::new(Some(value));
-    value_label.set_xalign(0.0);
-    value_label.add_css_class("title-3");
-    let label_widget = Label::new(Some(label));
-    label_widget.set_xalign(0.0);
-    label_widget.add_css_class("muted");
-
-    card.append(&value_label);
-    card.append(&label_widget);
-    card
-}
-
 fn append_lines_section(container: &GtkBox, heading: &str, lines: &[String], empty_message: &str) {
-    let block = GtkBox::new(Orientation::Vertical, 6);
-    let heading_label = Label::new(Some(heading));
-    heading_label.set_xalign(0.0);
-    heading_label.add_css_class("title-4");
-    block.append(&heading_label);
-
-    if lines.is_empty() {
-        let empty = Label::new(Some(empty_message));
-        empty.set_xalign(0.0);
-        empty.add_css_class("muted");
-        block.append(&empty);
-    } else {
-        for line in lines {
-            let row = Label::new(Some(line));
-            row.set_xalign(0.0);
-            row.set_wrap(true);
-            row.add_css_class("mono");
-            block.append(&row);
-        }
-    }
-
-    container.append(&block);
-    container.append(&Separator::new(Orientation::Horizontal));
+    container.append(&ui::section(
+        heading,
+        &[],
+        &repo_overview_lines_body(lines, empty_message, true),
+    ));
 }
 
 fn append_repo_group_section(
@@ -10958,71 +10870,46 @@ fn append_repo_group_section(
     limit: Option<usize>,
     host_ptr: *const maruzzella_sdk::ffi::MzHostApi,
 ) {
-    let block = GtkBox::new(Orientation::Vertical, 6);
-
-    let heading_label = Label::new(Some(heading));
-    heading_label.set_xalign(0.0);
-    heading_label.add_css_class("title-4");
-
-    let body_label = Label::new(Some(body));
-    body_label.set_xalign(0.0);
-    body_label.set_wrap(true);
-    body_label.add_css_class("muted");
-
-    block.append(&heading_label);
-    block.append(&body_label);
+    let block = ui::vbox(8);
+    block.append(&ui::hint(body));
 
     if items.is_empty() {
         let empty_label = Label::new(Some("Nothing to show."));
         empty_label.set_xalign(0.0);
-        empty_label.add_css_class("muted");
+        empty_label.add_css_class("ronomepo-fg-muted");
         block.append(&empty_label);
     } else {
         let take = limit.unwrap_or(items.len());
-        block.append(&overview_repo_header());
+        let table = ui::list_card();
+        table.append(&overview_repo_header());
         for item in items.iter().take(take) {
-            block.append(&overview_repo_row(item, host_ptr));
+            table.append(&overview_repo_row(item, host_ptr));
         }
+        block.append(&table);
         if items.len() > take {
             let more_label = Label::new(Some(&format!(
                 "{} more repos hidden in this section.",
                 items.len() - take
             )));
             more_label.set_xalign(0.0);
-            more_label.add_css_class("muted");
+            more_label.add_css_class("ronomepo-fg-muted");
             block.append(&more_label);
         }
     }
 
-    container.append(&block);
-    container.append(&Separator::new(Orientation::Horizontal));
+    let count = ui::badge(&items.len().to_string(), ui::Tone::Muted);
+    container.append(&ui::section(heading, &[count.upcast_ref()], &block));
 }
 
 fn append_log_section(container: &GtkBox, heading: &str, logs: &[String], limit: usize) {
-    let block = GtkBox::new(Orientation::Vertical, 6);
-
-    let heading_label = Label::new(Some(heading));
-    heading_label.set_xalign(0.0);
-    heading_label.add_css_class("title-4");
-    block.append(&heading_label);
-
-    if logs.is_empty() {
-        let empty_label = Label::new(Some("No operations recorded yet."));
-        empty_label.set_xalign(0.0);
-        empty_label.add_css_class("muted");
-        block.append(&empty_label);
-    } else {
-        for entry in logs.iter().rev().take(limit).rev() {
-            let row = Label::new(Some(entry));
-            row.set_xalign(0.0);
-            row.set_wrap(true);
-            row.add_css_class("mono");
-            block.append(&row);
-        }
-    }
-
-    container.append(&block);
-    container.append(&Separator::new(Orientation::Horizontal));
+    let lines = logs
+        .iter()
+        .rev()
+        .take(limit)
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>();
+    append_lines_section(container, heading, &lines, "No operations recorded yet.");
 }
 
 fn attention_items(
@@ -11270,6 +11157,7 @@ fn create_repo_manifest_editor_view(
     }
 
     let host = remember_host_ptr(host);
+    ui::install_stylesheet();
 
     let repo_id = unsafe { request.as_ref() }
         .and_then(|request| decode_mzstr(request.instance_key))
@@ -12089,6 +11977,7 @@ fn create_text_editor_view(
     }
 
     let host = remember_host_ptr(host);
+    ui::install_stylesheet();
 
     let root = padded_view_root(12, 18);
 
@@ -12449,23 +12338,53 @@ fn create_operations_view(
     }
 
     let host = remember_host_ptr(host);
+    ui::install_stylesheet();
 
-    let root = padded_view_root(12, 18);
+    let root = GtkBox::new(Orientation::Vertical, 0);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
 
     let (cursor, logs) = {
         let app_state = state().lock().expect("state mutex poisoned");
         (log_cursor(&app_state), app_state.logs.clone())
     };
-    let summary = Label::new(Some(&operation_summary_text(&logs)));
-    summary.set_xalign(0.0);
-    summary.add_css_class("muted");
-    summary.set_wrap(true);
-    summary.set_hexpand(true);
 
-    let summary_row = GtkBox::new(Orientation::Horizontal, 8);
-    summary_row.set_halign(Align::Fill);
-    summary_row.set_hexpand(true);
-    summary_row.set_valign(Align::Center);
+    // Run tool window style header: title, live counters, then actions.
+    let header = ui::hbox(12);
+    header.add_css_class("ronomepo-toolwindow-header");
+    let title = Label::new(Some("Operations"));
+    title.add_css_class("ronomepo-toolwindow-title");
+    header.append(&title);
+    let stats = ui::hbox(12);
+    let mut stat_values = Vec::new();
+    for caption in ["started", "ok", "skipped", "failed"] {
+        let (stat, value) = ui::stat(caption);
+        stats.append(&stat);
+        stat_values.push(value);
+    }
+    header.append(&stats);
+    let latest = Label::new(None);
+    latest.set_xalign(0.0);
+    latest.set_hexpand(true);
+    latest.set_ellipsize(EllipsizeMode::End);
+    latest.add_css_class("ronomepo-meta");
+    header.append(&latest);
+    let [started, ok, skipped, failed]: [Label; 4] = stat_values
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("four counters were built"));
+    let summary_handle = OperationSummaryHandle {
+        root: glib::WeakRef::new(),
+        started,
+        ok,
+        skipped,
+        failed,
+        latest,
+    };
+    summary_handle.root.set(Some(&root));
+    sync_operation_summary(&summary_handle, &operation_summary(&logs));
+    OPERATION_SUMMARIES.with(|handles| {
+        handles.borrow_mut().push(summary_handle);
+    });
 
     let view_host = unsafe { host.as_ref() }.map(HostApi::from_raw);
     let follow = operation_follow_button();
@@ -12475,11 +12394,13 @@ fn create_operations_view(
         .and_then(|host| {
             host_toolbar_button(host, CMD_REFRESH_LOGS, "view-refresh-symbolic", "Refresh")
         })
-        .unwrap_or_else(|| clickable_button_with_label("Refresh"));
+        .unwrap_or_else(|| ui::icon_button("view-refresh-symbolic", "Refresh"));
     let clear = view_host
         .as_ref()
         .and_then(|host| host_toolbar_button(host, CMD_CLEAR_LOGS, "user-trash-symbolic", "Clear"))
-        .unwrap_or_else(|| clickable_button_with_label("Clear"));
+        .unwrap_or_else(|| ui::icon_button("user-trash-symbolic", "Clear"));
+    ui::style_icon_button(&refresh, "view-refresh-symbolic", "Refresh logs");
+    ui::style_icon_button(&clear, "user-trash-symbolic", "Clear logs");
 
     let buffer = TextBuffer::new(None);
     let buffer_handle = OperationBufferHandle {
@@ -12491,11 +12412,6 @@ fn create_operations_view(
     sync_operation_buffer(&buffer_handle, &buffer, cursor, &logs);
     OPERATION_BUFFERS.with(|buffers| {
         buffers.borrow_mut().push(buffer_handle);
-    });
-    let summary_ref = glib::WeakRef::new();
-    summary_ref.set(Some(&summary));
-    OPERATION_SUMMARIES.with(|labels| {
-        labels.borrow_mut().push(summary_ref);
     });
 
     if view_host.is_none() {
@@ -12517,6 +12433,11 @@ fn create_operations_view(
     text.set_cursor_visible(false);
     text.set_monospace(true);
     text.set_wrap_mode(WrapMode::WordChar);
+    text.add_css_class("ronomepo-console");
+    text.set_top_margin(8);
+    text.set_bottom_margin(8);
+    text.set_left_margin(12);
+    text.set_right_margin(12);
 
     let scroller = ScrolledWindow::builder()
         .hexpand(true)
@@ -12569,11 +12490,10 @@ fn create_operations_view(
         });
     });
 
-    summary_row.append(&summary);
-    summary_row.append(&follow);
-    summary_row.append(&refresh);
-    summary_row.append(&clear);
-    root.append(&summary_row);
+    header.append(&follow);
+    header.append(&refresh);
+    header.append(&clear);
+    root.append(&header);
     root.append(&scroller);
 
     suppress_scroll_events.set(true);
@@ -12582,23 +12502,47 @@ fn create_operations_view(
     into_view_ptr(root)
 }
 
-fn operation_summary_text(logs: &[String]) -> String {
-    let total = logs.len();
-    let starts = logs.iter().filter(|line| line.contains("[START]")).count();
-    let ok = logs.iter().filter(|line| line.contains("[OK]")).count();
-    let skipped = logs.iter().filter(|line| line.contains("[SKIP]")).count();
-    let failed = logs.iter().filter(|line| line.contains("[FAIL]")).count();
-    let latest_failure = logs
-        .iter()
-        .rev()
-        .find(|line| line.contains("[FAIL]"))
-        .map(String::as_str);
-    let latest = logs
-        .last()
-        .map(String::as_str)
-        .unwrap_or("No operations recorded yet.");
+/// Counts of the operation log, shown in the Operations header.
+struct OperationSummary {
+    total: usize,
+    starts: usize,
+    ok: usize,
+    skipped: usize,
+    failed: usize,
+    latest_failure: Option<String>,
+    latest: String,
+}
 
-    let mut summary = match latest_failure {
+fn operation_summary(logs: &[String]) -> OperationSummary {
+    OperationSummary {
+        total: logs.len(),
+        starts: logs.iter().filter(|line| line.contains("[START]")).count(),
+        ok: logs.iter().filter(|line| line.contains("[OK]")).count(),
+        skipped: logs.iter().filter(|line| line.contains("[SKIP]")).count(),
+        failed: logs.iter().filter(|line| line.contains("[FAIL]")).count(),
+        latest_failure: logs
+            .iter()
+            .rev()
+            .find(|line| line.contains("[FAIL]"))
+            .cloned(),
+        latest: logs
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "No operations recorded yet.".to_string()),
+    }
+}
+
+fn operation_summary_text(summary: &OperationSummary) -> String {
+    let OperationSummary {
+        total,
+        starts,
+        ok,
+        skipped,
+        failed,
+        latest,
+        ..
+    } = summary;
+    let mut text = match &summary.latest_failure {
         Some(failure) => format!(
             "{total} log lines | {starts} started | {ok} ok | {skipped} skipped | {failed} failed | Latest failure: {failure} | Latest: {latest}"
         ),
@@ -12607,10 +12551,50 @@ fn operation_summary_text(logs: &[String]) -> String {
         ),
     };
     if let Some(runtime_line) = runtime_profile_summary("operations") {
-        summary.push_str(" | ");
-        summary.push_str(&runtime_line);
+        text.push_str(" | ");
+        text.push_str(&runtime_line);
     }
-    summary
+    text
+}
+
+fn sync_operation_summary(handle: &OperationSummaryHandle, summary: &OperationSummary) {
+    handle.started.set_text(&summary.starts.to_string());
+    handle.ok.set_text(&summary.ok.to_string());
+    handle.skipped.set_text(&summary.skipped.to_string());
+    handle.failed.set_text(&summary.failed.to_string());
+    ui::set_fg_tone(
+        &handle.ok,
+        if summary.ok > 0 {
+            ui::Tone::Success
+        } else {
+            ui::Tone::Strong
+        },
+    );
+    ui::set_fg_tone(
+        &handle.failed,
+        if summary.failed > 0 {
+            ui::Tone::Danger
+        } else {
+            ui::Tone::Strong
+        },
+    );
+    // The latest failure matters more than the latest line, which the log
+    // below already shows.
+    match &summary.latest_failure {
+        Some(failure) => {
+            handle
+                .latest
+                .set_text(&format!("Latest failure: {failure}"));
+            ui::set_fg_tone(&handle.latest, ui::Tone::Danger);
+        }
+        None => {
+            handle.latest.set_text(&summary.latest);
+            ui::set_fg_tone(&handle.latest, ui::Tone::Muted);
+        }
+    }
+    handle
+        .latest
+        .set_tooltip_text(Some(&operation_summary_text(summary)));
 }
 
 fn load_manifest_if_present(path: &Path) -> Option<WorkspaceManifest> {
