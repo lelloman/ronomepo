@@ -333,6 +333,9 @@ struct AppState {
     watch_manager_sync_pending: bool,
     /// The Pull/Push/... batch currently running; only one runs at a time.
     operation_in_flight: Option<OperationBatchState>,
+    /// Each repo's invalidation_seq when the running full workspace scan was
+    /// submitted; repos invalidated since then must not take its results.
+    workspace_scan_seqs: HashMap<String, u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -392,6 +395,7 @@ impl Default for AppState {
             watch_manager_sync_in_flight: false,
             watch_manager_sync_pending: false,
             operation_in_flight: None,
+            workspace_scan_seqs: HashMap::new(),
         }
     }
 }
@@ -2228,11 +2232,10 @@ fn handle_worker_result(result: WorkerResult) {
             workspace_status,
             repository_items,
         } => {
-            let (rerun, prefetch_sort_details) = {
+            let (rerun, prefetch_sort_details, changed_mid_scan) = {
                 let mut app_state = state().lock().expect("state mutex poisoned");
-                mark_full_workspace_scan_completed(&mut app_state, &repository_items);
+                let changed_mid_scan = apply_full_workspace_scan(&mut app_state, repository_items);
                 app_state.workspace_status = workspace_status;
-                app_state.repository_items = repository_items;
                 app_state.repository_items_loading = false;
                 let rerun = app_state.repository_items_refresh_pending;
                 app_state.repository_items_refresh_pending = false;
@@ -2250,8 +2253,11 @@ fn handle_worker_result(result: WorkerResult) {
                         app_state.manifest_sort_mode == MonitorSortMode::RecentActivity
                     }
                 };
-                (rerun, prefetch_sort_details)
+                (rerun, prefetch_sort_details, changed_mid_scan)
             };
+            if changed_mid_scan {
+                schedule_pending_local_rescans();
+            }
             sync_watch_manager_from_state();
             if prefetch_sort_details {
                 prefetch_monitor_sort_details();
@@ -3850,21 +3856,41 @@ fn sync_repo_runtime_state(app_state: &mut AppState) {
     }
 }
 
-fn mark_full_workspace_scan_completed(
+/// Merges a full workspace scan into the state. Repos invalidated after the
+/// scan was submitted keep their current item (the scan may have read them
+/// before the change, while a per-repo refresh may already have newer data)
+/// and stay stale. Per-repo refresh flags belong to the RepoStatus jobs and
+/// are left alone. Returns whether any scanned repo still needs a rescan.
+fn apply_full_workspace_scan(
     app_state: &mut AppState,
-    repository_items: &[RepositoryListItem],
-) {
+    repository_items: Vec<RepositoryListItem>,
+) -> bool {
     let now = SystemTime::now();
+    let scan_seqs = std::mem::take(&mut app_state.workspace_scan_seqs);
+    let mut previous_items = std::mem::take(&mut app_state.repository_items)
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    let mut needs_rescan = false;
+    let mut merged = Vec::with_capacity(repository_items.len());
     for item in repository_items {
         let runtime = app_state
             .repo_runtime
             .entry(item.id.clone())
             .or_insert_with(|| RepoRuntimeState::new(now, &item.id));
-        runtime.last_scanned_seq = runtime.invalidation_seq;
-        runtime.scheduled_scan_seq = runtime.invalidation_seq;
-        runtime.local_refresh_in_flight = false;
-        runtime.last_local_scan_at = Some(now);
+        let scanned_seq = scan_seqs.get(&item.id).copied().unwrap_or(0);
+        if runtime.invalidation_seq == scanned_seq {
+            runtime.last_scanned_seq = runtime.last_scanned_seq.max(scanned_seq);
+            runtime.scheduled_scan_seq = runtime.scheduled_scan_seq.max(scanned_seq);
+            runtime.last_local_scan_at = Some(now);
+            merged.push(item);
+            continue;
+        }
+        needs_rescan |= runtime.needs_rescan();
+        merged.push(previous_items.remove(&item.id).unwrap_or(item));
     }
+    app_state.repository_items = merged;
+    needs_rescan
 }
 
 fn mark_repo_scan_completed(app_state: &mut AppState, repo_id: &str) {
@@ -4086,6 +4112,11 @@ fn schedule_workspace_scan() {
         }
         app_state.repository_items_loading = true;
         app_state.repository_items_refresh_pending = false;
+        app_state.workspace_scan_seqs = app_state
+            .repo_runtime
+            .iter()
+            .map(|(repo_id, runtime)| (repo_id.clone(), runtime.invalidation_seq))
+            .collect();
         (app_state.workspace_root.clone(), app_state.manifest.clone())
     };
 
@@ -4096,8 +4127,10 @@ fn schedule_workspace_scan() {
             manifest,
         },
     ) {
-        let mut app_state = state().lock().expect("state mutex poisoned");
-        app_state.repository_items_loading = false;
+        state()
+            .lock()
+            .expect("state mutex poisoned")
+            .repository_items_loading = false;
         append_log(format!("Workspace scan failed to start: {message}"));
         refresh_views();
     }
@@ -4120,7 +4153,17 @@ fn schedule_repository_status_refresh(item: &RepositoryListItem) {
         WorkerJob::RepositoryStatusRefresh { item: item.clone() },
     ) {
         Ok(true) => {}
-        Ok(false) => {}
+        Ok(false) => {
+            // An older scan of this repo is still running and will be credited
+            // with scheduled_scan_seq on completion. It may have read the repo
+            // before the latest invalidation, so roll the claim back: the repo
+            // stays stale and that completion schedules the follow-up.
+            let mut app_state = state().lock().expect("state mutex poisoned");
+            if let Some(runtime) = app_state.repo_runtime.get_mut(&repo_id) {
+                runtime.scheduled_scan_seq = runtime.last_scanned_seq;
+                runtime.local_refresh_in_flight = true;
+            }
+        }
         Err(message) => {
             let mut app_state = state().lock().expect("state mutex poisoned");
             if let Some(runtime) = app_state.repo_runtime.get_mut(&repo_id) {
@@ -12785,6 +12828,46 @@ mod tests {
             claim_due_remote_fetches(&mut app_state, SystemTime::now()).len(),
             1
         );
+    }
+
+    #[test]
+    fn full_scan_does_not_overwrite_repos_changed_mid_scan() {
+        let mut app_state = AppState::default();
+        for name in ["alpha", "beta"] {
+            app_state.repository_items.push(test_repository_item(
+                name,
+                RepositoryState::Clean,
+                RepositorySync::UpToDate,
+            ));
+            app_state
+                .repo_runtime
+                .insert(name.to_string(), RepoRuntimeState::new(UNIX_EPOCH, name));
+        }
+        // The full scan is submitted with both repos at seq 0.
+        app_state.workspace_scan_seqs =
+            HashMap::from([("alpha".to_string(), 0), ("beta".to_string(), 0)]);
+        // beta changes while the scan runs and its own refresh is in flight.
+        assert!(begin_repo_status_refresh(&mut app_state, "beta"));
+
+        let scanned = vec![
+            test_repository_item("alpha", RepositoryState::Dirty, RepositorySync::UpToDate),
+            test_repository_item("beta", RepositoryState::Dirty, RepositorySync::UpToDate),
+        ];
+        let needs_rescan = apply_full_workspace_scan(&mut app_state, scanned);
+
+        assert!(needs_rescan);
+        assert_eq!(
+            app_state.repository_items[0].status.state,
+            RepositoryState::Dirty
+        );
+        // beta keeps its current item and stays stale with its refresh in flight.
+        assert_eq!(
+            app_state.repository_items[1].status.state,
+            RepositoryState::Clean
+        );
+        assert!(app_state.repo_runtime["beta"].needs_rescan());
+        assert!(app_state.repo_runtime["beta"].local_refresh_in_flight);
+        assert!(!app_state.repo_runtime["alpha"].needs_rescan());
     }
 
     #[test]
