@@ -331,6 +331,9 @@ struct AppState {
     repo_runtime: HashMap<String, RepoRuntimeState>,
     watch_manager_sync_in_flight: bool,
     watch_manager_sync_pending: bool,
+    /// Sequence number one past the newest log line; see `LogCursor`.
+    log_end_seq: u64,
+    log_rewrites: u64,
     /// Parsed `.ronomepo/capability-state.json`, re-read only when capability
     /// checks write it or a workspace scan completes.
     capability_registry: Arc<CapabilityRegistry>,
@@ -378,6 +381,8 @@ impl Default for AppState {
             repo_runtime: HashMap::new(),
             watch_manager_sync_in_flight: false,
             watch_manager_sync_pending: false,
+            log_end_seq: 0,
+            log_rewrites: 0,
             capability_registry: Arc::new(CapabilityRegistry::default()),
         }
     }
@@ -723,6 +728,36 @@ struct RepoOverviewViewHandle {
     host_ptr: usize,
 }
 
+/// Identifies the log contents: `logs[i]` has sequence number
+/// `end_seq - logs.len() + i`, and `rewrites` counts in-place updates of the
+/// last line (repeat collapsing).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LogCursor {
+    first_seq: u64,
+    end_seq: u64,
+    rewrites: u64,
+}
+
+/// What a log view showing `shown` must do to show the log at a newer cursor.
+#[derive(Debug, PartialEq, Eq)]
+enum LogViewEdit {
+    Unchanged,
+    Reset,
+    /// Drop `drop_front` entries from the start, keep the next `keep`
+    /// entries, and replace the rest with `logs[keep..]`.
+    Update {
+        drop_front: usize,
+        keep: usize,
+    },
+}
+
+struct OperationBufferHandle {
+    buffer: glib::WeakRef<TextBuffer>,
+    shown: Cell<LogCursor>,
+    /// Number of text lines of each shown entry (entries may span lines).
+    line_counts: RefCell<std::collections::VecDeque<usize>>,
+}
+
 struct OperationFollowHandle {
     scroller: glib::WeakRef<ScrolledWindow>,
     toggle: glib::WeakRef<ToggleButton>,
@@ -736,7 +771,8 @@ thread_local! {
     static REPO_OVERVIEWS: RefCell<Vec<RepoOverviewViewHandle>> = const { RefCell::new(Vec::new()) };
     static COMMIT_CHECK_VIEWS: RefCell<Vec<CommitCheckViewHandle>> = const { RefCell::new(Vec::new()) };
     static FUCINA_POLICY_VIEWS: RefCell<Vec<ContainerViewHandle>> = const { RefCell::new(Vec::new()) };
-    static OPERATION_BUFFERS: RefCell<Vec<glib::WeakRef<TextBuffer>>> = const { RefCell::new(Vec::new()) };
+    static OPERATION_BUFFERS: RefCell<Vec<OperationBufferHandle>> = const { RefCell::new(Vec::new()) };
+    static OPERATION_SUMMARY_CURSOR: Cell<Option<LogCursor>> = const { Cell::new(None) };
     static OPERATION_SUMMARIES: RefCell<Vec<glib::WeakRef<Label>>> = const { RefCell::new(Vec::new()) };
     static OPERATION_FOLLOWERS: RefCell<Vec<OperationFollowHandle>> = const { RefCell::new(Vec::new()) };
     static DIRTY_TEXT_EDITORS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
@@ -1706,9 +1742,11 @@ fn push_log_line(app_state: &mut AppState, message: String) {
         if let Some(last) = app_state.logs.last_mut() {
             *last = line;
         }
+        app_state.log_rewrites += 1;
         return;
     }
     app_state.logs.push(format!("{stamp} {message}"));
+    app_state.log_end_seq += 1;
     app_state.last_log_message = Some(message);
     app_state.last_log_repeats = 1;
     if app_state.logs.len() > MAX_LOG_ENTRIES {
@@ -2328,28 +2366,44 @@ fn refresh_workspace_settings_views(snapshot: &StateSnapshot) {
 }
 
 fn refresh_operation_views(snapshot: &StateSnapshot) {
+    refresh_operation_log_views(snapshot.log_cursor, &snapshot.logs);
+}
+
+/// Brings every Operations view up to `cursor`, editing only the changed
+/// lines of each buffer.
+fn refresh_operation_log_views(cursor: LogCursor, logs: &[String]) {
+    let mut changed = false;
     OPERATION_BUFFERS.with(|buffers| {
         let mut buffers = buffers.borrow_mut();
-        buffers.retain(|buffer_ref| match buffer_ref.upgrade() {
+        buffers.retain(|handle| match handle.buffer.upgrade() {
             Some(buffer) => {
-                buffer.set_text(&snapshot.logs.join("\n"));
+                changed |= sync_operation_buffer(handle, &buffer, cursor, logs);
                 true
             }
             None => false,
         });
     });
 
-    OPERATION_SUMMARIES.with(|labels| {
-        let mut labels = labels.borrow_mut();
-        labels.retain(|label_ref| match label_ref.upgrade() {
-            Some(label) => {
-                label.set_text(&operation_summary_text(&snapshot.logs));
-                true
-            }
-            None => false,
+    let summary_stale = OPERATION_SUMMARY_CURSOR.with(|shown| shown.replace(Some(cursor)))
+        != Some(cursor)
+        || runtime_profile_enabled();
+    if summary_stale {
+        let text = operation_summary_text(logs);
+        OPERATION_SUMMARIES.with(|labels| {
+            let mut labels = labels.borrow_mut();
+            labels.retain(|label_ref| match label_ref.upgrade() {
+                Some(label) => {
+                    label.set_text(&text);
+                    true
+                }
+                None => false,
+            });
         });
-    });
+    }
 
+    if !changed {
+        return;
+    }
     OPERATION_FOLLOWERS.with(|followers| {
         let mut followers = followers.borrow_mut();
         followers.retain(|handle| {
@@ -2373,10 +2427,113 @@ fn refresh_operation_views(snapshot: &StateSnapshot) {
     });
 }
 
+fn log_cursor(app_state: &AppState) -> LogCursor {
+    LogCursor {
+        first_seq: app_state
+            .log_end_seq
+            .saturating_sub(app_state.logs.len() as u64),
+        end_seq: app_state.log_end_seq,
+        rewrites: app_state.log_rewrites,
+    }
+}
+
+fn log_view_edit(shown: LogCursor, current: LogCursor) -> LogViewEdit {
+    if shown == current {
+        return LogViewEdit::Unchanged;
+    }
+    if current.first_seq < shown.first_seq || current.end_seq < shown.end_seq {
+        return LogViewEdit::Reset;
+    }
+    // Only the newest line is ever rewritten, so a rewrite since `shown`
+    // touched at most the last shown entry.
+    let replace_from = if shown.rewrites == current.rewrites {
+        shown.end_seq
+    } else {
+        shown.end_seq.saturating_sub(1)
+    };
+    if replace_from < current.first_seq || replace_from < shown.first_seq {
+        return LogViewEdit::Reset;
+    }
+    LogViewEdit::Update {
+        drop_front: (current.first_seq - shown.first_seq) as usize,
+        keep: (replace_from - current.first_seq) as usize,
+    }
+}
+
+fn log_entry_line_count(entry: &str) -> usize {
+    entry.matches('\n').count() + 1
+}
+
+/// Returns whether the buffer text changed.
+fn sync_operation_buffer(
+    handle: &OperationBufferHandle,
+    buffer: &TextBuffer,
+    cursor: LogCursor,
+    logs: &[String],
+) -> bool {
+    let edit = log_view_edit(handle.shown.get(), cursor);
+    let mut line_counts = handle.line_counts.borrow_mut();
+    let (drop_front, keep) = match edit {
+        LogViewEdit::Unchanged => return false,
+        LogViewEdit::Update { drop_front, keep } if drop_front <= line_counts.len() => {
+            (drop_front, keep)
+        }
+        _ => {
+            buffer.set_text(&logs.join("\n"));
+            *line_counts = logs
+                .iter()
+                .map(|entry| log_entry_line_count(entry))
+                .collect();
+            handle.shown.set(cursor);
+            return true;
+        }
+    };
+
+    let dropped_lines = line_counts.drain(..drop_front).sum::<usize>();
+    if dropped_lines > 0 {
+        let mut start = buffer.start_iter();
+        let mut end = buffer
+            .iter_at_line(dropped_lines as i32)
+            .unwrap_or_else(|| buffer.end_iter());
+        buffer.delete(&mut start, &mut end);
+    }
+
+    line_counts.truncate(keep);
+    let kept_lines = line_counts.iter().sum::<usize>();
+    let mut cut = if kept_lines == 0 {
+        buffer.start_iter()
+    } else {
+        let mut line_end = buffer
+            .iter_at_line(kept_lines as i32 - 1)
+            .unwrap_or_else(|| buffer.end_iter());
+        if !line_end.ends_line() {
+            line_end.forward_to_line_end();
+        }
+        line_end
+    };
+    let mut end = buffer.end_iter();
+    buffer.delete(&mut cut, &mut end);
+
+    let appended = &logs[keep.min(logs.len())..];
+    if !appended.is_empty() {
+        let mut text = appended.join("\n");
+        if kept_lines > 0 {
+            text.insert(0, '\n');
+        }
+        buffer.insert(&mut buffer.end_iter(), &text);
+        line_counts.extend(appended.iter().map(|entry| log_entry_line_count(entry)));
+    }
+    handle.shown.set(cursor);
+    true
+}
+
 fn refresh_log_surfaces() {
     let _timed = diag::timed("refresh-log-surfaces");
-    let snapshot = snapshot();
-    refresh_operation_views(&snapshot);
+    let (cursor, logs) = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        (log_cursor(&app_state), app_state.logs.clone())
+    };
+    refresh_operation_log_views(cursor, &logs);
 }
 
 fn adjustment_bottom_value(adjustment: &gtk::Adjustment) -> f64 {
@@ -2477,6 +2634,7 @@ struct StateSnapshot {
     selected_repo_ids: Vec<String>,
     active_repo_id: Option<String>,
     logs: Vec<String>,
+    log_cursor: LogCursor,
     history_report: Vec<String>,
     history_report_loading: bool,
     line_stats_report: Vec<String>,
@@ -2512,6 +2670,7 @@ fn snapshot() -> StateSnapshot {
         selected_repo_ids: app_state.selected_repo_ids.clone(),
         active_repo_id: app_state.active_repo_id.clone(),
         logs: app_state.logs.clone(),
+        log_cursor: log_cursor(&app_state),
         history_report: app_state.history_report.clone(),
         history_report_loading: app_state.history_report_loading,
         line_stats_report: app_state.line_stats_report.clone(),
@@ -11490,7 +11649,11 @@ extern "C" fn create_operations_view(
     root.set_margin_start(18);
     root.set_margin_end(18);
 
-    let summary = Label::new(Some(&operation_summary_text(&snapshot().logs)));
+    let (cursor, logs) = {
+        let app_state = state().lock().expect("state mutex poisoned");
+        (log_cursor(&app_state), app_state.logs.clone())
+    };
+    let summary = Label::new(Some(&operation_summary_text(&logs)));
     summary.set_xalign(0.0);
     summary.add_css_class("muted");
     summary.set_wrap(true);
@@ -11516,11 +11679,15 @@ extern "C" fn create_operations_view(
         .unwrap_or_else(|| clickable_button_with_label("Clear"));
 
     let buffer = TextBuffer::new(None);
-    buffer.set_text(&snapshot().logs.join("\n"));
-    let buffer_ref = glib::WeakRef::new();
-    buffer_ref.set(Some(&buffer));
+    let buffer_handle = OperationBufferHandle {
+        buffer: glib::WeakRef::new(),
+        shown: Cell::new(LogCursor::default()),
+        line_counts: RefCell::new(Default::default()),
+    };
+    buffer_handle.buffer.set(Some(&buffer));
+    sync_operation_buffer(&buffer_handle, &buffer, cursor, &logs);
     OPERATION_BUFFERS.with(|buffers| {
-        buffers.borrow_mut().push(buffer_ref);
+        buffers.borrow_mut().push(buffer_handle);
     });
     let summary_ref = glib::WeakRef::new();
     summary_ref.set(Some(&summary));
@@ -11529,29 +11696,16 @@ extern "C" fn create_operations_view(
     });
 
     if view_host.is_none() {
-        refresh.connect_clicked({
-            let buffer = buffer.clone();
-            let summary = summary.clone();
-            move |_| {
-                let snapshot = snapshot();
-                buffer.set_text(&snapshot.logs.join("\n"));
-                summary.set_text(&operation_summary_text(&snapshot.logs));
+        refresh.connect_clicked(|_| refresh_log_surfaces());
+        clear.connect_clicked(|_| {
+            {
+                let mut app_state = state().lock().expect("state mutex poisoned");
+                app_state.logs.clear();
+                app_state.last_log_message = None;
+                push_log_line(&mut app_state, "Operations log cleared.".to_string());
             }
-        });
-        clear.connect_clicked({
-            let buffer = buffer.clone();
-            let summary = summary.clone();
-            move |_| {
-                {
-                    let mut app_state = state().lock().expect("state mutex poisoned");
-                    app_state.logs.clear();
-                    app_state.logs.push("Operations log cleared.".to_string());
-                }
-                let snapshot = snapshot();
-                buffer.set_text(&snapshot.logs.join("\n"));
-                summary.set_text(&operation_summary_text(&snapshot.logs));
-                refresh_views();
-            }
+            refresh_log_surfaces();
+            refresh_views();
         });
     }
 
@@ -12626,6 +12780,82 @@ mod tests {
         let shown = vec![rules[1].id.clone()];
         let added = commit_check_rules_added(&baseline, &shown, &rules);
         assert_eq!(added, rules[2..].to_vec());
+    }
+
+    #[test]
+    fn log_view_edits_only_touch_changed_entries() {
+        let cursor = |first_seq, end_seq, rewrites| LogCursor {
+            first_seq,
+            end_seq,
+            rewrites,
+        };
+        let shown = cursor(0, 3, 0);
+        assert_eq!(log_view_edit(shown, shown), LogViewEdit::Unchanged);
+        // Appended lines.
+        assert_eq!(
+            log_view_edit(shown, cursor(0, 5, 0)),
+            LogViewEdit::Update {
+                drop_front: 0,
+                keep: 3
+            }
+        );
+        // The last line was rewritten, possibly before more lines arrived.
+        assert_eq!(
+            log_view_edit(shown, cursor(0, 3, 1)),
+            LogViewEdit::Update {
+                drop_front: 0,
+                keep: 2
+            }
+        );
+        assert_eq!(
+            log_view_edit(shown, cursor(0, 5, 2)),
+            LogViewEdit::Update {
+                drop_front: 0,
+                keep: 2
+            }
+        );
+        // Old lines were trimmed at the front.
+        assert_eq!(
+            log_view_edit(cursor(0, 500, 0), cursor(2, 502, 0)),
+            LogViewEdit::Update {
+                drop_front: 2,
+                keep: 498
+            }
+        );
+        // Cleared and restarted with one line.
+        assert_eq!(
+            log_view_edit(shown, cursor(3, 4, 0)),
+            LogViewEdit::Update {
+                drop_front: 3,
+                keep: 0
+            }
+        );
+        assert_eq!(log_view_edit(shown, cursor(0, 2, 0)), LogViewEdit::Reset);
+    }
+
+    #[test]
+    fn log_cursor_follows_appends_rewrites_and_trimming() {
+        let mut app_state = AppState::default();
+        push_log_line(&mut app_state, "one".to_string());
+        push_log_line(&mut app_state, "two".to_string());
+        push_log_line(&mut app_state, "two".to_string());
+        assert_eq!(
+            log_cursor(&app_state),
+            LogCursor {
+                first_seq: 0,
+                end_seq: 2,
+                rewrites: 1
+            }
+        );
+        for index in 0..MAX_LOG_ENTRIES {
+            push_log_line(&mut app_state, format!("line {index}"));
+        }
+        let cursor = log_cursor(&app_state);
+        assert_eq!(cursor.end_seq, 2 + MAX_LOG_ENTRIES as u64);
+        assert_eq!(
+            cursor.end_seq - cursor.first_seq,
+            app_state.logs.len() as u64
+        );
     }
 
     #[test]
