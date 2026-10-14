@@ -1,6 +1,7 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gtk::gio::prelude::ApplicationExtManual;
 use maruzzella::{
@@ -9,14 +10,34 @@ use maruzzella::{
     ToolbarDisplayMode, ToolbarItemSpec, WorkbenchNodeSpec,
 };
 use ronomepo_core::normalize_workspace_root;
+use ronomepo_plugin::{persisted_config_root, PERSISTENCE_ID};
 
 fn main() {
-    configure_gtk_input_method();
-    reset_stale_persisted_layout();
-
-    let workspace_root = parse_workspace_root_arg()
-        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let workspace_root = match parse_args(env::args_os().skip(1)) {
+        Ok(CliCommand::Run(workspace_root)) => workspace_root,
+        Ok(CliCommand::Help) => {
+            print!("{USAGE}");
+            return;
+        }
+        Ok(CliCommand::Version) => {
+            println!("ronomepo {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Err(message) => exit_with_usage_error(&message),
+    };
+    let workspace_root =
+        workspace_root.unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if !workspace_root.is_dir() {
+        exit_with_usage_error(&format!(
+            "workspace {} is not a directory",
+            workspace_root.display()
+        ));
+    }
     let workspace_root = normalize_workspace_root(workspace_root);
+
+    configure_gtk_input_method();
+    clear_empty_xdg_dirs();
+    reset_stale_persisted_layouts();
     env::set_var("RONOMEPO_WORKSPACE_ROOT", &workspace_root);
 
     let mut product = default_product_spec();
@@ -153,13 +174,6 @@ fn main() {
             payload: Vec::new(),
         },
         MenuItemSpec {
-            id: "monorepo-add-repo".to_string(),
-            root_id: "monorepo".to_string(),
-            label: "Add repo".to_string(),
-            command_id: "ronomepo.workspace.add_repo".to_string(),
-            payload: Vec::new(),
-        },
-        MenuItemSpec {
             id: "monorepo-fucina-policy".to_string(),
             root_id: "monorepo".to_string(),
             label: "Fucina Policy".to_string(),
@@ -198,10 +212,6 @@ fn main() {
         CommandSpec {
             id: "ronomepo.workspace.filter".to_string(),
             title: "Filter Repositories".to_string(),
-        },
-        CommandSpec {
-            id: "ronomepo.workspace.add_repo".to_string(),
-            title: "Add Repo".to_string(),
         },
         CommandSpec {
             id: "ronomepo.workspace.open_fucina_policy".to_string(),
@@ -347,7 +357,7 @@ fn main() {
     );
 
     let config = MaruzzellaConfig::new("com.lelloman.ronomepo")
-        .with_persistence_id("ronomepo")
+        .with_persistence_id(PERSISTENCE_ID)
         .with_product(product)
         .with_builtin_plugin(embedded_ronomepo_plugin);
 
@@ -382,9 +392,35 @@ fn env_var_uses_ibus(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn reset_stale_persisted_layout() {
-    let path = persisted_layout_path("ronomepo");
-    let Ok(raw) = fs::read_to_string(&path) else {
+/// The XDG base directory spec says an empty variable counts as unset, but
+/// Maruzzella would treat an empty XDG_CONFIG_HOME as a relative path and put
+/// configs and layouts under the current directory.
+fn clear_empty_xdg_dirs() {
+    for name in ["XDG_CONFIG_HOME", "XDG_STATE_HOME"] {
+        if env::var_os(name).is_some_and(|value| value.is_empty()) {
+            env::remove_var(name);
+        }
+    }
+}
+
+/// Removes stale layouts from the main layout slot and from every scoped slot
+/// (`<persistence id>--<slot>`) Maruzzella keeps next to it.
+fn reset_stale_persisted_layouts() {
+    let slot_prefix = format!("{PERSISTENCE_ID}--");
+    let Ok(entries) = fs::read_dir(persisted_config_root()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == PERSISTENCE_ID || name.starts_with(&slot_prefix) {
+            reset_stale_persisted_layout(&entry.path().join("layout.json"));
+        }
+    }
+}
+
+fn reset_stale_persisted_layout(path: &Path) {
+    let Ok(raw) = fs::read_to_string(path) else {
         return;
     };
 
@@ -416,39 +452,75 @@ fn reset_stale_persisted_layout() {
     }
 }
 
-fn persisted_layout_path(persistence_id: &str) -> PathBuf {
-    let mut path = if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(dir)
-    } else if let Ok(home) = env::var("HOME") {
-        PathBuf::from(home).join(".config")
-    } else {
-        PathBuf::from(".")
-    };
-    path.push(persistence_id);
-    path.push("layout.json");
-    path
+const USAGE: &str = "\
+Usage: ronomepo-app [--workspace <dir> | <dir>]
+
+Opens the Ronomepo workspace in <dir> (default: the current directory).
+
+Options:
+  -w, --workspace <dir>  Workspace directory
+  -h, --help             Print this help
+  -V, --version          Print the version
+";
+
+#[derive(Debug, PartialEq, Eq)]
+enum CliCommand {
+    Run(Option<PathBuf>),
+    Help,
+    Version,
 }
 
-fn parse_workspace_root_arg() -> Option<PathBuf> {
-    let mut args = env::args_os().skip(1);
-    let mut positional = None;
+fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliCommand, String> {
+    let mut args = args.into_iter();
+    let mut workspace = None;
+    let mut set_workspace = |path: PathBuf| {
+        if path.as_os_str().is_empty() {
+            return Err("the workspace path is empty".to_string());
+        }
+        if workspace.replace(path).is_some() {
+            return Err("only one workspace can be given".to_string());
+        }
+        Ok(())
+    };
+    let mut options_done = false;
 
     while let Some(arg) = args.next() {
-        if arg == "--workspace" {
-            return args.next().map(PathBuf::from);
+        if options_done {
+            set_workspace(PathBuf::from(arg))?;
+            continue;
         }
-        if let Some(value) = arg
-            .to_str()
-            .and_then(|text| text.strip_prefix("--workspace="))
-        {
-            return Some(PathBuf::from(value));
-        }
-        if positional.is_none() {
-            positional = Some(PathBuf::from(arg));
+        let Some(text) = arg.to_str() else {
+            set_workspace(PathBuf::from(arg))?;
+            continue;
+        };
+        match text {
+            "-h" | "--help" => return Ok(CliCommand::Help),
+            "-V" | "--version" => return Ok(CliCommand::Version),
+            "-w" | "--workspace" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("{text} requires a directory"))?;
+                set_workspace(PathBuf::from(value))?;
+            }
+            "--" => options_done = true,
+            _ => {
+                if let Some(value) = text.strip_prefix("--workspace=") {
+                    set_workspace(PathBuf::from(value))?;
+                } else if text.starts_with('-') && text != "-" {
+                    return Err(format!("unknown option {text}"));
+                } else {
+                    set_workspace(PathBuf::from(arg))?;
+                }
+            }
         }
     }
 
-    positional
+    Ok(CliCommand::Run(workspace))
+}
+
+fn exit_with_usage_error(message: &str) -> ! {
+    eprint!("ronomepo-app: {message}\n\n{USAGE}");
+    std::process::exit(2);
 }
 
 fn embedded_ronomepo_plugin() -> Result<maruzzella::LoadedPlugin, maruzzella::PluginLoadError> {
@@ -456,4 +528,39 @@ fn embedded_ronomepo_plugin() -> Result<maruzzella::LoadedPlugin, maruzzella::Pl
         "builtin:ronomepo-plugin",
         ronomepo_plugin::maruzzella_plugin_entry,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<CliCommand, String> {
+        parse_args(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn workspace_can_be_given_as_option_or_positional() {
+        let expected = Ok(CliCommand::Run(Some(PathBuf::from("/repos"))));
+        assert_eq!(parse(&["--workspace", "/repos"]), expected);
+        assert_eq!(parse(&["--workspace=/repos"]), expected);
+        assert_eq!(parse(&["-w", "/repos"]), expected);
+        assert_eq!(parse(&["/repos"]), expected);
+        assert_eq!(parse(&["--", "/repos"]), expected);
+        assert_eq!(parse(&[]), Ok(CliCommand::Run(None)));
+    }
+
+    #[test]
+    fn bad_arguments_are_rejected_instead_of_becoming_the_workspace() {
+        assert_eq!(parse(&["--help"]), Ok(CliCommand::Help));
+        assert_eq!(parse(&["-V"]), Ok(CliCommand::Version));
+        assert!(parse(&["--workspace"]).is_err());
+        assert!(parse(&["--workspace="]).is_err());
+        assert!(parse(&["--verbose"]).is_err());
+        assert!(parse(&["/a", "/b"]).is_err());
+        assert!(parse(&["--workspace", "/a", "/b"]).is_err());
+        assert_eq!(
+            parse(&["--", "--odd-dir"]),
+            Ok(CliCommand::Run(Some(PathBuf::from("--odd-dir"))))
+        );
+    }
 }
