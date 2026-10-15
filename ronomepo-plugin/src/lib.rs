@@ -3663,16 +3663,13 @@ fn build_repo_monitor_list_row(
     list_row
 }
 
-/// The name cell, colored by working tree state like IDEA's VCS colors. With
-/// `show_branch`, the branch follows in small muted text, as in IDEA's
+/// The name cell. With `show_branch`, the branch follows in small muted text, as in IDEA's
 /// Project tool window.
 fn append_monitor_name_cell(row: &GtkBox, item: &RepositoryListItem, show_branch: bool) {
     let name = monitor_cell(&item.name, None);
+    ui::set_fg_tone(&name, ui::Tone::Strong);
     if item.id == MONOREPO_ROW_ID {
-        ui::set_fg_tone(&name, ui::Tone::Strong);
         name.add_css_class(ui::class::STRONG);
-    } else {
-        ui::set_fg_tone(&name, repo_name_tone(&item.status));
     }
     if !show_branch || item.id == MONOREPO_ROW_ID {
         row.append(&name);
@@ -7382,31 +7379,15 @@ fn monitor_state_cell(state: &ronomepo_core::RepositoryState) -> Label {
     )
 }
 
-/// The Status column tone. It matches the name colors: only states that need
-/// action stand out, and untracked files alone are not alarming.
+/// The Status column tone: clean in green, missing in red, anything with
+/// local changes in orange.
 fn state_tone(state: &ronomepo_core::RepositoryState) -> ui::Tone {
     match state {
-        ronomepo_core::RepositoryState::Clean | ronomepo_core::RepositoryState::Untracked => {
-            ui::Tone::Muted
-        }
-        ronomepo_core::RepositoryState::Dirty => ui::Tone::Accent,
-        ronomepo_core::RepositoryState::Missing | ronomepo_core::RepositoryState::Unknown => {
-            ui::Tone::Danger
-        }
-    }
-}
-
-/// IDEA-style name colors, kept calm: modified names in the accent color,
-/// diverged ones in the warning color, missing or unreadable repositories in
-/// the danger color. Clean and untracked-only names keep the default color.
-fn repo_name_tone(status: &RepositoryStatus) -> ui::Tone {
-    match (&status.state, &status.sync) {
-        (ronomepo_core::RepositoryState::Missing | ronomepo_core::RepositoryState::Unknown, _) => {
-            ui::Tone::Danger
-        }
-        (_, ronomepo_core::RepositorySync::Diverged { .. }) => ui::Tone::Warning,
-        (ronomepo_core::RepositoryState::Dirty, _) => ui::Tone::Accent,
-        _ => ui::Tone::Strong,
+        ronomepo_core::RepositoryState::Clean => ui::Tone::Success,
+        ronomepo_core::RepositoryState::Missing => ui::Tone::Danger,
+        ronomepo_core::RepositoryState::Dirty
+        | ronomepo_core::RepositoryState::Untracked
+        | ronomepo_core::RepositoryState::Unknown => ui::Tone::Warning,
     }
 }
 
@@ -7423,14 +7404,14 @@ fn monitor_sync_cell(sync: &ronomepo_core::RepositorySync) -> Label {
 /// Compact ahead/behind arrows, e.g. `↑2 ↓1`.
 fn sync_compact(sync: &ronomepo_core::RepositorySync) -> (String, ui::Tone) {
     match sync {
-        ronomepo_core::RepositorySync::UpToDate => ("✓".to_string(), ui::Tone::Muted),
-        ronomepo_core::RepositorySync::Ahead(ahead) => (format!("↑{ahead}"), ui::Tone::Accent),
-        ronomepo_core::RepositorySync::Behind(behind) => (format!("↓{behind}"), ui::Tone::Accent),
+        ronomepo_core::RepositorySync::UpToDate => ("✓".to_string(), ui::Tone::Success),
+        ronomepo_core::RepositorySync::Ahead(ahead) => (format!("↑{ahead}"), ui::Tone::Warning),
+        ronomepo_core::RepositorySync::Behind(behind) => (format!("↓{behind}"), ui::Tone::Warning),
         ronomepo_core::RepositorySync::Diverged { ahead, behind } => {
-            (format!("↑{ahead} ↓{behind}"), ui::Tone::Warning)
+            (format!("↑{ahead} ↓{behind}"), ui::Tone::Danger)
         }
-        ronomepo_core::RepositorySync::NoUpstream => ("–".to_string(), ui::Tone::Muted),
-        ronomepo_core::RepositorySync::Unknown => ("?".to_string(), ui::Tone::Muted),
+        ronomepo_core::RepositorySync::NoUpstream => ("–".to_string(), ui::Tone::Danger),
+        ronomepo_core::RepositorySync::Unknown => ("?".to_string(), ui::Tone::Danger),
     }
 }
 
@@ -9979,7 +9960,7 @@ fn repo_overview_context(
     title_row.append(&title);
     title_row.append(&ui::badge(
         status_label(&item.status.state),
-        state_badge_tone(&item.status.state),
+        state_tone(&item.status.state),
     ));
     let rank = attention_rank(attention_signals);
     if rank <= 4 {
@@ -10037,14 +10018,6 @@ fn repo_overview_context(
     block.append(&meta_row);
 
     block
-}
-
-fn state_badge_tone(state: &ronomepo_core::RepositoryState) -> ui::Tone {
-    match state {
-        ronomepo_core::RepositoryState::Clean => ui::Tone::Success,
-        ronomepo_core::RepositoryState::Untracked => ui::Tone::Neutral,
-        other => state_tone(other),
-    }
 }
 
 fn attention_severity(level: AttentionLevel) -> ui::Severity {
@@ -10650,7 +10623,7 @@ fn overview_repo_row(
     )));
 
     let name = monitor_cell(&item.name, None);
-    ui::set_fg_tone(&name, repo_name_tone(&item.status));
+    ui::set_fg_tone(&name, ui::Tone::Strong);
     let branch = monitor_cell(branch_label(item), Some(MONITOR_BRANCH_COL_WIDTH));
     ui::set_fg_tone(&branch, ui::Tone::Muted);
 
@@ -12776,77 +12749,24 @@ mod tests {
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
-    fn repo_names_only_stand_out_for_states_that_need_action() {
-        let status = |state, sync| RepositoryStatus {
-            state,
-            sync,
-            ..empty_repository_status(PathBuf::from("/tmp/repo"))
-        };
-        let cases = [
-            (
-                RepositoryState::Clean,
-                RepositorySync::UpToDate,
-                ui::Tone::Strong,
-            ),
-            (
-                RepositoryState::Untracked,
-                RepositorySync::UpToDate,
-                ui::Tone::Strong,
-            ),
-            (
-                RepositoryState::Clean,
-                RepositorySync::Ahead(2),
-                ui::Tone::Strong,
-            ),
-            (
-                RepositoryState::Clean,
-                RepositorySync::Behind(1),
-                ui::Tone::Strong,
-            ),
-            (
-                RepositoryState::Clean,
-                RepositorySync::NoUpstream,
-                ui::Tone::Strong,
-            ),
-            (
-                RepositoryState::Dirty,
-                RepositorySync::UpToDate,
-                ui::Tone::Accent,
-            ),
-            (
-                RepositoryState::Dirty,
-                RepositorySync::Diverged {
-                    ahead: 1,
-                    behind: 1,
-                },
-                ui::Tone::Warning,
-            ),
-            (
-                RepositoryState::Clean,
-                RepositorySync::Diverged {
-                    ahead: 1,
-                    behind: 1,
-                },
-                ui::Tone::Warning,
-            ),
-            (
-                RepositoryState::Missing,
-                RepositorySync::Unknown,
-                ui::Tone::Danger,
-            ),
-            (
-                RepositoryState::Unknown,
-                RepositorySync::Unknown,
-                ui::Tone::Danger,
-            ),
-        ];
-        for (state, sync, tone) in cases {
-            let label = format!("{state:?} {sync:?}");
-            assert_eq!(repo_name_tone(&status(state, sync)), tone, "{label}");
-        }
-        assert_eq!(state_tone(&RepositoryState::Untracked), ui::Tone::Muted);
-        assert_eq!(state_tone(&RepositoryState::Dirty), ui::Tone::Accent);
+    fn repository_status_and_sync_use_traffic_light_tones() {
+        assert_eq!(state_tone(&RepositoryState::Clean), ui::Tone::Success);
+        assert_eq!(state_tone(&RepositoryState::Dirty), ui::Tone::Warning);
+        assert_eq!(state_tone(&RepositoryState::Untracked), ui::Tone::Warning);
         assert_eq!(state_tone(&RepositoryState::Missing), ui::Tone::Danger);
+        assert_eq!(sync_compact(&RepositorySync::UpToDate).1, ui::Tone::Success);
+        assert_eq!(
+            sync_compact(&RepositorySync::Behind(1)).1,
+            ui::Tone::Warning
+        );
+        assert_eq!(
+            sync_compact(&RepositorySync::Diverged {
+                ahead: 1,
+                behind: 1
+            })
+            .1,
+            ui::Tone::Danger
+        );
     }
 
     fn temp_test_dir(label: &str) -> PathBuf {
