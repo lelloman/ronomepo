@@ -7401,14 +7401,14 @@ fn monitor_sync_cell(sync: &ronomepo_core::RepositorySync) -> Label {
     )
 }
 
-/// Compact ahead/behind arrows, e.g. `↑2 ↓1`.
+/// Compact ahead/behind counts, e.g. `+2 -1`.
 fn sync_compact(sync: &ronomepo_core::RepositorySync) -> (String, ui::Tone) {
     match sync {
         ronomepo_core::RepositorySync::UpToDate => ("✓".to_string(), ui::Tone::Success),
-        ronomepo_core::RepositorySync::Ahead(ahead) => (format!("↑{ahead}"), ui::Tone::Warning),
-        ronomepo_core::RepositorySync::Behind(behind) => (format!("↓{behind}"), ui::Tone::Warning),
+        ronomepo_core::RepositorySync::Ahead(ahead) => (format!("+{ahead}"), ui::Tone::Warning),
+        ronomepo_core::RepositorySync::Behind(behind) => (format!("-{behind}"), ui::Tone::Warning),
         ronomepo_core::RepositorySync::Diverged { ahead, behind } => {
-            (format!("↑{ahead} ↓{behind}"), ui::Tone::Danger)
+            (format!("+{ahead} -{behind}"), ui::Tone::Danger)
         }
         ronomepo_core::RepositorySync::NoUpstream => ("–".to_string(), ui::Tone::Danger),
         ronomepo_core::RepositorySync::Unknown => ("?".to_string(), ui::Tone::Danger),
@@ -10005,9 +10005,9 @@ fn repo_overview_context(
     path.set_ellipsize(EllipsizeMode::Start);
     let branch = ui::badge(branch_label(item), ui::Tone::Neutral);
     branch.set_tooltip_text(Some("Current branch"));
-    let (sync_arrows, sync_tone) = sync_compact(&item.status.sync);
+    let (sync_counts, sync_tone) = sync_compact(&item.status.sync);
     let sync = Label::new(Some(&format!(
-        "{sync_arrows}  {}",
+        "{sync_counts}  {}",
         sync_description(&item.status.sync)
     )));
     sync.add_css_class(ui::class::META);
@@ -12755,6 +12755,16 @@ mod tests {
         assert_eq!(state_tone(&RepositoryState::Untracked), ui::Tone::Warning);
         assert_eq!(state_tone(&RepositoryState::Missing), ui::Tone::Danger);
         assert_eq!(sync_compact(&RepositorySync::UpToDate).1, ui::Tone::Success);
+        assert_eq!(sync_compact(&RepositorySync::Ahead(2)).0, "+2");
+        assert_eq!(sync_compact(&RepositorySync::Behind(1)).0, "-1");
+        assert_eq!(
+            sync_compact(&RepositorySync::Diverged {
+                ahead: 1,
+                behind: 3
+            })
+            .0,
+            "+1 -3"
+        );
         assert_eq!(
             sync_compact(&RepositorySync::Behind(1)).1,
             ui::Tone::Warning
